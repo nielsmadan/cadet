@@ -1,9 +1,11 @@
 pub mod canonical;
+pub mod collision;
 pub mod config;
 pub mod error;
 pub mod model;
 pub mod validate;
 pub use canonical::*;
+pub use collision::*;
 pub use config::*;
 pub use error::CoreError;
 pub use model::*;
