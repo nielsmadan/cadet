@@ -8,3 +8,4 @@ thiserror.workspace = true
 ulid.workspace = true
 jiff.workspace = true
 blake3.workspace = true
+toml_edit.workspace = true
