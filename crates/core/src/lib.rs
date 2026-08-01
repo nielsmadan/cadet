@@ -2,6 +2,7 @@ pub mod backend;
 pub mod canonical;
 pub mod collision;
 pub mod config;
+pub mod conformance;
 pub mod error;
 pub mod identity;
 pub mod model;

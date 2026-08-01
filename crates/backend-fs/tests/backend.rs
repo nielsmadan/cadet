@@ -1,4 +1,7 @@
 use cadet_backend_fs::FsBackend;
+use cadet_core::conformance::{
+    assert_round_trip, assert_scan_is_a_complete_snapshot, assert_stale_revision_is_rejected,
+};
 use cadet_core::*;
 use std::collections::BTreeMap;
 
@@ -452,4 +455,15 @@ fn changing_a_title_does_not_rename_the_file() {
             .contains("title: Renamed Title"),
         "the new title must be spliced in place"
     );
+}
+
+/// Proves the reusable contract in `cadet_core::conformance` is not just
+/// self-consistent but actually satisfied by the only real implementation of
+/// `Backend` — the whole point of extracting the suite.
+#[test]
+fn fs_backend_satisfies_the_conformance_suite() {
+    let (_d, b) = setup();
+    assert_scan_is_a_complete_snapshot(&b);
+    assert_round_trip(&b, task("Round trip"));
+    assert_stale_revision_is_rejected(&b, task("Stale revision"));
 }
