@@ -26,7 +26,15 @@ pub struct IndexEntry {
 #[derive(Debug, Clone, Default)]
 pub struct IndexView {
     pub entries: Vec<IndexEntry>,
-    /// path -> (revision when first seen, timestamp ms)
+    /// path -> (revision when first seen, timestamp ms).
+    ///
+    /// Contract: the caller MUST clear a path's entry here whenever an
+    /// `Outcome::Adopt` claims it. If the caller does not, and the path is
+    /// later deleted and recreated — paths, unlike uids, are reused — the
+    /// newcomer inherits the stale first-seen timestamp, trivially satisfies
+    /// the grace-period check, and is adopted immediately with no grace
+    /// period at all, defeating the "never mutate on first observation" rule
+    /// that exists to stop a rename delivered mid-sync from being written to.
     pub pending: BTreeMap<String, (Revision, i64)>,
     /// uid -> timestamp ms when absence was first observed.
     ///

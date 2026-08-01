@@ -1,0 +1,13 @@
+[package]
+name = "cadet-store-sqlite"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cadet-core = { path = "../core" }
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+jiff.workspace = true
