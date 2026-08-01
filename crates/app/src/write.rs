@@ -1,7 +1,7 @@
-use crate::reconcile::{App, AppError};
+use crate::reconcile::{App, AppError, carry_pending_deletions};
 use cadet_core::*;
 use cadet_store_sqlite::TaskSummary;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl App {
     fn now() -> jiff::Timestamp {
@@ -10,10 +10,27 @@ impl App {
 
     /// Re-reads the backend once and refreshes the cached display data, so an
     /// index-backed `list()` is correct immediately after a mutation.
-    /// One pass, not one pass per task.
+    /// One pass, not one pass per task. Unlike `reconcile`, this has no
+    /// identity-resolution pass of its own — it must not blindly trust the
+    /// scan as the complete picture: a task mid pending-deletion grace
+    /// period is legitimately absent from disk right now, and a bare
+    /// scan-and-replace would silently drop it from `list()` the moment
+    /// *any* write ran, not just the one that caused its absence.
     fn refresh_cache(&self) -> Result<(), AppError> {
         if let ChangeSet::Snapshot { tasks, .. } = self.backend.scan(None)? {
-            let cached: Vec<Task> = tasks.into_values().collect();
+            let observed: BTreeSet<String> =
+                tasks.values().map(|t| t.uid.as_str().to_string()).collect();
+            let mut cached: Vec<Task> = tasks.into_values().collect();
+            let pending_deletions = self.index.view(&self.project)?.pending_deletions;
+            if !pending_deletions.is_empty() {
+                let previously_cached = self.index.list_tasks(&self.project, true, &[])?;
+                let observed: BTreeSet<&str> = observed.iter().map(String::as_str).collect();
+                cached.extend(carry_pending_deletions(
+                    &pending_deletions,
+                    previously_cached.iter(),
+                    &observed,
+                ));
+            }
             self.index.cache_tasks(&self.project, &cached)?;
         }
         Ok(())
@@ -93,7 +110,16 @@ impl App {
     pub fn delete(&self, key: &TaskKey) -> Result<(), AppError> {
         let task = self.get_by_key(key)?;
         let expected = revision(&task);
-        self.backend.delete(task.uid, Some(expected))?;
+        self.backend.delete(task.uid.clone(), Some(expected))?;
+        // An explicit `cadet rm` is certain, not inferred — the file's
+        // absence is never going to be resolved by a sync tool catching up.
+        // Retire the identity outright instead of leaving it in `entries`
+        // for the next `reconcile` to rediscover, which would look exactly
+        // like an ordinary external deletion: routed through the deletion
+        // grace period (and counted in its mass-deletion `ScanRejected`
+        // guard) for no reason, and misreported by `cadet doctor` as still
+        // pending when the user already confirmed it.
+        self.index.forget(&self.project, &task.uid)?;
         self.refresh_cache()?;
         self.commit_or_warn(&format!("remove {key}"));
         Ok(())
@@ -106,5 +132,14 @@ impl App {
         Ok(self
             .index
             .list_tasks(&self.project, all, &cfg.workflow.terminal)?)
+    }
+
+    /// Unlike the write paths above, a failed undo must fail loudly: undo is
+    /// not itself a write with a durable backend result to fall back on, so
+    /// there is no already-successful outcome to protect by swallowing the
+    /// error into a warning.
+    pub fn undo(&self) -> Result<(), AppError> {
+        self.git.undo()?;
+        Ok(())
     }
 }

@@ -81,6 +81,35 @@ impl App {
     }
 
     pub fn reconcile(&self, now_ms: i64) -> Result<ReconcileReport, AppError> {
+        self.reconcile_with(now_ms, false, false)
+    }
+
+    /// Adopts every currently pending hand-written note immediately,
+    /// skipping the rest of its grace period: the user invoking `cadet
+    /// adopt` is exactly the confirmation the grace period exists to wait
+    /// for. Deletion grace periods are untouched.
+    pub fn adopt_pending(&self, now_ms: i64) -> Result<ReconcileReport, AppError> {
+        self.reconcile_with(now_ms, true, false)
+    }
+
+    /// Reconciles as `reconcile` does, except a uid observed absent for the
+    /// FIRST time in this pass is deleted at once instead of entering the
+    /// normal deletion grace period. Meant to be called exactly once,
+    /// immediately after `undo`: a `git reset --hard` makes an absence
+    /// intentional, not a possible sync artefact, so there is nothing to
+    /// wait out. A uid that already had a `pending_deletions` record before
+    /// this pass — mid grace period for a reason unrelated to the undo —
+    /// is left exactly as it was; see `ScanClock::immediate_deletion`.
+    pub fn reconcile_after_undo(&self, now_ms: i64) -> Result<ReconcileReport, AppError> {
+        self.reconcile_with(now_ms, false, true)
+    }
+
+    fn reconcile_with(
+        &self,
+        now_ms: i64,
+        force_adopt: bool,
+        immediate_deletion: bool,
+    ) -> Result<ReconcileReport, AppError> {
         let ChangeSet::Snapshot {
             snapshot: snap,
             tasks: mut parsed,
@@ -93,8 +122,16 @@ impl App {
         let clock = ScanClock {
             now_ms,
             grace_ms: GRACE_MS,
+            immediate_deletion,
         };
-        let outcomes = resolve_identity(&snap, &view, clock);
+        let mut outcomes = resolve_identity(&snap, &view, clock);
+        if force_adopt {
+            for o in outcomes.iter_mut() {
+                if let Outcome::PendingAdoption { path } = o {
+                    *o = Outcome::Adopt { path: path.clone() };
+                }
+            }
+        }
 
         let mut report = ReconcileReport::default();
         if outcomes
@@ -118,7 +155,6 @@ impl App {
             .into_iter()
             .map(|s| (s.uid.clone(), s))
             .collect();
-        let mut carried: Vec<Task> = Vec::new();
 
         for outcome in &outcomes {
             match outcome {
@@ -198,11 +234,17 @@ impl App {
                     if let Some(e) = view.entries.iter().find(|e| &e.uid == uid) {
                         entries.push(e.clone());
                     }
-                    if let Some(s) = cached_by_uid.get(uid.as_str()) {
-                        carried.push(task_from_summary(s));
-                    }
                 }
-                Outcome::Delete { .. } => report.deleted += 1,
+                Outcome::Delete { uid } => {
+                    report.deleted += 1;
+                    // A confirmed deletion must retire its `pending_deletions`
+                    // row, not just leave it stale: `carry_pending_deletions`
+                    // (see below, and `refresh_cache`) trusts that table as
+                    // "still mid grace period" — an uncleared row would let a
+                    // just-deleted task get silently resurrected into the
+                    // cache by nothing more than an unrelated later write.
+                    self.index.clear_pending_deletion(&self.project, uid)?;
+                }
                 Outcome::ScanRejected { .. } => unreachable!("handled above"),
             }
         }
@@ -210,10 +252,22 @@ impl App {
         self.index.apply(&self.project, &entries)?;
         // Cache the parsed content so every later read is a SQL query, never a
         // file read (spec §3). The scan already parsed these — this is free.
-        // `carried` adds back the tasks the scan didn't see this cycle but
-        // that are only pending deletion, not deleted yet.
+        // `carry_pending_deletions` adds back the tasks the scan didn't see
+        // this cycle but that are only pending deletion, not deleted yet —
+        // read AFTER the loop above so it sees this pass's own
+        // mark_pending_deletion/clear_pending_deletion calls.
+        let observed_uids: std::collections::BTreeSet<&str> = snap
+            .observed
+            .iter()
+            .filter_map(|o| o.uid.as_ref().map(TaskUid::as_str))
+            .collect();
+        let pending_deletions = self.index.view(&self.project)?.pending_deletions;
         let mut cached: Vec<Task> = parsed.into_values().collect();
-        cached.extend(carried);
+        cached.extend(carry_pending_deletions(
+            &pending_deletions,
+            cached_by_uid.values(),
+            &observed_uids,
+        ));
         self.index.cache_tasks(&self.project, &cached)?;
         Ok(report)
     }
@@ -248,6 +302,30 @@ impl App {
         parsed.insert(path.to_string(), task);
         Ok(())
     }
+}
+
+/// Task placeholders for every uid the project's index currently has
+/// recorded as mid pending-deletion grace period, for any such uid
+/// `observed` (the uids a fresh scan just saw) doesn't cover. Without this,
+/// a task counting down its grace period vanishes from `list()` the instant
+/// *anything* replaces the cache — not only the reconcile pass that first
+/// noticed its absence. Shared by `reconcile_with` (whose own outcomes loop
+/// keeps `pending_deletions` current before calling this) and
+/// `App::refresh_cache` in `write.rs` (which has no identity-resolution
+/// pass of its own and would otherwise trust a bare scan that cannot tell
+/// "gone" from "still counting down").
+pub(crate) fn carry_pending_deletions<'a>(
+    pending_deletions: &std::collections::BTreeMap<TaskUid, i64>,
+    cached: impl Iterator<Item = &'a TaskSummary>,
+    observed: &std::collections::BTreeSet<&str>,
+) -> Vec<Task> {
+    cached
+        .filter(|s| {
+            !observed.contains(s.uid.as_str())
+                && TaskUid::parse(&s.uid).is_some_and(|u| pending_deletions.contains_key(&u))
+        })
+        .map(task_from_summary)
+        .collect()
 }
 
 /// Reconstructs just enough of a `Task` to round-trip through `cache_tasks`,

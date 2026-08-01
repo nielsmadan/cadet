@@ -51,6 +51,16 @@ pub struct IndexView {
 pub struct ScanClock {
     pub now_ms: i64,
     pub grace_ms: i64,
+    /// True only for the single reconcile pass that immediately follows an
+    /// explicit `undo`: a `git reset --hard` makes an absence intentional,
+    /// not a possible sync artefact, so a uid observed absent for the FIRST
+    /// time in this pass — no `pending_deletions` record yet — is deleted
+    /// at once instead of entering the normal grace period. A uid that
+    /// already had a `pending_deletions` record before this pass (mid grace
+    /// period for a reason unrelated to the undo) is left exactly as it
+    /// was: this flag must never shorten or reset an unrelated task's
+    /// countdown.
+    pub immediate_deletion: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,11 +228,16 @@ pub fn resolve_identity(snap: &Snapshot, idx: &IndexView, clock: ScanClock) -> V
                 reason: RejectReason::Incomplete,
             }];
         }
-        // Guard 3: absence must persist across the grace period.
-        let confirmed = idx
-            .pending_deletions
-            .get(&e.uid)
-            .is_some_and(|t| clock.now_ms - t >= clock.grace_ms);
+        // Guard 3: absence must persist across the grace period — except a
+        // fresh (never-before-seen) absence during the post-undo pass,
+        // which is confirmed on the spot. See `ScanClock::immediate_deletion`.
+        let confirmed = if clock.immediate_deletion && !idx.pending_deletions.contains_key(&e.uid) {
+            true
+        } else {
+            idx.pending_deletions
+                .get(&e.uid)
+                .is_some_and(|t| clock.now_ms - t >= clock.grace_ms)
+        };
         out.push(if confirmed {
             Outcome::Delete { uid: e.uid.clone() }
         } else {
@@ -257,6 +272,14 @@ mod tests {
         ScanClock {
             now_ms,
             grace_ms: 60_000,
+            immediate_deletion: false,
+        }
+    }
+
+    fn undo_clock(now_ms: i64) -> ScanClock {
+        ScanClock {
+            immediate_deletion: true,
+            ..clock(now_ms)
         }
     }
 
@@ -516,6 +539,38 @@ mod tests {
         idx.pending_deletions.insert(uid(1), 0);
         let out = resolve_identity(&snap, &idx, clock(60_001));
         assert_eq!(out, vec![Outcome::Delete { uid: uid(1) }]);
+    }
+
+    #[test]
+    fn immediate_deletion_deletes_a_freshly_absent_uid_at_once() {
+        let snap = Snapshot {
+            complete: true,
+            observed: vec![],
+        };
+        let mut idx = IndexView::default();
+        idx.entries.push(seen(uid(1), "a.md"));
+        // No `pending_deletions` record yet — this is the first time the
+        // uid is observed absent.
+        let out = resolve_identity(&snap, &idx, undo_clock(0));
+        assert_eq!(out, vec![Outcome::Delete { uid: uid(1) }]);
+    }
+
+    #[test]
+    fn immediate_deletion_does_not_disturb_an_already_pending_uid() {
+        let snap = Snapshot {
+            complete: true,
+            observed: vec![],
+        };
+        let mut idx = IndexView::default();
+        idx.entries.push(seen(uid(1), "a.md"));
+        // Already mid grace period for a reason unrelated to this pass.
+        idx.pending_deletions.insert(uid(1), 0);
+        let out = resolve_identity(&snap, &idx, undo_clock(1_000));
+        assert_eq!(
+            out,
+            vec![Outcome::PendingDeletion { uid: uid(1) }],
+            "an existing pending-deletion record must not be short-circuited by an unrelated undo"
+        );
     }
 
     #[test]

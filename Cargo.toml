@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/backend-fs", "crates/store-sqlite", "crates/app"]
+members = ["crates/core", "crates/backend-fs", "crates/store-sqlite", "crates/app", "crates/cli"]
 
 [workspace.package]
 edition = "2024"
@@ -12,6 +12,9 @@ ulid = "3.0"
 jiff = "0.2"
 blake3 = "1.8"
 toml_edit = { version = "0.25", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+miette = { version = "7.6", features = ["fancy"] }
+directories = "6"
 # Brief pins "0.40", but rusqlite 0.40.x (and its libsqlite3-sys 0.38.x) use
 # the unstable `cfg_select!` macro in their own library source, not just a
 # build script, so they cannot compile under this workspace's pinned stable

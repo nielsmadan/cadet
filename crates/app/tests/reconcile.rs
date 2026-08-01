@@ -18,6 +18,7 @@ struct Fixture {
     _repo: tempfile::TempDir,
     app: App,
     vault_path: std::path::PathBuf,
+    repo_dir: std::path::PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -26,7 +27,8 @@ fn fixture() -> Fixture {
     std::fs::write(vault.path().join("project.toml"), CFG).unwrap();
     let backend = FsBackend::new(vault.path().to_path_buf());
     let index = SqliteIndex::open_in_memory().unwrap();
-    let git = GitNet::new(repo.path().join("r.git"), vault.path().to_path_buf());
+    let repo_dir = repo.path().join("r.git");
+    let git = GitNet::new(repo_dir.clone(), vault.path().to_path_buf());
     git.ensure_init().unwrap();
     let vault_path = vault.path().to_path_buf();
     Fixture {
@@ -34,7 +36,42 @@ fn fixture() -> Fixture {
         _repo: repo,
         app: App::new(Box::new(backend), index, git, "p".into()),
         vault_path,
+        repo_dir,
     }
+}
+
+/// Commits directly against the fixture's repo, bypassing `App` entirely —
+/// used to simulate a change that lands in its own git commit, independent
+/// of any `App` write path, so a later `undo` (which only reverts the most
+/// recent commit) cannot accidentally touch it.
+fn commit_raw(repo_dir: &std::path::Path, work_tree: &std::path::Path, message: &str) {
+    let add = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_dir)
+        .arg("--work-tree")
+        .arg(work_tree)
+        .args(["add", "--all"])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+    let commit = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_dir)
+        .arg("--work-tree")
+        .arg(work_tree)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ])
+        .output()
+        .unwrap();
+    assert!(commit.status.success());
 }
 
 #[test]
@@ -100,6 +137,237 @@ fn a_hand_written_note_is_adopted_after_the_grace_period() {
     assert!(raw.contains("uid: "), "adoption must write uid back");
     assert!(raw.contains("key: P-"), "adoption must write key back");
     assert!(raw.contains("Hand made"), "the original title must survive");
+}
+
+#[test]
+fn a_pending_note_adopts_after_the_grace_period_even_when_polled() {
+    let f = fixture();
+    std::fs::write(
+        f.vault_path.join("note.md"),
+        "---\nstate: todo\ntitle: Hand made\n---\nx\n",
+    )
+    .unwrap();
+    // Poll repeatedly inside the grace window, as running `cadet ls` more
+    // than once a minute would. Each poll must not restart the clock.
+    for t in [0, 10_000, 20_000, 30_000, 40_000, 50_000, 59_000] {
+        let r = f.app.reconcile(t).unwrap();
+        assert_eq!(
+            r.adopted, 0,
+            "must not adopt before the grace period, t={t}"
+        );
+    }
+    let r = f.app.reconcile(60_001).unwrap();
+    assert_eq!(
+        r.adopted, 1,
+        "polling during the grace period must not have reset since_ms"
+    );
+}
+
+#[test]
+fn adopt_pending_bypasses_the_grace_period_for_a_hand_written_note() {
+    let f = fixture();
+    std::fs::write(
+        f.vault_path.join("note.md"),
+        "---\nstate: todo\ntitle: Hand made\n---\nx\n",
+    )
+    .unwrap();
+    // Never polled before — `adopt_pending` still adopts immediately: the
+    // explicit request is itself the confirmation the grace period waits for.
+    let r = f.app.adopt_pending(0).unwrap();
+    assert_eq!(r.adopted, 1);
+    assert_eq!(f.app.list(true).unwrap().len(), 1);
+}
+
+#[test]
+fn a_write_does_not_drop_another_task_that_is_mid_grace_period() {
+    let f = fixture();
+    let a = f.app.add("vanishing").unwrap();
+    f.app.add("steady").unwrap();
+    f.app.reconcile(0).unwrap();
+
+    std::fs::remove_file(f.vault_path.join("vanishing.md")).unwrap();
+    let r = f.app.reconcile(1_000).unwrap();
+    assert_eq!(
+        r.pending_deletion, 1,
+        "the vanished task must start a grace period"
+    );
+
+    // An ordinary write, unrelated to the vanished task, made while it is
+    // still mid grace period. `add`'s internal `refresh_cache` must not
+    // silently drop it from the cache just because this scan doesn't see it.
+    f.app.add("third task").unwrap();
+
+    let tasks = f.app.list(true).unwrap();
+    assert!(
+        tasks.iter().any(|t| t.uid == a.uid.as_str()),
+        "a task mid pending-deletion grace period must survive an unrelated write, got: {tasks:?}"
+    );
+    assert!(tasks.iter().any(|t| t.title == "steady"));
+    assert!(tasks.iter().any(|t| t.title == "third task"));
+}
+
+#[test]
+fn an_explicitly_removed_task_does_not_reappear() {
+    let f = fixture();
+    let a = f.app.add("delete me").unwrap();
+    // Mirrors the real CLI: a reconcile always runs before a command
+    // dispatches, so `entries` already knows this uid by the time `delete`
+    // runs — exactly the condition that let the stale row linger before
+    // this fix.
+    f.app.reconcile(0).unwrap();
+    f.app.delete(&a.key).unwrap();
+
+    // Reconcile twice, both times well past what the deletion grace period
+    // would have been had this gone through the inferred-absence path.
+    let r1 = f.app.reconcile(1_000).unwrap();
+    assert_eq!(
+        r1.pending_deletion, 0,
+        "an explicit delete must never enter the deletion grace period"
+    );
+    assert_eq!(
+        r1.deleted, 0,
+        "there is nothing left to (re)discover as deleted"
+    );
+    assert!(
+        !f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.uid == a.uid.as_str()),
+        "the explicitly removed task must not be listed"
+    );
+
+    let r2 = f.app.reconcile(1_000 + 60_000 + 1).unwrap();
+    assert_eq!(r2.pending_deletion, 0);
+    assert_eq!(r2.deleted, 0);
+    assert!(
+        !f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.uid == a.uid.as_str()),
+        "the explicitly removed task must never reappear"
+    );
+}
+
+#[test]
+fn removing_one_task_does_not_disturb_another_mid_grace_period() {
+    let f = fixture();
+    let vanishing = f.app.add("vanishing").unwrap();
+    let doomed = f.app.add("doomed").unwrap();
+    f.app.reconcile(0).unwrap();
+
+    // `vanishing` disappears externally and starts its own grace period,
+    // entirely unrelated to anything `delete` will do below.
+    std::fs::remove_file(f.vault_path.join("vanishing.md")).unwrap();
+    let r = f.app.reconcile(1_000).unwrap();
+    assert_eq!(
+        r.pending_deletion, 1,
+        "the vanished task must start its own grace period"
+    );
+    assert!(
+        f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.uid == vanishing.uid.as_str()),
+        "the vanished task must still be listed during its grace period"
+    );
+
+    // An explicit `cadet rm` of a completely different task.
+    f.app.delete(&doomed.key).unwrap();
+
+    let tasks = f.app.list(true).unwrap();
+    assert!(
+        tasks.iter().any(|t| t.uid == vanishing.uid.as_str()),
+        "an unrelated explicit delete must not disturb another task's own grace period"
+    );
+    assert!(
+        !tasks.iter().any(|t| t.uid == doomed.uid.as_str()),
+        "the explicitly removed task must be gone immediately"
+    );
+
+    // The vanished task's own grace period must still run its normal,
+    // untouched course.
+    let r2 = f.app.reconcile(1_000 + 60_000 + 1).unwrap();
+    assert_eq!(r2.deleted, 1);
+    assert!(
+        !f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.uid == vanishing.uid.as_str())
+    );
+}
+
+#[test]
+fn undo_does_not_discard_another_tasks_pending_deletion() {
+    let f = fixture();
+
+    // Task A: removed by hand (as an external sync tool might) and
+    // committed on its own, entirely independent of anything `undo` will
+    // later revert. Reconciled into its own, independent pending-deletion
+    // window.
+    let _a = f.app.add("unrelated").unwrap();
+    f.app.reconcile(0).unwrap();
+    std::fs::remove_file(f.vault_path.join("unrelated.md")).unwrap();
+    commit_raw(&f.repo_dir, &f.vault_path, "remove unrelated by hand");
+    let r1 = f.app.reconcile(1_000).unwrap();
+    assert_eq!(
+        r1.pending_deletion, 1,
+        "task A must start its own grace period"
+    );
+    assert!(
+        f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.title == "unrelated"),
+        "task A must still be listed during its grace period"
+    );
+
+    // Task B: added through the ordinary `App::add` write path — its own
+    // git commit, and its own `refresh_cache` call. `refresh_cache` must
+    // now carry task A's placeholder forward too (that's the fix this
+    // round), so this exercises the exact path `cadet add` followed by
+    // `cadet undo` takes in practice, rather than sidestepping it.
+    let _b = f.app.add("mistake").unwrap();
+    assert!(
+        f.app
+            .list(true)
+            .unwrap()
+            .iter()
+            .any(|t| t.title == "unrelated"),
+        "an unrelated write must not have dropped task A mid-grace-period"
+    );
+    f.app.reconcile(1_500).unwrap();
+
+    f.app.undo().unwrap();
+    let r2 = f.app.reconcile_after_undo(2_000).unwrap();
+    assert_eq!(r2.deleted, 1, "the undone task must be deleted immediately");
+    assert_eq!(
+        r2.pending_deletion, 1,
+        "task A's unrelated pending deletion must still be tracked, not silently dropped"
+    );
+
+    let tasks = f.app.list(true).unwrap();
+    assert!(
+        tasks.iter().any(|t| t.title == "unrelated"),
+        "an unrelated task's pending-deletion grace period must survive an unconnected undo"
+    );
+    assert!(
+        !tasks.iter().any(|t| t.title == "mistake"),
+        "the undone task must be gone"
+    );
+
+    // Advance well past task A's ORIGINAL grace-period baseline (since_ms
+    // = 1_000). If the undo pass had reset or extended it, this would
+    // either already have fired early or would still be pending here.
+    let r3 = f.app.reconcile(1_000 + 60_000 + 1).unwrap();
+    assert_eq!(
+        r3.deleted, 1,
+        "task A's own grace period must have run its normal, untouched course"
+    );
 }
 
 #[test]

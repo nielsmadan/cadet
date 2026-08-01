@@ -116,6 +116,14 @@ impl SqliteIndex {
         Ok(())
     }
 
+    /// Records a note as pending adoption. Unlike a plain upsert, `since_ms`
+    /// is preserved across repeated calls with the same `revision` — a
+    /// reconcile run every time `cadet ls` is called must not restart the
+    /// grace-period countdown on every poll, or a note that changes hands
+    /// less often than the polling interval never finishes adopting. A
+    /// genuinely changed revision still resets the clock: that's the
+    /// "changed content restarts the grace period" rule (§5), preserved by
+    /// the `WHERE` clause only firing when the revision actually differs.
     pub fn mark_pending(
         &self,
         project: &str,
@@ -124,8 +132,11 @@ impl SqliteIndex {
         since_ms: i64,
     ) -> Result<(), IndexError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO pending (project, path, revision, since_ms)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO pending (project, path, revision, since_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project, path) DO UPDATE SET
+                 revision = excluded.revision,
+                 since_ms = excluded.since_ms
+             WHERE pending.revision != excluded.revision",
             params![project, path, rev.as_str(), since_ms],
         )?;
         Ok(())
@@ -276,6 +287,21 @@ impl SqliteIndex {
         rows.next().transpose().map_err(Into::into)
     }
 
+    /// Removes a single uid from `entries`, `tasks`, and `pending_deletions`
+    /// in one call — the narrow, uid-scoped counterpart to `clear` (which is
+    /// project-wide). For when the caller already knows, with certainty,
+    /// that this exact task is gone (an explicit delete): there is nothing
+    /// left to infer, so nothing else in the project is touched.
+    pub fn forget(&self, project: &str, uid: &TaskUid) -> Result<(), IndexError> {
+        for table in ["entries", "tasks", "pending_deletions"] {
+            self.conn.execute(
+                &format!("DELETE FROM {table} WHERE project = ?1 AND uid = ?2"),
+                params![project, uid.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Wipes the derived view. High-water marks deliberately survive.
     pub fn clear(&self, project: &str) -> Result<(), IndexError> {
         for t in ["entries", "pending", "pending_deletions", "tasks"] {
@@ -352,6 +378,39 @@ mod tests {
     }
 
     #[test]
+    fn marking_pending_again_with_the_same_revision_preserves_since_ms() {
+        let i = idx();
+        i.mark_pending("p", "new.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        // Simulates a later poll (e.g. another `cadet ls`) observing the
+        // same, unchanged file — must not restart the grace-period clock.
+        i.mark_pending("p", "new.md", &Revision::from_raw("r1"), 999_000)
+            .unwrap();
+        let v = i.view("p").unwrap();
+        assert_eq!(
+            v.pending.get("new.md").unwrap().1,
+            100,
+            "an unchanged revision must not reset since_ms"
+        );
+    }
+
+    #[test]
+    fn marking_pending_with_a_changed_revision_resets_since_ms() {
+        let i = idx();
+        i.mark_pending("p", "new.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending("p", "new.md", &Revision::from_raw("r2"), 999_000)
+            .unwrap();
+        let v = i.view("p").unwrap();
+        assert_eq!(
+            v.pending.get("new.md").unwrap().1,
+            999_000,
+            "a genuinely changed revision must restart the grace period"
+        );
+        assert_eq!(v.pending.get("new.md").unwrap().0, Revision::from_raw("r2"));
+    }
+
+    #[test]
     fn clear_wipes_a_project_but_keeps_high_water() {
         let i = idx();
         i.apply("p", &[entry("a.md")]).unwrap();
@@ -365,6 +424,42 @@ mod tests {
             9,
             "high-water must survive an index rebuild"
         );
+    }
+
+    #[test]
+    fn forget_removes_one_uid_from_every_table_but_leaves_others_untouched() {
+        let i = idx();
+        let gone = entry("gone.md");
+        let other = entry("other.md");
+        i.apply("p", &[gone.clone(), other.clone()]).unwrap();
+        i.cache_tasks(
+            "p",
+            &[
+                task_with_uid(gone.uid.clone(), 1, "gone"),
+                task_with_uid(other.uid.clone(), 2, "other"),
+            ],
+        )
+        .unwrap();
+        i.mark_pending_deletion("p", &gone.uid, 100).unwrap();
+        i.mark_pending_deletion("p", &other.uid, 100).unwrap();
+
+        i.forget("p", &gone.uid).unwrap();
+
+        let v = i.view("p").unwrap();
+        assert!(
+            !v.entries.iter().any(|e| e.uid == gone.uid),
+            "forget must remove the entries row"
+        );
+        assert!(
+            v.entries.iter().any(|e| e.uid == other.uid),
+            "forget must not touch a different uid's entry"
+        );
+        assert!(!v.pending_deletions.contains_key(&gone.uid));
+        assert!(v.pending_deletions.contains_key(&other.uid));
+
+        let tasks = i.list_tasks("p", true, &[]).unwrap();
+        assert!(!tasks.iter().any(|t| t.uid == gone.uid.as_str()));
+        assert!(tasks.iter().any(|t| t.uid == other.uid.as_str()));
     }
 
     fn task(num: u32, title: &str, state: &str, due: Option<&str>) -> cadet_core::Task {
@@ -382,6 +477,13 @@ mod tests {
             possible_duplicate_of: None,
             fields: Default::default(),
             body: String::new(),
+        }
+    }
+
+    fn task_with_uid(uid: TaskUid, num: u32, title: &str) -> cadet_core::Task {
+        cadet_core::Task {
+            uid,
+            ..task(num, title, "todo", None)
         }
     }
 
