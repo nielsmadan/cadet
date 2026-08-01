@@ -49,6 +49,25 @@ CREATE TABLE IF NOT EXISTS pending_renumbers (
     since_ms  INTEGER NOT NULL,
     PRIMARY KEY (project, path)
 );
+-- Tags and custom fields for the display cache. Separate tables rather than
+-- delimited columns: a tag or a list item may contain any character, and a
+-- delimiter that appears in the data is a silent corruption. Disposable like
+-- `tasks` — rewritten wholesale by `cache_tasks`.
+CREATE TABLE IF NOT EXISTS task_tags (
+    project   TEXT NOT NULL,
+    uid       TEXT NOT NULL,
+    ord       INTEGER NOT NULL,
+    tag       TEXT NOT NULL,
+    PRIMARY KEY (project, uid, ord)
+);
+CREATE TABLE IF NOT EXISTS task_fields (
+    project   TEXT NOT NULL,
+    uid       TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    kind      TEXT NOT NULL,
+    value     TEXT NOT NULL,
+    PRIMARY KEY (project, uid, name)
+);
 "#;
 
 /// Created separately from `DDL` because it can legitimately fail on an index

@@ -1,7 +1,8 @@
 pub mod schema;
 
-use cadet_core::{IndexEntry, IndexView, Priority, Revision, Task, TaskKey, TaskUid};
+use cadet_core::{FieldValue, IndexEntry, IndexView, Priority, Revision, Task, TaskKey, TaskUid};
 use rusqlite::{Connection, params};
+use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -19,6 +20,53 @@ pub struct TaskSummary {
     pub state: String,
     pub due: Option<String>,
     pub priority: Priority,
+    pub tags: Vec<String>,
+    pub fields: BTreeMap<String, FieldValue>,
+}
+
+fn encode_field(v: &FieldValue) -> (&'static str, String) {
+    match v {
+        FieldValue::Str(s) => ("str", s.clone()),
+        FieldValue::Int(i) => ("int", i.to_string()),
+        FieldValue::Float(f) => ("float", f.to_string()),
+        FieldValue::Bool(b) => ("bool", b.to_string()),
+        FieldValue::Date(d) => ("date", d.clone()),
+        // A bare `join` collapses `[]` and `[""]` to the same string ("").
+        // Reserve "" for the empty list and prefix every non-empty list with
+        // a leading separator, so `[""]` encodes as "\u{1f}" and decodes back
+        // to one empty-string element instead of zero elements.
+        FieldValue::List(items) => {
+            if items.is_empty() {
+                ("list", String::new())
+            } else {
+                ("list", format!("\u{1f}{}", items.join("\u{1f}")))
+            }
+        }
+    }
+}
+
+fn decode_field(kind: &str, raw: &str) -> FieldValue {
+    match kind {
+        "int" => raw
+            .parse()
+            .map(FieldValue::Int)
+            .unwrap_or_else(|_| FieldValue::Str(raw.into())),
+        "float" => raw
+            .parse()
+            .map(FieldValue::Float)
+            .unwrap_or_else(|_| FieldValue::Str(raw.into())),
+        "bool" => FieldValue::Bool(raw == "true"),
+        "date" => FieldValue::Date(raw.into()),
+        "list" => {
+            if raw.is_empty() {
+                FieldValue::List(vec![])
+            } else {
+                let rest = raw.strip_prefix('\u{1f}').unwrap_or(raw);
+                FieldValue::List(rest.split('\u{1f}').map(str::to_string).collect())
+            }
+        }
+        _ => FieldValue::Str(raw.into()),
+    }
 }
 
 pub struct SqliteIndex {
@@ -325,6 +373,12 @@ impl SqliteIndex {
     pub fn cache_tasks(&self, project: &str, tasks: &[Task]) -> Result<(), IndexError> {
         self.conn
             .execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
+        self.conn
+            .execute("DELETE FROM task_tags WHERE project = ?1", params![project])?;
+        self.conn.execute(
+            "DELETE FROM task_fields WHERE project = ?1",
+            params![project],
+        )?;
         for t in tasks {
             // A plain INSERT, not `INSERT OR REPLACE`: with `tasks_unique_key`
             // in place, `OR REPLACE` would silently delete whichever task
@@ -350,6 +404,19 @@ impl SqliteIndex {
                     },
                 ],
             )?;
+            for (i, tag) in t.tags.iter().enumerate() {
+                self.conn.execute(
+                    "INSERT INTO task_tags (project, uid, ord, tag) VALUES (?1, ?2, ?3, ?4)",
+                    params![project, t.uid.as_str(), i as i64, tag],
+                )?;
+            }
+            for (name, value) in &t.fields {
+                let (kind, encoded) = encode_field(value);
+                self.conn.execute(
+                    "INSERT INTO task_fields (project, uid, name, kind, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![project, t.uid.as_str(), name, kind, encoded],
+                )?;
+            }
         }
         Ok(())
     }
@@ -366,7 +433,49 @@ impl SqliteIndex {
                 2 => Priority::Low,
                 _ => Priority::Normal,
             },
+            tags: Vec::new(),
+            fields: BTreeMap::new(),
         })
+    }
+
+    fn hydrate(&self, project: &str, out: &mut [TaskSummary]) -> Result<(), IndexError> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let mut by_uid: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, s) in out.iter().enumerate() {
+            by_uid.insert(s.uid.clone(), i);
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT uid, tag FROM task_tags WHERE project = ?1 ORDER BY uid, ord")?;
+        let rows = st.query_map(params![project], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (uid, tag) = row?;
+            if let Some(&i) = by_uid.get(uid.as_str()) {
+                out[i].tags.push(tag);
+            }
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT uid, name, kind, value FROM task_fields WHERE project = ?1")?;
+        let rows = st.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (uid, name, kind, value) = row?;
+            if let Some(&i) = by_uid.get(uid.as_str()) {
+                out[i].fields.insert(name, decode_field(&kind, &value));
+            }
+        }
+        Ok(())
     }
 
     /// The list view. One query — never touches the backend (spec §3).
@@ -390,6 +499,7 @@ impl SqliteIndex {
                 out.push(s);
             }
         }
+        self.hydrate(project, &mut out)?;
         Ok(out)
     }
 
@@ -406,10 +516,16 @@ impl SqliteIndex {
             params![project, key.number as i64, key.prefix],
             Self::row_to_summary,
         )?;
-        rows.next().transpose().map_err(Into::into)
+        let found = rows.next().transpose()?;
+        let Some(s) = found else {
+            return Ok(None);
+        };
+        let mut v = vec![s];
+        self.hydrate(project, &mut v)?;
+        Ok(Some(v.remove(0)))
     }
 
-    /// Removes a single uid from all five tables — the narrow, uid-scoped
+    /// Removes a single uid from all seven tables — the narrow, uid-scoped
     /// counterpart to `clear` (which is project-wide). For when the caller
     /// already knows, with certainty, that this exact task is gone (an
     /// explicit delete): there is nothing left to infer, so nothing else in
@@ -432,7 +548,13 @@ impl SqliteIndex {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        for table in ["entries", "tasks", "pending_deletions"] {
+        for table in [
+            "entries",
+            "tasks",
+            "pending_deletions",
+            "task_tags",
+            "task_fields",
+        ] {
             self.conn.execute(
                 &format!("DELETE FROM {table} WHERE project = ?1 AND uid = ?2"),
                 params![project, uid.as_str()],
@@ -449,7 +571,9 @@ impl SqliteIndex {
         Ok(())
     }
 
-    /// Wipes the derived view. High-water marks deliberately survive.
+    /// Wipes the derived view, including the tags and custom fields cached
+    /// alongside `tasks` — they are as much a part of the derived view as the
+    /// row they're keyed on. High-water marks deliberately survive.
     pub fn clear(&self, project: &str) -> Result<(), IndexError> {
         for t in [
             "entries",
@@ -457,6 +581,8 @@ impl SqliteIndex {
             "pending_deletions",
             "pending_renumbers",
             "tasks",
+            "task_tags",
+            "task_fields",
         ] {
             self.conn.execute(
                 &format!("DELETE FROM {t} WHERE project = ?1"),
@@ -470,7 +596,8 @@ impl SqliteIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadet_core::{IndexEntry, Revision, TaskUid};
+    use cadet_core::{FieldValue, IndexEntry, Revision, TaskUid};
+    use std::collections::BTreeMap;
 
     fn idx() -> SqliteIndex {
         SqliteIndex::open_in_memory().unwrap()
@@ -903,5 +1030,154 @@ mod tests {
             .unwrap();
         let v = i.view("p").unwrap();
         assert_eq!(v.pending.get("new.md").unwrap().1, 500_000);
+    }
+
+    #[test]
+    fn cached_tasks_round_trip_tags_and_custom_fields() {
+        let ix = SqliteIndex::open_in_memory().unwrap();
+        let mut t = Task {
+            uid: TaskUid::generate(),
+            key: TaskKey::new("T", 1),
+            title: "with extras".into(),
+            state: "todo".into(),
+            created: "2026-08-02T00:00:00Z".parse().unwrap(),
+            updated: "2026-08-02T00:00:00Z".parse().unwrap(),
+            due: None,
+            priority: Priority::Normal,
+            tags: vec!["home".into(), "errand".into()],
+            renumbered_from: None,
+            possible_duplicate_of: None,
+            fields: BTreeMap::new(),
+            body: String::new(),
+        };
+        t.fields.insert("estimate".into(), FieldValue::Int(3));
+        t.fields
+            .insert("area".into(), FieldValue::Str("kitchen".into()));
+
+        ix.cache_tasks("p", &[t.clone()]).unwrap();
+
+        let got = ix.list_tasks("p", true, &[]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].tags, vec!["home".to_string(), "errand".to_string()]);
+        assert_eq!(got[0].fields.get("estimate"), Some(&FieldValue::Int(3)));
+        assert_eq!(
+            got[0].fields.get("area"),
+            Some(&FieldValue::Str("kitchen".into()))
+        );
+
+        let one = ix.find_by_key("p", &TaskKey::new("T", 1)).unwrap().unwrap();
+        assert_eq!(one.tags, vec!["home".to_string(), "errand".to_string()]);
+        assert_eq!(one.fields.get("estimate"), Some(&FieldValue::Int(3)));
+    }
+
+    #[test]
+    fn recaching_replaces_tags_and_fields_rather_than_accumulating() {
+        let ix = SqliteIndex::open_in_memory().unwrap();
+        let uid = TaskUid::generate();
+        let mk = |tags: Vec<String>| Task {
+            uid: uid.clone(),
+            key: TaskKey::new("T", 1),
+            title: "t".into(),
+            state: "todo".into(),
+            created: "2026-08-02T00:00:00Z".parse().unwrap(),
+            updated: "2026-08-02T00:00:00Z".parse().unwrap(),
+            due: None,
+            priority: Priority::Normal,
+            tags,
+            renumbered_from: None,
+            possible_duplicate_of: None,
+            fields: BTreeMap::new(),
+            body: String::new(),
+        };
+        ix.cache_tasks("p", &[mk(vec!["a".into(), "b".into()])])
+            .unwrap();
+        ix.cache_tasks("p", &[mk(vec!["c".into()])]).unwrap();
+        let got = ix.list_tasks("p", true, &[]).unwrap();
+        assert_eq!(got[0].tags, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn forget_clears_the_tag_and_field_tables_too() {
+        let i = idx();
+        let gone = entry("gone.md");
+        i.apply("p", std::slice::from_ref(&gone)).unwrap();
+        let mut t = task_with_uid(gone.uid.clone(), 1, "gone");
+        t.tags = vec!["a".into(), "b".into()];
+        t.fields.insert("x".into(), FieldValue::Int(1));
+        i.cache_tasks("p", &[t]).unwrap();
+
+        i.forget("p", &gone.uid).unwrap();
+
+        let tag_count: i64 = i
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_tags WHERE project = 'p' AND uid = ?1",
+                params![gone.uid.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let field_count: i64 = i
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_fields WHERE project = 'p' AND uid = ?1",
+                params![gone.uid.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 0, "forget must remove the uid's tags too");
+        assert_eq!(field_count, 0, "forget must remove the uid's fields too");
+    }
+
+    #[test]
+    fn clear_wipes_the_tag_and_field_tables_too() {
+        let i = idx();
+        let mut t = task(1, "x", "todo", None);
+        t.tags = vec!["a".into()];
+        t.fields.insert("y".into(), FieldValue::Str("z".into()));
+        i.cache_tasks("p", &[t]).unwrap();
+
+        i.clear("p").unwrap();
+
+        let tag_count: i64 = i
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_tags WHERE project = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let field_count: i64 = i
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_fields WHERE project = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 0, "clear must wipe tags too");
+        assert_eq!(field_count, 0, "clear must wipe fields too");
+    }
+
+    #[test]
+    fn list_field_round_trips_a_single_empty_string_element() {
+        let (kind, encoded) = encode_field(&FieldValue::List(vec!["".into()]));
+        assert_eq!(
+            decode_field(kind, &encoded),
+            FieldValue::List(vec!["".into()]),
+            "a list containing exactly one empty string must not decode as an empty list"
+        );
+    }
+
+    #[test]
+    fn list_field_round_trips_empty_elements_interspersed_with_non_empty_ones() {
+        let items = vec!["a".to_string(), "".to_string(), "b".to_string()];
+        let (kind, encoded) = encode_field(&FieldValue::List(items.clone()));
+        assert_eq!(decode_field(kind, &encoded), FieldValue::List(items));
+    }
+
+    #[test]
+    fn list_field_round_trips_the_empty_list() {
+        let (kind, encoded) = encode_field(&FieldValue::List(vec![]));
+        assert_eq!(decode_field(kind, &encoded), FieldValue::List(vec![]));
     }
 }

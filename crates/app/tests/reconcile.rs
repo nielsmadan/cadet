@@ -402,6 +402,59 @@ fn an_explicitly_removed_task_does_not_reappear() {
     );
 }
 
+/// `task_from_summary` reconstructs a placeholder `Task` from the cache for
+/// any task the scan didn't observe this cycle (only pending deletion), so
+/// it can round-trip back through `cache_tasks` without vanishing from
+/// `list()` a full deletion cycle early. Now that `cache_tasks` persists
+/// tags and custom fields (not just uid/key/title/state/due/priority), that
+/// reconstruction has to carry them over too, or an unrelated write mid
+/// grace period silently wipes them from the cache.
+#[test]
+fn a_task_mid_grace_period_keeps_its_tags_and_fields_through_a_cache_rebuild() {
+    let f = fixture();
+    std::fs::write(
+        f.vault_path.join("tagged.md"),
+        "---\nstate: todo\ntitle: Tagged\ntags: [home, errand]\n---\nx\n",
+    )
+    .unwrap();
+    f.app.reconcile(0).unwrap();
+    f.app.reconcile(60_001).unwrap();
+    let before = f.app.list(true).unwrap();
+    let tagged = before
+        .iter()
+        .find(|t| t.title == "Tagged")
+        .expect("the hand-written note must have been adopted");
+    assert_eq!(
+        tagged.tags,
+        vec!["home".to_string(), "errand".to_string()],
+        "tags must be cached once the task is adopted"
+    );
+
+    std::fs::remove_file(f.vault_path.join("tagged.md")).unwrap();
+    let r = f.app.reconcile(120_002).unwrap();
+    assert_eq!(
+        r.pending_deletion, 1,
+        "the vanished task must start a grace period"
+    );
+
+    // An ordinary write, unrelated to the vanished task, made while it is
+    // still mid grace period. This forces `cache_tasks` to rewrite the
+    // whole project's cache from `cached_by_uid` (via `task_from_summary`)
+    // union the freshly scanned tasks.
+    f.app.add("unrelated").unwrap();
+
+    let after = f.app.list(true).unwrap();
+    let tagged_after = after
+        .iter()
+        .find(|t| t.title == "Tagged")
+        .expect("a task mid pending-deletion grace period must survive an unrelated write");
+    assert_eq!(
+        tagged_after.tags,
+        vec!["home".to_string(), "errand".to_string()],
+        "tags must survive a cache rebuild while the task is mid grace period"
+    );
+}
+
 #[test]
 fn removing_one_task_does_not_disturb_another_mid_grace_period() {
     let f = fixture();

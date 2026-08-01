@@ -700,8 +700,11 @@ pub(crate) fn carry_absent_tasks<'a>(
 
 /// Reconstructs just enough of a `Task` to round-trip through `cache_tasks`,
 /// for a task the scan didn't observe this cycle (only pending deletion).
-/// `cache_tasks` only persists uid/key/title/state/due/priority — every
-/// other field here is a placeholder and never reaches the `tasks` table.
+/// `cache_tasks` persists uid/key/title/state/due/priority/tags/fields —
+/// `tags` and `fields` are carried over from the summary so a task mid grace
+/// period does not lose them on the next cache rebuild; `created`/`updated`/
+/// `renumbered_from`/`possible_duplicate_of`/`body` are never persisted by
+/// `cache_tasks` and stay placeholders.
 fn task_from_summary(s: &TaskSummary) -> Task {
     Task {
         uid: TaskUid::parse(&s.uid).unwrap_or_else(TaskUid::generate),
@@ -712,10 +715,10 @@ fn task_from_summary(s: &TaskSummary) -> Task {
         updated: jiff::Timestamp::UNIX_EPOCH,
         due: s.due.clone(),
         priority: s.priority,
-        tags: vec![],
+        tags: s.tags.clone(),
         renumbered_from: None,
         possible_duplicate_of: None,
-        fields: std::collections::BTreeMap::new(),
+        fields: s.fields.clone(),
         body: String::new(),
     }
 }
