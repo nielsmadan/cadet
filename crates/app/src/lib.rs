@@ -4,3 +4,4 @@ pub mod write;
 pub use cadet_core::RejectReason;
 pub use git::*;
 pub use reconcile::*;
+pub use write::*;

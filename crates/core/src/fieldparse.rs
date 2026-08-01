@@ -70,7 +70,10 @@ pub fn parse_field_value(def: &FieldDef, raw: &str) -> Result<FieldValue, CoreEr
 /// Deliberately shallow: `YYYY-MM-DD` optionally followed by a time. Dates are
 /// stored as the string the user typed (`Task::due` is an `Option<String>`),
 /// so this rejects obvious nonsense without claiming to be a calendar.
-fn is_date_like(s: &str) -> bool {
+///
+/// This is the shared gate for every date-shaped value Cadet writes, `due`
+/// included — not only declared custom fields of type `Date`/`DateTime`.
+pub fn is_date_like(s: &str) -> bool {
     // Check for valid separator (T or space), and if present, ensure there's content after it.
     let parts: Vec<&str> = s.splitn(2, ['T', ' ']).collect();
     if parts.len() == 2 && parts[1].is_empty() {

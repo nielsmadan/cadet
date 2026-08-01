@@ -3,6 +3,54 @@ use cadet_core::*;
 use cadet_store_sqlite::TaskSummary;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Everything `add_with` needs to create a task. `title` is the only
+/// required field; everything else falls back to the same defaults `add`
+/// always used (`state` to the project workflow's `initial`, `priority` to
+/// `Priority::default()`, `due`/`tags`/`fields` to empty).
+#[derive(Debug, Clone, Default)]
+pub struct TaskDraft {
+    pub title: String,
+    pub state: Option<String>,
+    pub due: Option<String>,
+    pub priority: Option<Priority>,
+    pub tags: Vec<String>,
+    pub fields: BTreeMap<String, FieldValue>,
+}
+
+/// Everything `update` can change on an existing task. Every field is a
+/// no-op when left at its default: `None` means "leave alone" everywhere,
+/// including `due`, where the outer `Option` distinguishes that from `Some(None)`
+/// ("clear it") and a field entry's `Option<FieldValue>` distinguishes "leave
+/// alone" (absent from the map) from "remove it" (`None`).
+#[derive(Debug, Clone, Default)]
+pub struct TaskChanges {
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub due: Option<Option<String>>,
+    pub priority: Option<Priority>,
+    pub tags: Option<Vec<String>>,
+    pub fields: BTreeMap<String, Option<FieldValue>>,
+}
+
+/// `due` is read straight off frontmatter with no validation and compared as
+/// a plain string by `TaskFilter`, which is calendar-correct only when the
+/// format is fixed-width — a task written with `due: 2026-8-10` sorts and
+/// filters wrong forever after. `is_date_like` is the same gate
+/// `parse_field_value` applies to every declared `Date`/`DateTime` field;
+/// `add_with` and `update` are the only two places Cadet ever writes `due`,
+/// so this is the one place that has to call it.
+fn validate_due(due: &Option<String>) -> Result<(), CoreError> {
+    if let Some(d) = due
+        && !is_date_like(d)
+    {
+        return Err(CoreError::FieldType {
+            field: "due".to_string(),
+            expected: "a date such as 2026-08-10".to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl App {
     fn now() -> jiff::Timestamp {
         jiff::Timestamp::now()
@@ -79,24 +127,36 @@ impl App {
     }
 
     pub fn add(&self, title: &str) -> Result<Task, AppError> {
+        self.add_with(TaskDraft {
+            title: title.to_string(),
+            ..Default::default()
+        })
+    }
+
+    pub fn add_with(&self, draft: TaskDraft) -> Result<Task, AppError> {
         let cfg = self.backend.load_project()?;
         let next = self.index.high_water(&self.project)? + 1;
         let now = Self::now();
         let task = Task {
             uid: TaskUid::generate(),
             key: TaskKey::new(cfg.prefix.clone(), next),
-            title: title.to_string(),
-            state: cfg.workflow.initial.clone(),
+            title: draft.title,
+            // Creation has no "from" state, so the transition graph does not
+            // apply — `validate_task` below still requires the state to be
+            // declared, and minting a task straight into `done` to log
+            // something already finished is legitimate, not a bug.
+            state: draft.state.unwrap_or_else(|| cfg.workflow.initial.clone()),
             created: now,
             updated: now,
-            due: None,
-            priority: Priority::Normal,
-            tags: vec![],
+            due: draft.due,
+            priority: draft.priority.unwrap_or_default(),
+            tags: draft.tags,
             renumbered_from: None,
             possible_duplicate_of: None,
-            fields: BTreeMap::new(),
+            fields: draft.fields,
             body: String::new(),
         };
+        validate_due(&task.due)?;
         validate_task(&task, &cfg)?;
         self.backend.put(task.clone(), None)?;
         self.index.bump_high_water(&self.project, next)?;
@@ -120,16 +180,96 @@ impl App {
     }
 
     pub fn set_state(&self, key: &TaskKey, state: &str) -> Result<Task, AppError> {
+        self.update(
+            key,
+            TaskChanges {
+                state: Some(state.to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn update(&self, key: &TaskKey, changes: TaskChanges) -> Result<Task, AppError> {
+        // A change set carrying nothing is a caller no-op, not a write: it
+        // must not rewrite the file, bump `updated`, or leave a git commit
+        // behind. `TaskChanges::default()` (e.g. before any field is set by
+        // a CLI flag) is exactly this case.
+        if changes.title.is_none()
+            && changes.state.is_none()
+            && changes.due.is_none()
+            && changes.priority.is_none()
+            && changes.tags.is_none()
+            && changes.fields.is_empty()
+        {
+            return self.get_by_key(key);
+        }
+
         let cfg = self.backend.load_project()?;
         let mut task = self.get_by_key(key)?;
-        check_transition(&cfg.workflow, &task.state, state)?;
+        if let Some(state) = &changes.state {
+            check_transition(&cfg.workflow, &task.state, state)?;
+        }
+        // Validate only what the caller actually supplied, never the merged
+        // result: `task.due` may already carry a bad date hand-written
+        // straight into the file (adoption never validates `due`), and that
+        // is a pre-existing condition this call did not create and has no
+        // obligation to fix. Rejecting the merge would make an unrelated
+        // change — even a bare state transition — permanently impossible.
+        // The amendment's own words: "you cannot fix a file that already
+        // contains a bad date, but you can stop Cadet writing one."
+        if let Some(due) = &changes.due {
+            validate_due(due)?;
+        }
+        // A removal request for a name the project never declared is not a
+        // no-op: the backend never put an undeclared key into `task.fields`
+        // in the first place (that key is preserved on disk, untouched, at
+        // the backend layer — it was never Cadet's to delete), so silently
+        // succeeding here reports success for a request that changed
+        // nothing.
+        for (name, value) in &changes.fields {
+            if value.is_none() && !cfg.fields.iter().any(|d| &d.name == name) {
+                return Err(CoreError::UnknownField(name.clone()).into());
+            }
+        }
         let expected = revision(&task);
-        task.state = state.to_string();
+        let state_changed = changes.state.is_some();
+
+        if let Some(title) = changes.title {
+            task.title = title;
+        }
+        if let Some(state) = changes.state {
+            task.state = state;
+        }
+        if let Some(due) = changes.due {
+            task.due = due;
+        }
+        if let Some(priority) = changes.priority {
+            task.priority = priority;
+        }
+        if let Some(tags) = changes.tags {
+            task.tags = tags;
+        }
+        for (name, value) in changes.fields {
+            match value {
+                Some(v) => {
+                    task.fields.insert(name, v);
+                }
+                None => {
+                    task.fields.remove(&name);
+                }
+            }
+        }
         task.updated = Self::now();
+
         validate_task(&task, &cfg)?;
         self.backend.put(task.clone(), Some(expected))?;
         self.refresh_cache_or_warn();
-        self.commit_or_warn(&format!("{} -> {}", task.key, state));
+        let message = if state_changed {
+            format!("{} -> {}", task.key, task.state)
+        } else {
+            format!("update {}", task.key)
+        };
+        self.commit_or_warn(&message);
         Ok(task)
     }
 

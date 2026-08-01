@@ -11,6 +11,10 @@ prefix = "P"
 states = ["todo", "doing", "done"]
 initial = "todo"
 terminal = ["done"]
+
+[[fields]]
+name = "estimate"
+type = "int"
 "#;
 
 struct Fixture {
@@ -1388,4 +1392,203 @@ fn one_unreadable_file_does_not_block_every_write() {
         "one file Cadet cannot read must not block every write: {added:?}"
     );
     assert!(f.vault_path.join("new-one.md").exists());
+}
+
+#[test]
+fn add_with_writes_every_field_to_the_file() {
+    let f = fixture();
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert("estimate".to_string(), cadet_core::FieldValue::Int(3));
+    let t = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "full task".into(),
+            state: Some("doing".into()),
+            due: Some("2026-08-10".into()),
+            priority: Some(cadet_core::Priority::High),
+            tags: vec!["home".into(), "urgent".into()],
+            fields,
+        })
+        .unwrap();
+
+    assert_eq!(t.state, "doing");
+    assert_eq!(t.due.as_deref(), Some("2026-08-10"));
+    assert_eq!(t.tags, vec!["home".to_string(), "urgent".to_string()]);
+
+    let src = std::fs::read_to_string(f.vault_path.join("full-task.md")).unwrap();
+    assert!(src.contains("due: 2026-08-10"), "{src}");
+    assert!(src.contains("estimate: 3"), "{src}");
+    assert!(src.contains("urgent"), "{src}");
+}
+
+#[test]
+fn update_changes_only_what_is_named() {
+    let f = fixture();
+    let t = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "keep most".into(),
+            due: Some("2026-08-10".into()),
+            tags: vec!["home".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let after = f
+        .app
+        .update(
+            &t.key,
+            cadet_app::TaskChanges {
+                priority: Some(cadet_core::Priority::High),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(after.priority, cadet_core::Priority::High);
+    assert_eq!(after.due.as_deref(), Some("2026-08-10"), "due must survive");
+    assert_eq!(after.tags, vec!["home".to_string()], "tags must survive");
+    assert_eq!(after.title, "keep most");
+}
+
+#[test]
+fn update_can_clear_a_due_date_and_remove_a_field() {
+    let f = fixture();
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert("estimate".to_string(), cadet_core::FieldValue::Int(3));
+    let t = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "clear me".into(),
+            due: Some("2026-08-10".into()),
+            fields,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut changes = cadet_app::TaskChanges {
+        due: Some(None),
+        ..Default::default()
+    };
+    changes.fields.insert("estimate".to_string(), None);
+    let after = f.app.update(&t.key, changes).unwrap();
+
+    assert_eq!(after.due, None);
+    assert!(!after.fields.contains_key("estimate"));
+}
+
+#[test]
+fn set_state_still_works_and_is_now_an_update() {
+    let f = fixture();
+    let t = f.app.add("legacy path").unwrap();
+    let after = f.app.set_state(&t.key, "doing").unwrap();
+    assert_eq!(after.state, "doing");
+}
+
+#[test]
+fn add_with_rejects_a_badly_formatted_due_date_and_writes_no_file() {
+    let f = fixture();
+    let err = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "bad due".into(),
+            due: Some("2026-8-10".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("due"), "{err}");
+    assert!(!f.vault_path.join("bad-due.md").exists());
+}
+
+/// Reviewer-caught regression: validating the *merged* `due` (rather than
+/// only what the caller supplied in `changes.due`) means a task whose file
+/// already carries a hand-edited bad date — something Cadet itself never
+/// wrote, and `reconcile`/adoption never validates — becomes permanently
+/// stuck: `set_state` (and therefore `cadet done`, `cadet mv`) would refuse
+/// every future transition forever, with no CLI flag able to fix `due` to
+/// get unstuck. The amendment's own words: "you cannot fix a file that
+/// already contains a bad date, but you can stop Cadet writing one" — i.e.
+/// validate only what's supplied, not what's merely carried forward.
+#[test]
+fn set_state_still_works_when_due_on_disk_is_already_malformed() {
+    let f = fixture();
+    let t = f.app.add("hand edited due").unwrap();
+    let path = f.vault_path.join("hand-edited-due.md");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let with_bad_due = src.replacen("state: todo\n", "state: todo\ndue: 2026-8-10\n", 1);
+    assert_ne!(
+        src, with_bad_due,
+        "test setup must actually inject a bad due line"
+    );
+    std::fs::write(&path, with_bad_due).unwrap();
+
+    let after = f
+        .app
+        .set_state(&t.key, "doing")
+        .expect("a pre-existing bad `due` on disk must not block an unrelated transition");
+    assert_eq!(after.state, "doing");
+    assert_eq!(after.due.as_deref(), Some("2026-8-10"), "due is left alone");
+}
+
+#[test]
+fn update_rejects_removing_a_field_the_project_never_declared() {
+    let f = fixture();
+    let t = f.app.add("undeclared field").unwrap();
+    let path = f.vault_path.join("undeclared-field.md");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let with_extra = src.replacen("state: todo\n", "state: todo\nmycolumn: hello\n", 1);
+    std::fs::write(&path, with_extra).unwrap();
+
+    let mut changes = cadet_app::TaskChanges::default();
+    changes.fields.insert("mycolumn".to_string(), None);
+    let err = f
+        .app
+        .update(&t.key, changes)
+        .expect_err("removing an undeclared field must fail, not silently no-op");
+    assert!(err.to_string().contains("mycolumn"), "{err}");
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("mycolumn: hello"),
+        "the undeclared field must be untouched on disk: {after}"
+    );
+}
+
+#[test]
+fn a_no_op_update_does_not_write_or_commit() {
+    let f = fixture();
+    let t = f.app.add("no-op test").unwrap();
+    let path = f.vault_path.join("no-op-test.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let commits_before = commit_count(&f.repo_dir, &f.vault_path);
+
+    let after = f
+        .app
+        .update(&t.key, cadet_app::TaskChanges::default())
+        .unwrap();
+
+    assert_eq!(
+        after.updated, t.updated,
+        "a change set carrying nothing must not bump `updated`"
+    );
+    let src = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(src, before, "a no-op update must not rewrite the file");
+    assert_eq!(
+        commit_count(&f.repo_dir, &f.vault_path),
+        commits_before,
+        "a no-op update must not create a git commit"
+    );
+}
+
+fn commit_count(repo_dir: &std::path::Path, work_tree: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_dir)
+        .arg("--work-tree")
+        .arg(work_tree)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
