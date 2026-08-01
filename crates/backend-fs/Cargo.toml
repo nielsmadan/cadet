@@ -1,0 +1,8 @@
+[package]
+name = "cadet-backend-fs"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cadet-core = { path = "../core" }
+thiserror.workspace = true
