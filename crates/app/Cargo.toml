@@ -1,0 +1,14 @@
+[package]
+name = "cadet-app"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cadet-core = { path = "../core" }
+cadet-backend-fs = { path = "../backend-fs" }
+cadet-store-sqlite = { path = "../store-sqlite" }
+jiff.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
