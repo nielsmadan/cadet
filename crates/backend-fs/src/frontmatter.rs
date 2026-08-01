@@ -62,7 +62,7 @@ impl Frontmatter {
 /// `"\r\n"`, `"\n"`, or `""` for a final line with no trailing newline.
 /// Unlike `str::lines`, the terminator is preserved so untouched lines can
 /// be re-emitted byte-identical regardless of the document's line ending.
-fn split_lines(s: &str) -> Vec<(&str, &str)> {
+pub(crate) fn split_lines(s: &str) -> Vec<(&str, &str)> {
     let mut result = Vec::new();
     let mut rest = s;
     while !rest.is_empty() {
@@ -93,7 +93,7 @@ fn join_lines(lines: &[(&str, &str)]) -> String {
 
 /// Locates the opening and closing fence lines by content, independent of
 /// line-ending style. Returns `(open_idx, close_idx)`.
-fn find_fences(lines: &[(&str, &str)]) -> Option<(usize, usize)> {
+pub(crate) fn find_fences(lines: &[(&str, &str)]) -> Option<(usize, usize)> {
     if lines.is_empty() || lines[0].0 != "---" {
         return None;
     }
