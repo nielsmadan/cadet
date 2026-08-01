@@ -294,10 +294,41 @@ impl App {
     /// The list view. One SQL query — never touches the backend (spec §3).
     /// `all` includes terminal states. Sorting happens in SQL.
     pub fn list(&self, all: bool) -> Result<Vec<TaskSummary>, AppError> {
+        self.list_filtered(all, &TaskFilter::default())
+    }
+
+    /// Same as `list`, narrowed by `filter`. Filtering happens in Rust, not
+    /// SQL: the tag and field predicates would each need a correlated
+    /// subquery, and the list is already fully materialised for display.
+    pub fn list_filtered(
+        &self,
+        all: bool,
+        filter: &TaskFilter,
+    ) -> Result<Vec<TaskSummary>, AppError> {
         let cfg = self.backend.load_project()?;
-        Ok(self
-            .index
-            .list_tasks(&self.project, all, &cfg.workflow.terminal)?)
+        // Naming a state explicitly is itself a request to see it, so the
+        // terminal-state exclusion defers to that: `--state done` must not
+        // be silently emptied by the same hiding that `--all` exists to
+        // override. Without a state filter, the exclusion still applies.
+        let include_terminal = all || !filter.states.is_empty();
+        let rows =
+            self.index
+                .list_tasks(&self.project, include_terminal, &cfg.workflow.terminal)?;
+        if filter.is_empty() {
+            return Ok(rows);
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|s| {
+                filter.matches(&FilterTarget {
+                    state: &s.state,
+                    due: s.due.as_deref(),
+                    priority: s.priority,
+                    tags: &s.tags,
+                    fields: &s.fields,
+                })
+            })
+            .collect())
     }
 
     /// Unlike the write paths above, a failed undo must fail loudly: undo is

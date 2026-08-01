@@ -1580,6 +1580,88 @@ fn a_no_op_update_does_not_write_or_commit() {
     );
 }
 
+#[test]
+fn list_filtered_narrows_by_tag_and_state() {
+    let f = fixture();
+    f.app
+        .add_with(cadet_app::TaskDraft {
+            title: "home one".into(),
+            tags: vec!["home".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    f.app
+        .add_with(cadet_app::TaskDraft {
+            title: "work one".into(),
+            tags: vec!["work".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let filter = cadet_core::TaskFilter {
+        tags: vec!["home".into()],
+        ..Default::default()
+    };
+    let got = f.app.list_filtered(false, &filter).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].title, "home one");
+}
+
+#[test]
+fn list_filtered_with_an_empty_filter_equals_list() {
+    let f = fixture();
+    f.app.add("a").unwrap();
+    f.app.add("b").unwrap();
+    let plain = f.app.list(false).unwrap();
+    let filtered = f
+        .app
+        .list_filtered(false, &cadet_core::TaskFilter::default())
+        .unwrap();
+    assert_eq!(plain.len(), filtered.len());
+    assert_eq!(plain.len(), 2);
+}
+
+#[test]
+fn list_filtered_names_a_terminal_state_explicitly_and_sees_it_without_all() {
+    let f = fixture();
+    f.app
+        .add_with(cadet_app::TaskDraft {
+            title: "finished one".into(),
+            state: Some("done".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let filter = cadet_core::TaskFilter {
+        states: vec!["done".into()],
+        ..Default::default()
+    };
+    let got = f.app.list_filtered(false, &filter).unwrap();
+    assert_eq!(got.len(), 1, "naming a terminal state must surface it");
+    assert_eq!(got[0].title, "finished one");
+}
+
+#[test]
+fn bare_list_still_hides_terminal_states_without_all() {
+    let f = fixture();
+    f.app
+        .add_with(cadet_app::TaskDraft {
+            title: "finished one".into(),
+            state: Some("done".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    f.app.add("open one").unwrap();
+
+    let got = f.app.list(false).unwrap();
+    assert_eq!(
+        got.len(),
+        1,
+        "an unfiltered list must still hide terminal states"
+    );
+    assert_eq!(got[0].title, "open one");
+}
+
 fn commit_count(repo_dir: &std::path::Path, work_tree: &std::path::Path) -> String {
     let out = std::process::Command::new("git")
         .arg("--git-dir")
