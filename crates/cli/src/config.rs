@@ -7,6 +7,7 @@ pub struct Registry {
     pub root: PathBuf,
     pub projects: Vec<Project>,
     pub default: Option<String>,
+    pub project_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ impl Registry {
             root,
             projects: vec![],
             default: None,
+            project_root: None,
         };
         let Ok(src) = std::fs::read_to_string(&path) else {
             return Ok(reg);
@@ -58,6 +60,10 @@ impl Registry {
             .get("default")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        reg.project_root = doc
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
         if let Some(tbl) = doc.get("projects").and_then(|p| p.as_table_like()) {
             for (id, item) in tbl.iter() {
                 if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
@@ -100,6 +106,9 @@ impl Registry {
         if let Some(d) = &self.default {
             doc["default"] = toml_edit::value(d.as_str());
         }
+        if let Some(pr) = &self.project_root {
+            doc["project_root"] = toml_edit::value(pr.to_string_lossy().as_ref());
+        }
         let mut projects = toml_edit::Table::new();
         projects.set_implicit(true);
         for p in &self.projects {
@@ -109,6 +118,44 @@ impl Registry {
         }
         doc["projects"] = toml_edit::Item::Table(projects);
         std::fs::write(Self::file(&self.root), doc.to_string())
+    }
+
+    // Unused outside tests until Task 8 wires these into the `project` CLI
+    // commands; `cadet-cli` is a bin-only crate, so `pub` alone doesn't
+    // silence rustc's dead_code lint the way it would in a lib crate.
+    #[allow(dead_code)]
+    pub fn project_root(&self) -> Option<&Path> {
+        self.project_root.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_project_root(&mut self, p: PathBuf) {
+        self.project_root = Some(p);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_default(&mut self, id: &str) -> Result<(), String> {
+        if !self.projects.iter().any(|p| p.id == id) {
+            return Err(format!("unknown project `{id}`"));
+        }
+        self.default = Some(id.to_string());
+        Ok(())
+    }
+
+    /// Clearing the default matters as much as removing the entry: a dangling
+    /// `default` makes every later command fail with "no default project set",
+    /// and there is no command that repairs it.
+    #[allow(dead_code)]
+    pub fn remove_project(&mut self, id: &str) -> bool {
+        let before = self.projects.len();
+        self.projects.retain(|p| p.id != id);
+        if self.projects.len() == before {
+            return false;
+        }
+        if self.default.as_deref() == Some(id) {
+            self.default = self.projects.first().map(|p| p.id.clone());
+        }
+        true
     }
 
     pub fn active(&self, requested: Option<&str>) -> Option<&Project> {
@@ -137,6 +184,7 @@ mod tests {
             root: root.to_path_buf(),
             projects,
             default: default.map(str::to_string),
+            project_root: None,
         }
     }
 
@@ -207,5 +255,76 @@ mod tests {
         let loaded = Registry::load_from(dir.path().to_path_buf()).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].path, PathBuf::from("/new"));
+    }
+
+    #[test]
+    fn project_root_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        reg.set_project_root(PathBuf::from("/tmp/notes"));
+        reg.save().unwrap();
+
+        let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(again.project_root(), Some(Path::new("/tmp/notes")));
+    }
+
+    #[test]
+    fn removing_the_default_project_promotes_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        reg.upsert_project(Project {
+            id: "a".into(),
+            path: "/tmp/a".into(),
+        });
+        reg.upsert_project(Project {
+            id: "b".into(),
+            path: "/tmp/b".into(),
+        });
+        reg.set_default("a").unwrap();
+
+        assert!(reg.remove_project("a"));
+        assert_eq!(reg.default.as_deref(), Some("b"));
+        assert_eq!(reg.projects.len(), 1);
+    }
+
+    #[test]
+    fn removing_the_last_project_clears_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        reg.upsert_project(Project {
+            id: "only".into(),
+            path: "/tmp/only".into(),
+        });
+        reg.set_default("only").unwrap();
+        assert!(reg.remove_project("only"));
+        assert_eq!(reg.default, None);
+    }
+
+    #[test]
+    fn removing_a_project_that_is_not_there_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert!(!reg.remove_project("ghost"));
+    }
+
+    #[test]
+    fn set_default_rejects_an_unknown_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert!(reg.set_default("ghost").is_err());
+    }
+
+    #[test]
+    fn a_path_with_quotes_and_backslashes_round_trips_with_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        let odd = PathBuf::from(r#"/tmp/say "hi"\back"#);
+        reg.upsert_project(Project {
+            id: "odd".into(),
+            path: odd.clone(),
+        });
+        reg.save().unwrap();
+        let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(again.projects[0].path, odd);
     }
 }
