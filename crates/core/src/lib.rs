@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod canonical;
 pub mod collision;
 pub mod config;
@@ -5,6 +6,7 @@ pub mod error;
 pub mod identity;
 pub mod model;
 pub mod validate;
+pub use backend::*;
 pub use canonical::*;
 pub use collision::*;
 pub use config::*;

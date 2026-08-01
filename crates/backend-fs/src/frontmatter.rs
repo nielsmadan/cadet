@@ -34,6 +34,11 @@ impl Frontmatter {
     /// the parsed elements of an inline `[a, b]` / comma-separated
     /// scalar. Empty if the key is absent, an empty scalar, or a nested
     /// map.
+    ///
+    /// A scalar item wrapped in double quotes is unquoted, with `\"`
+    /// unescaped back to `"` — the counterpart of [`render_list`], which
+    /// quotes an item containing a comma so it cannot be mistaken for a
+    /// separator. Splitting itself ignores commas inside a quoted item.
     pub fn list(&self, key: &str) -> Vec<String> {
         match self.values.get(key) {
             Some(Value::List(items)) => items.clone(),
@@ -43,9 +48,9 @@ impl Frontmatter {
                     .strip_prefix('[')
                     .and_then(|s| s.strip_suffix(']'))
                     .unwrap_or(trimmed);
-                inner
-                    .split(',')
-                    .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+                split_respecting_quotes(inner)
+                    .iter()
+                    .map(|s| unquote_list_item(s))
                     .filter(|s| !s.is_empty())
                     .collect()
             }
@@ -56,6 +61,73 @@ impl Frontmatter {
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.values.keys().map(String::as_str)
     }
+}
+
+/// Splits `s` on commas that are not inside a double-quoted span, so a
+/// quoted item's own commas cannot be mistaken for separators.
+fn split_respecting_quotes(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            }
+            '\\' if in_quotes => {
+                current.push(c);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ',' if !in_quotes => out.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    out.push(current);
+    out
+}
+
+/// Undoes [`quote_list_item`]: strips a wrapping pair of double quotes and
+/// unescapes `\"` back to `"`. An unquoted token is trimmed and, for
+/// backward compatibility with hand-written single-quoted items, has any
+/// leading/trailing `'` stripped too.
+fn unquote_list_item(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        trimmed[1..trimmed.len() - 1].replace("\\\"", "\"")
+    } else {
+        trimmed.trim_matches(['"', '\'']).to_string()
+    }
+}
+
+/// Quotes a list item if it contains a comma or a double quote, or has
+/// leading/trailing whitespace — anything [`Frontmatter::list`] could not
+/// otherwise split or trim back to the original value unambiguously. An
+/// embedded `"` is escaped as `\"`.
+fn quote_list_item(item: &str) -> String {
+    if item.contains(',') || item.contains('"') || item.trim() != item {
+        format!("\"{}\"", item.replace('"', "\\\""))
+    } else {
+        item.to_string()
+    }
+}
+
+/// Renders a list of strings to the inline `[a, b, c]` frontmatter form
+/// `splice` can write. The counterpart of [`Frontmatter::list`]: an item
+/// that `list` could not otherwise round-trip unambiguously (one containing
+/// a comma, for instance) is quoted.
+pub fn render_list(items: &[String]) -> String {
+    format!(
+        "[{}]",
+        items
+            .iter()
+            .map(|i| quote_list_item(i))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Splits `s` into `(content, terminator)` pairs, where `terminator` is
