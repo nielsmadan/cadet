@@ -138,7 +138,10 @@ impl ProjectConfig {
             }
         }
 
-        let prefix = get(project, "prefix");
+        // Trimmed before the check, and stored trimmed: a whitespace-only
+        // prefix passes `is_empty` and then renders keys as `" -1"`, and the
+        // prefix is load-bearing for identity.
+        let prefix = get(project, "prefix").trim().to_string();
         if prefix.is_empty() {
             return Err(CoreError::EmptyPrefix);
         }
@@ -266,6 +269,22 @@ values = ["shopping", "admin"]
         let src = SAMPLE.replace("prefix = \"PERS\"", "prefix = \"\"");
         let err = ProjectConfig::parse(&src).unwrap_err();
         assert!(matches!(err, CoreError::EmptyPrefix));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_prefix() {
+        for raw in ["prefix = \" \"", "prefix = \"\\t \""] {
+            let src = SAMPLE.replace("prefix = \"PERS\"", raw);
+            let err =
+                ProjectConfig::parse(&src).expect_err("a whitespace prefix renders keys as ` -1`");
+            assert!(matches!(err, CoreError::EmptyPrefix), "{raw}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_padded_prefix_is_stored_trimmed() {
+        let src = SAMPLE.replace("prefix = \"PERS\"", "prefix = \"  PERS  \"");
+        assert_eq!(ProjectConfig::parse(&src).unwrap().prefix, "PERS");
     }
 
     #[test]

@@ -30,7 +30,10 @@ impl Registry {
     }
 
     pub fn load() -> std::io::Result<Self> {
-        let root = Self::home();
+        Self::load_from(Self::home())
+    }
+
+    pub fn load_from(root: PathBuf) -> std::io::Result<Self> {
         let path = Self::file(&root);
         let mut reg = Registry {
             root,
@@ -81,35 +84,31 @@ impl Registry {
         }
     }
 
+    /// Built with `toml_edit`, never string formatting: a vault path
+    /// containing a quote or a backslash — or a project id that needs a
+    /// quoted key — would otherwise produce a file `load` correctly refuses
+    /// to parse, locking the user out of every project at once. This is the
+    /// one piece of local state that is not disposable.
+    ///
+    /// Inserting into a `Table` also subsumes the old duplicate-id guard:
+    /// re-inserting an id overwrites in place, so two entries sharing one id
+    /// can never render as two `[projects.<id>]` tables. Order is first-seen,
+    /// content is last-write-wins.
     pub fn save(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        let mut out = String::new();
+        let mut doc = toml_edit::DocumentMut::new();
         if let Some(d) = &self.default {
-            out.push_str(&format!("default = \"{d}\"\n\n"));
+            doc["default"] = toml_edit::value(d.as_str());
         }
-        // Defence in depth alongside `upsert_project`: even if `self.projects`
-        // somehow holds two entries for the same id, only the most recent one
-        // is ever written — never two `[projects.<id>]` tables, which would
-        // be invalid TOML and corrupt the file for every project, not just
-        // the duplicated one. Order is first-seen, content is last-write-wins.
-        let mut order: Vec<&str> = Vec::new();
-        let mut latest: std::collections::BTreeMap<&str, &Project> =
-            std::collections::BTreeMap::new();
+        let mut projects = toml_edit::Table::new();
+        projects.set_implicit(true);
         for p in &self.projects {
-            if !latest.contains_key(p.id.as_str()) {
-                order.push(p.id.as_str());
-            }
-            latest.insert(p.id.as_str(), p);
+            let mut entry = toml_edit::Table::new();
+            entry["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
+            projects.insert(&p.id, toml_edit::Item::Table(entry));
         }
-        for id in order {
-            let p = latest[id];
-            out.push_str(&format!(
-                "[projects.{}]\npath = \"{}\"\n\n",
-                p.id,
-                p.path.display()
-            ));
-        }
-        std::fs::write(Self::file(&self.root), out)
+        doc["projects"] = toml_edit::Item::Table(projects);
+        std::fs::write(Self::file(&self.root), doc.to_string())
     }
 
     pub fn active(&self, requested: Option<&str>) -> Option<&Project> {
@@ -126,5 +125,87 @@ impl Registry {
 
     pub fn index_path(&self) -> PathBuf {
         self.root.join("index.db")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry(root: &Path, projects: Vec<Project>, default: Option<&str>) -> Registry {
+        Registry {
+            root: root.to_path_buf(),
+            projects,
+            default: default.map(str::to_string),
+        }
+    }
+
+    /// A path containing a quote or a backslash is legal on every filesystem
+    /// Cadet targets, and `load` is (correctly) a hard error on a malformed
+    /// registry — so an unescaped write here locks the user out of every
+    /// project they have, not just this one.
+    #[test]
+    fn a_path_with_quotes_and_backslashes_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let awkward = PathBuf::from(r#"/tmp/say "hi"\back\slash"#);
+        registry(
+            dir.path(),
+            vec![Project {
+                id: "personal".into(),
+                path: awkward.clone(),
+            }],
+            Some("personal"),
+        )
+        .save()
+        .unwrap();
+
+        let loaded = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.default.as_deref(), Some("personal"));
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].path, awkward);
+    }
+
+    #[test]
+    fn a_project_id_needing_a_quoted_key_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        registry(
+            dir.path(),
+            vec![Project {
+                id: "my project".into(),
+                path: PathBuf::from("/tmp/v"),
+            }],
+            None,
+        )
+        .save()
+        .unwrap();
+
+        let loaded = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].id, "my project");
+    }
+
+    #[test]
+    fn a_duplicate_id_is_written_once_with_the_latest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        registry(
+            dir.path(),
+            vec![
+                Project {
+                    id: "p".into(),
+                    path: PathBuf::from("/old"),
+                },
+                Project {
+                    id: "p".into(),
+                    path: PathBuf::from("/new"),
+                },
+            ],
+            None,
+        )
+        .save()
+        .unwrap();
+
+        let loaded = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].path, PathBuf::from("/new"));
     }
 }

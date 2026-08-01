@@ -1,6 +1,6 @@
 mod config;
 
-use cadet_app::{App, GitNet};
+use cadet_app::{App, GitNet, RejectReason};
 use cadet_backend_fs::FsBackend;
 use cadet_core::{ProjectConfig, TaskKey};
 use cadet_store_sqlite::SqliteIndex;
@@ -224,9 +224,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let now = jiff_now_ms();
     let report = app.reconcile(now)?;
-    if report.scan_rejected {
-        eprintln!("⚠ scan rejected: an unexpectedly large number of tasks disappeared.");
-        eprintln!("  Nothing was deleted. Check that your sync tool has finished.");
+    match &report.scan_rejected {
+        Some(RejectReason::SuspectedIncompleteScan) => {
+            eprintln!("⚠ scan rejected: an unexpectedly large number of tasks disappeared.");
+            eprintln!("  Nothing was deleted. Check that your sync tool has finished.");
+        }
+        Some(RejectReason::Incomplete) => {
+            eprintln!("⚠ scan rejected: some files could not be read.");
+            eprintln!(
+                "  Nothing was deleted. Check file permissions, or wait for a cloud-synced folder to finish downloading."
+            );
+        }
+        None => {}
     }
     if report.pending_adoption > 0 {
         eprintln!(
@@ -286,7 +295,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Adopt => {
             let r = app.adopt_pending(now)?;
-            println!("adopted {} note(s)", r.adopted);
+            // A forced `PendingCopy` lands in `copies`, not `adopted` — both
+            // are notes the user just asked to be given an identity.
+            println!("adopted {} note(s)", r.adopted + r.copies);
             print_warnings(&app);
         }
         Cmd::Doctor => {
@@ -295,7 +306,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 report.adopted, report.pending_adoption
             );
             println!("pending deletions: {}", report.pending_deletion);
-            if report.scan_rejected {
+            println!(
+                "renumbered: {}  pending renumber: {}",
+                report.renumbered, report.pending_renumber
+            );
+            if report.scan_rejected.is_some() {
                 println!("scan rejected — see the warning above");
             }
         }

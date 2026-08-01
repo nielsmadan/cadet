@@ -372,15 +372,41 @@ Body text here.\n";
         assert!(parse_frontmatter("just a note\n").is_none());
     }
 
+    /// Spec §9.5, the golden-file round trip: *change one field, assert only
+    /// that field's bytes differ*. Byte-for-byte against the whole expected
+    /// document — comparing `.lines()` with the changed key filtered out of
+    /// both sides cannot see a line ending change, a lost trailing newline,
+    /// or a second `state:` line appearing out of nowhere.
     #[test]
-    fn splicing_one_field_changes_only_that_line() {
+    fn splicing_one_field_changes_only_that_field_byte_for_byte() {
         let out = splice(DOC, &[("state", Some("doing".into()))]);
-        assert!(out.contains("state: doing"));
-        assert!(out.contains("# a comment we must not lose"));
-        assert!(out.contains("custom:   spaced out value"));
-        let before: Vec<&str> = DOC.lines().filter(|l| !l.starts_with("state:")).collect();
-        let after: Vec<&str> = out.lines().filter(|l| !l.starts_with("state:")).collect();
-        assert_eq!(before, after, "no line other than `state:` may change");
+        let expected = DOC.replace("state: todo\n", "state: doing\n");
+        assert_eq!(out, expected, "only the `state:` bytes may differ");
+        // Guards the expectation itself: `expected` must really be one byte
+        // sequence away from `DOC`, not accidentally identical to it.
+        assert_ne!(out, DOC);
+        assert_eq!(
+            out.matches("state:").count(),
+            1,
+            "splicing must replace the field, not add a second one"
+        );
+    }
+
+    /// The same rule for a CRLF document: the splice must not normalise the
+    /// line endings of the lines it did not touch.
+    #[test]
+    fn splicing_preserves_crlf_byte_for_byte() {
+        let doc = DOC.replace('\n', "\r\n");
+        let out = splice(&doc, &[("state", Some("doing".into()))]);
+        assert_eq!(out, doc.replace("state: todo\r\n", "state: doing\r\n"));
+    }
+
+    /// A document with no trailing newline must not gain one.
+    #[test]
+    fn splicing_does_not_invent_a_trailing_newline() {
+        let doc = DOC.trim_end_matches('\n');
+        let out = splice(doc, &[("state", Some("doing".into()))]);
+        assert_eq!(out, doc.replace("state: todo\n", "state: doing\n"));
     }
 
     #[test]

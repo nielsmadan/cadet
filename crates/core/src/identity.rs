@@ -89,6 +89,16 @@ pub enum Outcome {
         source: TaskUid,
         path: String,
     },
+    /// A copy seen for the first time. Giving it a fresh identity means
+    /// writing to a file Cadet did not create, so it waits out the same
+    /// grace period as `PendingAdoption` — §5 names this exact case: a
+    /// rename delivered mid-sync (create lands before delete) is
+    /// indistinguishable from a duplicate until it has been seen unchanged
+    /// twice, 60s apart.
+    PendingCopy {
+        source: TaskUid,
+        path: String,
+    },
     PendingDeletion {
         uid: TaskUid,
     },
@@ -111,6 +121,31 @@ pub enum Outcome {
 
 const DROP_FRACTION: f64 = 0.10;
 const DROP_ABSOLUTE: usize = 5;
+
+/// Whether reconcile may write to this file yet: §5 allows it only once the
+/// file has been observed at the same revision across two scans at least
+/// `grace_ms` apart. Changed content restarts the countdown.
+fn ready_to_write(o: &Observed, idx: &IndexView, clock: ScanClock) -> bool {
+    idx.pending
+        .get(&o.path)
+        .is_some_and(|(r, t)| r == &o.revision && clock.now_ms - t >= clock.grace_ms)
+}
+
+/// A path holding a uid another live path already claims. Giving it a fresh
+/// identity is a write to a user file, so it waits out the grace period.
+fn copy(source: &TaskUid, o: &Observed, idx: &IndexView, clock: ScanClock) -> Outcome {
+    if ready_to_write(o, idx, clock) {
+        Outcome::Copy {
+            source: source.clone(),
+            path: o.path.clone(),
+        }
+    } else {
+        Outcome::PendingCopy {
+            source: source.clone(),
+            path: o.path.clone(),
+        }
+    }
+}
 
 /// Applies the §5 resolution table to one scan.
 ///
@@ -159,11 +194,7 @@ pub fn resolve_identity(snap: &Snapshot, idx: &IndexView, clock: ScanClock) -> V
     for o in ordered {
         match &o.uid {
             None => {
-                let ready = idx
-                    .pending
-                    .get(&o.path)
-                    .is_some_and(|(r, t)| r == &o.revision && clock.now_ms - t >= clock.grace_ms);
-                out.push(if ready {
+                out.push(if ready_to_write(o, idx, clock) {
                     Outcome::Adopt {
                         path: o.path.clone(),
                     }
@@ -173,19 +204,21 @@ pub fn resolve_identity(snap: &Snapshot, idx: &IndexView, clock: ScanClock) -> V
                     }
                 });
             }
+            // A uid already claimed by an earlier row in this same scan
+            // cannot be claimed again: two live paths can't both be the one
+            // task that uid identifies, so every occurrence after the first
+            // is a copy. This is checked BEFORE consulting the index,
+            // because it holds whether or not the index has ever heard of
+            // the uid — an index that knows nothing (a rebuild, a first
+            // sync) is exactly the case where two files sharing a uid would
+            // otherwise both be adopted and collapse into one.
+            Some(u) if claimed.contains(u) => out.push(copy(u, o, idx, clock)),
             Some(u) => match idx.entries.iter().find(|e| &e.uid == u) {
-                None => out.push(Outcome::Adopt {
-                    path: o.path.clone(),
-                }),
-                // A uid already claimed by an earlier row in this same scan
-                // cannot be claimed again: two live paths can't both be the
-                // one task that uid identifies, so every occurrence after
-                // the first is a Copy.
-                Some(_) if claimed.contains(u) => {
-                    out.push(Outcome::Copy {
-                        source: u.clone(),
+                None => {
+                    claimed.insert(u.clone());
+                    out.push(Outcome::Adopt {
                         path: o.path.clone(),
-                    });
+                    })
                 }
                 Some(entry) if entry.path == o.path => {
                     claimed.insert(u.clone());
@@ -195,10 +228,7 @@ pub fn resolve_identity(snap: &Snapshot, idx: &IndexView, clock: ScanClock) -> V
                     });
                 }
                 Some(entry) if live_paths.contains(entry.path.as_str()) => {
-                    out.push(Outcome::Copy {
-                        source: u.clone(),
-                        path: o.path.clone(),
-                    });
+                    out.push(copy(u, o, idx, clock));
                 }
                 Some(_) => {
                     claimed.insert(u.clone());
@@ -412,10 +442,94 @@ mod tests {
             uid: uid(1),
             path: "a.md".into()
         }));
-        assert!(out.contains(&Outcome::Copy {
+        // Pending on a first observation — see
+        // `a_copy_waits_out_the_grace_period_before_it_is_given_an_identity`.
+        assert!(out.contains(&Outcome::PendingCopy {
             source: uid(1),
             path: "b.md".into()
         }));
+    }
+
+    /// The index knows nothing (a rebuild, or a first sync), and two files
+    /// carry the same uid. Both cannot be the one task that uid identifies:
+    /// the first claims it, every other occurrence is a copy. Without this the
+    /// rebuild path silently yields FEWER tasks than the backend holds —
+    /// `entries` and `tasks` are both keyed on `(project, uid)` and collapse
+    /// the two into one — which is §1 inverted.
+    #[test]
+    fn a_uid_unknown_to_the_index_can_still_only_be_claimed_once() {
+        let snap = Snapshot {
+            complete: true,
+            observed: vec![
+                Observed {
+                    uid: Some(uid(1)),
+                    path: "a.md".into(),
+                    revision: rev("r1"),
+                },
+                Observed {
+                    uid: Some(uid(1)),
+                    path: "b.md".into(),
+                    revision: rev("r1"),
+                },
+            ],
+        };
+        let out = resolve_identity(&snap, &IndexView::default(), clock(0));
+        assert!(
+            out.contains(&Outcome::Adopt {
+                path: "a.md".into()
+            }),
+            "the first path keeps the uid, got {out:?}"
+        );
+        assert!(
+            out.contains(&Outcome::PendingCopy {
+                source: uid(1),
+                path: "b.md".into()
+            }),
+            "the second path must not claim the same uid, got {out:?}"
+        );
+    }
+
+    /// §5: "closes the everyday failure where a rename delivered mid-sync
+    /// (create lands before delete) is read as a duplicate and permanently
+    /// renumbered." A copy is a first observation like any other.
+    #[test]
+    fn a_copy_waits_out_the_grace_period_before_it_is_given_an_identity() {
+        let snap = Snapshot {
+            complete: true,
+            observed: vec![
+                Observed {
+                    uid: Some(uid(1)),
+                    path: "a.md".into(),
+                    revision: rev("r1"),
+                },
+                Observed {
+                    uid: Some(uid(1)),
+                    path: "b.md".into(),
+                    revision: rev("r2"),
+                },
+            ],
+        };
+        let mut idx = IndexView::default();
+        idx.entries.push(seen(uid(1), "a.md"));
+
+        let out = resolve_identity(&snap, &idx, clock(1_000));
+        assert!(
+            out.contains(&Outcome::PendingCopy {
+                source: uid(1),
+                path: "b.md".into()
+            }),
+            "no file may be written on first observation, got {out:?}"
+        );
+
+        idx.pending.insert("b.md".into(), (rev("r2"), 1_000));
+        let out = resolve_identity(&snap, &idx, clock(61_001));
+        assert!(
+            out.contains(&Outcome::Copy {
+                source: uid(1),
+                path: "b.md".into()
+            }),
+            "the copy must be adopted once the grace period elapses, got {out:?}"
+        );
     }
 
     #[test]
@@ -448,7 +562,7 @@ mod tests {
         );
         assert_eq!(
             out.iter()
-                .filter(|o| matches!(o, Outcome::Copy { .. }))
+                .filter(|o| matches!(o, Outcome::PendingCopy { .. }))
                 .count(),
             1
         );
@@ -458,7 +572,7 @@ mod tests {
             uid: uid(1),
             to: "b.md".into()
         }));
-        assert!(out.contains(&Outcome::Copy {
+        assert!(out.contains(&Outcome::PendingCopy {
             source: uid(1),
             path: "c.md".into()
         }));

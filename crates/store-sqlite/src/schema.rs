@@ -37,5 +37,28 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority  INTEGER NOT NULL,
     PRIMARY KEY (project, uid)
 );
-CREATE INDEX IF NOT EXISTS tasks_by_key ON tasks (project, key_num);
+-- Paths whose key is due to be renumbered but has not been written back yet.
+-- Renumbering is one of the three situations in which reconcile writes to a
+-- user file (spec §5), so it waits out the same grace period as adoption:
+-- no file is written until it has been observed unchanged across two scans
+-- at least 60s apart.
+CREATE TABLE IF NOT EXISTS pending_renumbers (
+    project   TEXT NOT NULL,
+    path      TEXT NOT NULL,
+    revision  TEXT NOT NULL,
+    since_ms  INTEGER NOT NULL,
+    PRIMARY KEY (project, path)
+);
 "#;
+
+/// Created separately from `DDL` because it can legitimately fail on an index
+/// built before the constraint existed — see `SqliteIndex::open`. Keys are
+/// never reused (spec §5), so two live tasks sharing one key is always a bug;
+/// this makes it a loud error at the point of insertion instead of a silent
+/// duplicate that leaves one of the two tasks permanently unreachable by
+/// `show`/`done`/`mv`/`rm`.
+/// The name is deliberately NOT the old non-unique `tasks_by_key`: `IF NOT
+/// EXISTS` matches on name alone, so reusing it would silently leave an index
+/// built before this constraint without one.
+pub const UNIQUE_KEY_INDEX: &str = "DROP INDEX IF EXISTS tasks_by_key;
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_unique_key ON tasks (project, key_prefix, key_num);";

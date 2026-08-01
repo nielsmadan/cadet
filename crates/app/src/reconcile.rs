@@ -11,7 +11,12 @@ pub struct ReconcileReport {
     pub copies: usize,
     pub pending_deletion: usize,
     pub deleted: usize,
-    pub scan_rejected: bool,
+    pub renumbered: usize,
+    pub pending_renumber: usize,
+    /// `None` when the scan was trusted. The reason matters to the user:
+    /// "a large number of tasks disappeared" and "one file could not be read"
+    /// call for completely different responses.
+    pub scan_rejected: Option<RejectReason>,
 }
 
 pub const GRACE_MS: i64 = 60_000;
@@ -118,6 +123,23 @@ impl App {
             // `backend-fs` never produces a Delta; a Delta here is a programming error.
             return Ok(ReconcileReport::default());
         };
+        // Spec §5: the high-water mark is the maximum over the keys LIVE IN
+        // THE SNAPSHOT, the stored mark, and quarantined files' keys — not
+        // the stored mark alone. Deleting the index takes the stored mark
+        // with it, and a first sync from another device never had one, so
+        // without this every rebuild starts minting at 1 again and hands out
+        // keys that are already on disk. Must run before the outcomes loop:
+        // `adopt` mints from this mark.
+        let prefix = self.backend.load_project()?.prefix;
+        if let Some(max) = parsed
+            .values()
+            .filter(|t| t.key.prefix == prefix)
+            .map(|t| t.key.number)
+            .max()
+        {
+            self.index.bump_high_water(&self.project, max)?;
+        }
+
         let view = self.index.view(&self.project)?;
         let clock = ScanClock {
             now_ms,
@@ -127,18 +149,27 @@ impl App {
         let mut outcomes = resolve_identity(&snap, &view, clock);
         if force_adopt {
             for o in outcomes.iter_mut() {
-                if let Outcome::PendingAdoption { path } = o {
-                    *o = Outcome::Adopt { path: path.clone() };
+                match o {
+                    Outcome::PendingAdoption { path } => {
+                        *o = Outcome::Adopt { path: path.clone() };
+                    }
+                    Outcome::PendingCopy { source, path } => {
+                        *o = Outcome::Copy {
+                            source: source.clone(),
+                            path: path.clone(),
+                        };
+                    }
+                    _ => {}
                 }
             }
         }
 
         let mut report = ReconcileReport::default();
-        if outcomes
+        if let Some(Outcome::ScanRejected { reason }) = outcomes
             .iter()
-            .any(|o| matches!(o, Outcome::ScanRejected { .. }))
+            .find(|o| matches!(o, Outcome::ScanRejected { .. }))
         {
-            report.scan_rejected = true;
+            report.scan_rejected = Some(reason.clone());
             return Ok(report);
         }
 
@@ -223,8 +254,27 @@ impl App {
                         });
                     }
                 }
+                Outcome::PendingCopy { path, .. } => {
+                    report.pending_adoption += 1;
+                    if let Some(o) = observed_by_path(path) {
+                        self.index
+                            .mark_pending(&self.project, path, &o.revision, now_ms)?;
+                    }
+                    // Drop it from the parsed set for as long as it is
+                    // pending. Its uid still belongs to the file it was
+                    // copied from, and both the `entries` and `tasks` tables
+                    // are keyed on `(project, uid)` — caching it here would
+                    // overwrite the original with the copy rather than show
+                    // both.
+                    parsed.remove(path);
+                }
                 Outcome::Copy { path, .. } => {
                     report.copies += 1;
+                    // Same reason `Adopt` clears it: this path's pending
+                    // record has served its purpose, and paths are reused. A
+                    // stale row would grant whatever file appears here next
+                    // an adoption with no grace period at all.
+                    self.index.clear_pending(&self.project, path)?;
                     self.adopt(path, now_ms, &mut entries, &mut parsed)?;
                 }
                 Outcome::PendingDeletion { uid } => {
@@ -238,7 +288,7 @@ impl App {
                 Outcome::Delete { uid } => {
                     report.deleted += 1;
                     // A confirmed deletion must retire its `pending_deletions`
-                    // row, not just leave it stale: `carry_pending_deletions`
+                    // row, not just leave it stale: `carry_absent_tasks`
                     // (see below, and `refresh_cache`) trusts that table as
                     // "still mid grace period" — an uncleared row would let a
                     // just-deleted task get silently resurrected into the
@@ -249,10 +299,23 @@ impl App {
             }
         }
 
+        self.renumber_duplicate_keys(
+            now_ms,
+            &prefix,
+            snap.complete,
+            &mut parsed,
+            &mut entries,
+            &mut report,
+        )?;
+
         self.index.apply(&self.project, &entries)?;
+        // `apply` replaces `entries` wholesale, so any uid it just dropped
+        // leaves its pending-deletion row behind with nothing left to reap
+        // it. Read AFTER `apply` for exactly that reason.
+        self.index.reap_orphaned_pending_deletions(&self.project)?;
         // Cache the parsed content so every later read is a SQL query, never a
         // file read (spec §3). The scan already parsed these — this is free.
-        // `carry_pending_deletions` adds back the tasks the scan didn't see
+        // `carry_absent_tasks` adds back the tasks the scan didn't see
         // this cycle but that are only pending deletion, not deleted yet —
         // read AFTER the loop above so it sees this pass's own
         // mark_pending_deletion/clear_pending_deletion calls.
@@ -263,13 +326,82 @@ impl App {
             .collect();
         let pending_deletions = self.index.view(&self.project)?.pending_deletions;
         let mut cached: Vec<Task> = parsed.into_values().collect();
-        cached.extend(carry_pending_deletions(
+        cached.extend(carry_absent_tasks(
             &pending_deletions,
             cached_by_uid.values(),
             &observed_uids,
+            snap.complete,
         ));
         self.index.cache_tasks(&self.project, &cached)?;
         Ok(report)
+    }
+
+    /// Applies the §5 whole-scan collision rule: every task claiming a key
+    /// another task also claims is renumbered from the high-water mark, in
+    /// `(created, canonical_hash, path)` order, and the loser records
+    /// `renumbered_from`.
+    ///
+    /// The resolved key lands in `parsed` — and therefore in the index —
+    /// immediately, but the *file* write waits out the grace period, because
+    /// renumbering is one of the three situations in which reconcile mutates
+    /// a user file (§5). Splitting it that way is what keeps the index
+    /// duplicate-free while the countdown runs: two live tasks under one key
+    /// have no answer for `cadet show`, and `tasks_unique_key` now refuses to
+    /// store them at all.
+    fn renumber_duplicate_keys(
+        &self,
+        now_ms: i64,
+        prefix: &str,
+        complete: bool,
+        parsed: &mut std::collections::BTreeMap<String, Task>,
+        entries: &mut [IndexEntry],
+        report: &mut ReconcileReport,
+    ) -> Result<(), AppError> {
+        // An incomplete snapshot is not a whole-scan view, and the rule is
+        // defined over one: renumbering on a partial tree could move a key
+        // away from the task that legitimately owns it.
+        if !complete {
+            return Ok(());
+        }
+        let high_water = self.index.high_water(&self.project)?;
+        let resolutions = resolve_collisions(collision_candidates(parsed, prefix), high_water);
+        let waiting = self.index.pending_renumbers(&self.project)?;
+
+        for r in resolutions {
+            let (Some(new_key), Some(from)) = (r.new_key, r.renumbered_from) else {
+                self.index.clear_pending_renumber(&self.project, &r.path)?;
+                continue;
+            };
+            let Some(task) = parsed.get_mut(&r.path) else {
+                continue;
+            };
+            let current = revision(task);
+            task.key = new_key.clone();
+            task.renumbered_from = Some(from);
+
+            let ready = waiting
+                .get(&r.path)
+                .is_some_and(|(rev, since)| rev == &current && now_ms - since >= GRACE_MS);
+            if !ready {
+                // Deliberately no `bump_high_water` here. The mark is what
+                // `resolve_collisions` counts up from, so raising it for a key
+                // that has not been written yet would hand the same file a
+                // different key on every poll, and the index would show a key
+                // that never settles.
+                report.pending_renumber += 1;
+                self.index
+                    .mark_pending_renumber(&self.project, &r.path, &current, now_ms)?;
+                continue;
+            }
+            let written = self.backend.put(task.clone(), Some(current))?;
+            self.index.bump_high_water(&self.project, new_key.number)?;
+            self.index.clear_pending_renumber(&self.project, &r.path)?;
+            report.renumbered += 1;
+            if let Some(e) = entries.iter_mut().find(|e| e.uid == task.uid) {
+                e.revision = written;
+            }
+        }
+        Ok(())
     }
 
     /// Stamps `uid` and `key` into a file that lacks them. The only case where
@@ -304,6 +436,24 @@ impl App {
     }
 }
 
+/// The §5 collision input: every parsed task carrying this project's prefix.
+/// A task whose `key` did not parse reads as the `?-0` placeholder and is
+/// excluded — those are not competing for a real key, and renumbering them
+/// would invent one under the wrong prefix.
+pub(crate) fn collision_candidates(
+    parsed: &std::collections::BTreeMap<String, Task>,
+    prefix: &str,
+) -> Vec<Candidate> {
+    parsed
+        .iter()
+        .filter(|(_, t)| t.key.prefix == prefix)
+        .map(|(path, task)| Candidate {
+            task: task.clone(),
+            path: path.clone(),
+        })
+        .collect()
+}
+
 /// Task placeholders for every uid the project's index currently has
 /// recorded as mid pending-deletion grace period, for any such uid
 /// `observed` (the uids a fresh scan just saw) doesn't cover. Without this,
@@ -314,15 +464,20 @@ impl App {
 /// `App::refresh_cache` in `write.rs` (which has no identity-resolution
 /// pass of its own and would otherwise trust a bare scan that cannot tell
 /// "gone" from "still counting down").
-pub(crate) fn carry_pending_deletions<'a>(
+pub(crate) fn carry_absent_tasks<'a>(
     pending_deletions: &std::collections::BTreeMap<TaskUid, i64>,
     cached: impl Iterator<Item = &'a TaskSummary>,
     observed: &std::collections::BTreeSet<&str>,
+    complete: bool,
 ) -> Vec<Task> {
     cached
+        .filter(|s| !observed.contains(s.uid.as_str()))
         .filter(|s| {
-            !observed.contains(s.uid.as_str())
-                && TaskUid::parse(&s.uid).is_some_and(|u| pending_deletions.contains_key(&u))
+            // An incomplete snapshot is not evidence of absence at all (§5
+            // guard 1) — a single unreadable file or an unmaterialised cloud
+            // placeholder makes it so. Under one, nothing the scan missed may
+            // be dropped, whatever its deletion state.
+            !complete || TaskUid::parse(&s.uid).is_some_and(|u| pending_deletions.contains_key(&u))
         })
         .map(task_from_summary)
         .collect()

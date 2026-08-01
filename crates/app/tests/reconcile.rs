@@ -21,6 +21,22 @@ struct Fixture {
     repo_dir: std::path::PathBuf,
 }
 
+impl Fixture {
+    /// A second `App` over the same vault and the same git repo, but with a
+    /// brand-new index. This is what deleting `index.db` actually looks like
+    /// — unlike `App::clear_index`, which deliberately preserves the
+    /// high-water mark and so cannot exercise the "rebuild from the backend
+    /// alone" path (spec §1).
+    fn with_a_deleted_index(&self) -> App {
+        App::new(
+            Box::new(FsBackend::new(self.vault_path.clone())),
+            SqliteIndex::open_in_memory().unwrap(),
+            GitNet::new(self.repo_dir.clone(), self.vault_path.clone()),
+            "p".into(),
+        )
+    }
+}
+
 fn fixture() -> Fixture {
     let vault = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -94,6 +110,142 @@ fn keys_are_not_reused_after_deletion() {
         "P-2",
         "keys must never be reused (spec §5)"
     );
+}
+
+/// Spec §5: high-water is the max over the keys live in the snapshot, the
+/// stored high-water mark, and quarantined files' keys — not the stored mark
+/// alone. Deleting the index takes the stored mark with it, so a mint after a
+/// rebuild has nothing but the snapshot to go on.
+#[test]
+fn a_mint_after_the_index_is_deleted_does_not_reuse_a_key() {
+    let f = fixture();
+    f.app.add("one").unwrap();
+    f.app.add("two").unwrap();
+
+    let rebuilt = f.with_a_deleted_index();
+    rebuilt.reconcile(0).unwrap();
+    let third = rebuilt.add("three").unwrap();
+
+    let keys: Vec<String> = rebuilt
+        .list(true)
+        .unwrap()
+        .iter()
+        .map(|t| t.key.to_string())
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "keys must never be reused (spec §5), got {keys:?}"
+    );
+    assert_eq!(third.key.to_string(), "P-3");
+}
+
+/// The other half of the same defect: the very first sync from another
+/// device. The backend already carries P-1 and P-2; this device's index has
+/// never allocated anything.
+#[test]
+fn a_mint_after_adopting_foreign_files_does_not_reuse_a_key() {
+    let f = fixture();
+    for (n, title) in [(1, "alpha"), (2, "beta")] {
+        std::fs::write(
+            f.vault_path.join(format!("{title}.md")),
+            format!(
+                "---\nuid: 01ARZ3NDEKTSV4RRFFQ69G5F0{n}\nkey: P-{n}\ntitle: {title}\nstate: todo\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+    f.app.reconcile(0).unwrap();
+    let fresh = f.app.add("mine").unwrap();
+    let keys: Vec<String> = f
+        .app
+        .list(true)
+        .unwrap()
+        .iter()
+        .map(|t| t.key.to_string())
+        .collect();
+    let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "an adopted foreign key must raise the high-water mark, got {keys:?}"
+    );
+    assert_eq!(fresh.key.to_string(), "P-3");
+}
+
+/// Two devices that have not synced can both allocate P-1. Both tasks are
+/// legitimate: the later one is renumbered and records `renumbered_from`
+/// (spec §5), and until then neither is unreachable.
+#[test]
+fn two_tasks_claiming_one_key_are_renumbered() {
+    let f = fixture();
+    for (n, title, created) in [
+        (1, "mine", "2026-01-01T00:00:00Z"),
+        (2, "theirs", "2026-01-02T00:00:00Z"),
+    ] {
+        std::fs::write(
+            f.vault_path.join(format!("{title}.md")),
+            format!(
+                "---\nuid: 01ARZ3NDEKTSV4RRFFQ69G5F0{n}\nkey: P-1\ntitle: {title}\nstate: todo\ncreated: {created}\nupdated: {created}\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    // First observation: the collision is recorded, no file is written yet.
+    let r = f.app.reconcile(0).unwrap();
+    assert_eq!(
+        r.pending_renumber, 1,
+        "§5: never mutate on first observation"
+    );
+    assert_eq!(r.renumbered, 0);
+    assert!(
+        std::fs::read_to_string(f.vault_path.join("theirs.md"))
+            .unwrap()
+            .contains("key: P-1"),
+        "no file may be rewritten on first observation"
+    );
+    // Both tasks are reachable regardless — that is the point of resolving.
+    let keys: Vec<String> = f
+        .app
+        .list(true)
+        .unwrap()
+        .iter()
+        .map(|t| t.key.to_string())
+        .collect();
+    assert_eq!(keys.len(), 2);
+    let unique: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(
+        unique.len(),
+        2,
+        "both tasks must be reachable, got {keys:?}"
+    );
+
+    // After the grace period the loser's file is rewritten.
+    let r = f.app.reconcile(60_001).unwrap();
+    assert_eq!(r.renumbered, 1);
+    let loser = std::fs::read_to_string(f.vault_path.join("theirs.md")).unwrap();
+    assert!(
+        loser.contains("key: P-2"),
+        "unexpected loser file:\n{loser}"
+    );
+    assert!(
+        loser.contains("renumbered_from: P-1"),
+        "the loser must record the key it gave up:\n{loser}"
+    );
+    let keeper = std::fs::read_to_string(f.vault_path.join("mine.md")).unwrap();
+    assert!(
+        keeper.contains("key: P-1"),
+        "the earlier-created task keeps the key:\n{keeper}"
+    );
+    assert!(!keeper.contains("renumbered_from"));
+
+    // Settled: no further churn, and a later mint does not collide.
+    let r = f.app.reconcile(120_000).unwrap();
+    assert_eq!(r.renumbered, 0);
+    assert_eq!(r.pending_renumber, 0);
+    assert_eq!(f.app.add("third").unwrap().key.to_string(), "P-3");
 }
 
 #[test]
@@ -429,7 +581,11 @@ fn a_mass_disappearance_is_rejected_rather_than_deleted() {
         }
     }
     let r = f.app.reconcile(1_000).unwrap();
-    assert!(r.scan_rejected, "a 100% drop must reject the scan");
+    assert_eq!(
+        r.scan_rejected,
+        Some(RejectReason::SuspectedIncompleteScan),
+        "a 100% drop must reject the scan"
+    );
     assert_eq!(
         f.app.list(false).unwrap().len(),
         20,
@@ -478,20 +634,45 @@ fn an_external_rename_preserves_identity() {
     assert_eq!(after[0].title, a.title);
 }
 
+/// §5 names this exact case: "closes the everyday failure where a rename
+/// delivered mid-sync (create lands before delete) is read as a duplicate and
+/// permanently renumbered". A copy is a first observation like any other, so
+/// neither file may be touched until the grace period has run.
 #[test]
-fn an_external_copy_gets_a_fresh_identity() {
+fn an_external_copy_gets_a_fresh_identity_only_after_the_grace_period() {
     let f = fixture();
     let a = f.app.add("duplicatable").unwrap();
     f.app.reconcile(0).unwrap();
 
-    std::fs::copy(
-        f.vault_path.join("duplicatable.md"),
-        f.vault_path.join("duplicatable-copy.md"),
-    )
-    .unwrap();
+    let original = f.vault_path.join("duplicatable.md");
+    let duplicate = f.vault_path.join("duplicatable-copy.md");
+    std::fs::copy(&original, &duplicate).unwrap();
+    let before = std::fs::read_to_string(&original).unwrap();
 
     let r = f.app.reconcile(1_000).unwrap();
+    assert_eq!(r.copies, 0, "§5: never mutate on first observation");
+    assert_eq!(r.pending_adoption, 1);
+    assert_eq!(
+        std::fs::read_to_string(&original).unwrap(),
+        before,
+        "the original must not lose its identity to a copy of itself"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&duplicate).unwrap(),
+        before,
+        "the copy must not be written to on first observation either"
+    );
+    let tasks = f.app.list(true).unwrap();
+    assert_eq!(tasks.len(), 1, "the copy is not a task yet");
+    assert_eq!(tasks[0].uid, a.uid.as_str());
+
+    let r = f.app.reconcile(61_001).unwrap();
     assert_eq!(r.copies, 1);
+    assert_eq!(
+        std::fs::read_to_string(&original).unwrap(),
+        before,
+        "the file that held the uid first keeps it"
+    );
 
     let tasks = f.app.list(true).unwrap();
     assert_eq!(
@@ -511,6 +692,197 @@ fn an_external_copy_gets_a_fresh_identity() {
         "add() must not mint a key that collides with one the copy was given"
     );
     assert_ne!(b.key, a.key);
+}
+
+/// The rebuild half of the same defect: `cp -p` a task file, delete the
+/// index, and the two files share a uid with nothing in the index to say so.
+/// The incremental path produces two tasks; the rebuild path must not
+/// produce one (spec §1 — you get back everything the backend has).
+#[test]
+fn a_duplicated_uid_survives_a_rebuild_instead_of_collapsing() {
+    let f = fixture();
+    let a = f.app.add("alpha").unwrap();
+    std::fs::copy(
+        f.vault_path.join("alpha.md"),
+        f.vault_path.join("alpha-copy.md"),
+    )
+    .unwrap();
+
+    let rebuilt = f.with_a_deleted_index();
+    rebuilt.reconcile(0).unwrap();
+    assert_eq!(
+        rebuilt.list(true).unwrap().len(),
+        1,
+        "the copy waits out its grace period first"
+    );
+    rebuilt.reconcile(61_001).unwrap();
+
+    let tasks = rebuilt.list(true).unwrap();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "a rebuild must not silently swallow a file, got {tasks:?}"
+    );
+    assert!(tasks.iter().any(|t| t.uid == a.uid.as_str()));
+    assert!(tasks.iter().any(|t| t.uid != a.uid.as_str()));
+}
+
+/// Finding 6: `Copy` must retire the pending record it just consumed. Paths,
+/// unlike uids, are reused — a stale row grants whatever file lands here next
+/// an adoption with no grace period at all.
+#[test]
+fn a_path_reused_after_a_copy_does_not_inherit_instant_adoption() {
+    let f = fixture();
+    f.app.add("original").unwrap();
+    let copy_path = f.vault_path.join("original-copy.md");
+    std::fs::copy(f.vault_path.join("original.md"), &copy_path).unwrap();
+    f.app.reconcile(0).unwrap();
+    assert_eq!(f.app.reconcile(61_001).unwrap().copies, 1);
+
+    // The copy is deleted and a brand-new hand-written note takes its path.
+    std::fs::remove_file(&copy_path).unwrap();
+    std::fs::write(&copy_path, "---\nstate: todo\ntitle: Successor\n---\n").unwrap();
+
+    let r = f.app.reconcile(62_000).unwrap();
+    assert_eq!(
+        r.adopted, 0,
+        "a stale pending row must not grant instant adoption at a reused path"
+    );
+    assert_eq!(r.pending_adoption, 1);
+}
+
+/// A backend that reports every scan as incomplete, wrapping a real
+/// `FsBackend` so every other operation behaves normally. That is what a
+/// single unreadable file or an unmaterialised cloud placeholder does to a
+/// scan — and an incomplete snapshot is never evidence of absence (§5 guard
+/// 1). `reconcile` honours that; `refresh_cache` runs on every write and
+/// must not quietly reach the opposite conclusion.
+struct IncompleteBackend {
+    inner: FsBackend,
+    incomplete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl cadet_core::Backend for IncompleteBackend {
+    fn load_project(&self) -> Result<cadet_core::ProjectConfig, cadet_core::BackendError> {
+        self.inner.load_project()
+    }
+    fn save_project(&self, cfg: cadet_core::ProjectConfig) -> Result<(), cadet_core::BackendError> {
+        self.inner.save_project(cfg)
+    }
+    fn get(
+        &self,
+        uid: cadet_core::TaskUid,
+    ) -> Result<Option<cadet_core::Task>, cadet_core::BackendError> {
+        self.inner.get(uid)
+    }
+    fn put(
+        &self,
+        task: cadet_core::Task,
+        expected: Option<cadet_core::Revision>,
+    ) -> Result<cadet_core::Revision, cadet_core::BackendError> {
+        self.inner.put(task, expected)
+    }
+    fn delete(
+        &self,
+        uid: cadet_core::TaskUid,
+        expected: Option<cadet_core::Revision>,
+    ) -> Result<(), cadet_core::BackendError> {
+        self.inner.delete(uid, expected)
+    }
+    fn adopt(
+        &self,
+        path: String,
+        uid: cadet_core::TaskUid,
+        key: cadet_core::TaskKey,
+        now: jiff::Timestamp,
+    ) -> Result<cadet_core::Task, cadet_core::BackendError> {
+        self.inner.adopt(path, uid, key, now)
+    }
+    fn scan(
+        &self,
+        since: Option<cadet_core::Cursor>,
+    ) -> Result<cadet_core::ChangeSet, cadet_core::BackendError> {
+        let mut cs = self.inner.scan(since)?;
+        if !self.incomplete.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(cs);
+        }
+        if let cadet_core::ChangeSet::Snapshot {
+            snapshot,
+            mut tasks,
+        } = cs
+        {
+            // An incomplete scan is one that did not see everything: drop a
+            // file from the snapshot as well as clearing the flag.
+            let mut observed = snapshot.observed;
+            if !observed.is_empty() {
+                let d = observed.remove(0);
+                tasks.remove(&d.path);
+            }
+            cs = cadet_core::ChangeSet::Snapshot {
+                snapshot: cadet_core::Snapshot {
+                    complete: false,
+                    observed,
+                },
+                tasks,
+            };
+        }
+        Ok(cs)
+    }
+}
+
+#[test]
+fn an_incomplete_scan_does_not_drop_a_task_from_the_cache_on_a_write() {
+    let f = fixture();
+    let a = f.app.add("unseen").unwrap();
+    let b = f.app.add("visible").unwrap();
+    f.app.reconcile(0).unwrap();
+
+    let incomplete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = App::new(
+        Box::new(IncompleteBackend {
+            inner: FsBackend::new(f.vault_path.clone()),
+            incomplete: std::sync::Arc::clone(&incomplete),
+        }),
+        SqliteIndex::open_in_memory().unwrap(),
+        GitNet::new(f.repo_dir.clone(), f.vault_path.clone()),
+        "p".into(),
+    );
+    app.reconcile(0).unwrap();
+    assert_eq!(
+        app.list(true).unwrap().len(),
+        2,
+        "both tasks start out cached"
+    );
+
+    incomplete.store(true, std::sync::atomic::Ordering::Relaxed);
+    // An ordinary write, whose `refresh_cache` sees the partial scan.
+    app.set_state(&b.key, "done").unwrap();
+
+    let tasks = app.list(true).unwrap();
+    assert!(
+        tasks.iter().any(|t| t.uid == a.uid.as_str()),
+        "an incomplete scan is not evidence a task is gone, got {tasks:?}"
+    );
+}
+
+/// Finding 8: the reason a scan was rejected has to reach the user, or the
+/// message names the wrong cause — "a large number of tasks disappeared"
+/// when the truth is one file Cadet could not open.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_rejects_the_scan_as_incomplete_not_as_a_mass_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    f.app.add("locked").unwrap();
+    f.app.add("other").unwrap();
+    f.app.reconcile(0).unwrap();
+
+    let locked = f.vault_path.join("locked.md");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = f.app.reconcile(1_000).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(r.scan_rejected, Some(RejectReason::Incomplete));
 }
 
 #[test]

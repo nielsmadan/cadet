@@ -290,7 +290,23 @@ impl Backend for FsBackend {
         if let Some(fm) = parse_frontmatter(&base) {
             for def in &cfg.fields {
                 let k = def.name.as_str();
-                if fm.keys().any(|fk| fk == k) && !task.fields.contains_key(k) {
+                if task.fields.contains_key(k) {
+                    continue;
+                }
+                // Only a value `read_task` could actually have read is a
+                // candidate for removal. A declared field whose on-disk shape
+                // does not match its declared type (a scalar written as a
+                // block list, say) never reaches `task.fields`, so it is
+                // indistinguishable here from one the caller deleted — and
+                // deleting it would be silent data loss on an ordinary state
+                // change. Preserve it untouched, exactly like an undeclared
+                // key.
+                let readable = if matches!(def.ty, FieldType::ListStr) {
+                    fm.keys().any(|fk| fk == k)
+                } else {
+                    fm.get(k).is_some()
+                };
+                if readable {
                     edits.push((k.to_string(), None));
                 }
             }

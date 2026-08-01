@@ -27,14 +27,23 @@ pub struct SqliteIndex {
 
 impl SqliteIndex {
     pub fn open(path: &std::path::Path) -> Result<Self, IndexError> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(schema::DDL)?;
-        Ok(Self { conn })
+        Self::from_connection(Connection::open(path)?)
     }
 
     pub fn open_in_memory() -> Result<Self, IndexError> {
-        let conn = Connection::open_in_memory()?;
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self, IndexError> {
         conn.execute_batch(schema::DDL)?;
+        if conn.execute_batch(schema::UNIQUE_KEY_INDEX).is_err() {
+            // A cache built before the constraint existed may already hold
+            // the duplicate keys the constraint exists to prevent. `tasks` is
+            // disposable display data, refilled by the next reconcile — empty
+            // it and retry rather than refusing to open the index at all.
+            conn.execute_batch("DELETE FROM tasks;")?;
+            conn.execute_batch(schema::UNIQUE_KEY_INDEX)?;
+        }
         Ok(Self { conn })
     }
 
@@ -181,6 +190,76 @@ impl SqliteIndex {
         Ok(())
     }
 
+    /// Records a path whose key must be renumbered, so the write can wait out
+    /// the §5 grace period. `since_ms` survives repeated calls with the same
+    /// revision for the same reason `mark_pending` preserves its own: a
+    /// reconcile runs on every command, and re-marking on each poll would
+    /// mean the countdown never finishes.
+    pub fn mark_pending_renumber(
+        &self,
+        project: &str,
+        path: &str,
+        rev: &Revision,
+        since_ms: i64,
+    ) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO pending_renumbers (project, path, revision, since_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project, path) DO UPDATE SET
+                 revision = excluded.revision,
+                 since_ms = excluded.since_ms
+             WHERE pending_renumbers.revision != excluded.revision",
+            params![project, path, rev.as_str(), since_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_renumber(&self, project: &str, path: &str) -> Result<(), IndexError> {
+        self.conn.execute(
+            "DELETE FROM pending_renumbers WHERE project = ?1 AND path = ?2",
+            params![project, path],
+        )?;
+        Ok(())
+    }
+
+    /// path -> (revision when the collision was first seen, timestamp ms).
+    pub fn pending_renumbers(
+        &self,
+        project: &str,
+    ) -> Result<std::collections::BTreeMap<String, (Revision, i64)>, IndexError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT path, revision, since_ms FROM pending_renumbers WHERE project = ?1")?;
+        let rows = st.query_map(params![project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (path, rev, since) = row?;
+            out.insert(path, (Revision::from_raw(rev), since));
+        }
+        Ok(out)
+    }
+
+    /// Drops `pending_deletions` rows for uids `entries` no longer knows.
+    /// `forget` and `clear_pending_deletion` are the only other reapers and
+    /// neither runs for a uid that leaves `entries` by a rebuild, so the
+    /// table would otherwise grow without bound — and, worse, a stale row is
+    /// read as "already mid grace period", which deletes the uid with no
+    /// grace period at all if it ever comes back.
+    pub fn reap_orphaned_pending_deletions(&self, project: &str) -> Result<usize, IndexError> {
+        Ok(self.conn.execute(
+            "DELETE FROM pending_deletions
+             WHERE project = ?1
+               AND uid NOT IN (SELECT uid FROM entries WHERE project = ?1)",
+            params![project],
+        )?)
+    }
+
     pub fn high_water(&self, project: &str) -> Result<u32, IndexError> {
         match self.conn.query_row(
             "SELECT value FROM high_water WHERE project = ?1",
@@ -209,8 +288,13 @@ impl SqliteIndex {
         self.conn
             .execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
         for t in tasks {
+            // A plain INSERT, not `INSERT OR REPLACE`: with `tasks_unique_key`
+            // in place, `OR REPLACE` would silently delete whichever task
+            // already held the key and put the duplicate in its place. Keys
+            // are never reused, so a conflict here is a bug in the caller and
+            // must surface as one.
             self.conn.execute(
-                "INSERT OR REPLACE INTO tasks
+                "INSERT INTO tasks
                  (project, uid, key_num, key_prefix, title, state, due, priority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
@@ -304,7 +388,13 @@ impl SqliteIndex {
 
     /// Wipes the derived view. High-water marks deliberately survive.
     pub fn clear(&self, project: &str) -> Result<(), IndexError> {
-        for t in ["entries", "pending", "pending_deletions", "tasks"] {
+        for t in [
+            "entries",
+            "pending",
+            "pending_deletions",
+            "pending_renumbers",
+            "tasks",
+        ] {
             self.conn.execute(
                 &format!("DELETE FROM {t} WHERE project = ?1"),
                 params![project],
@@ -526,6 +616,80 @@ mod tests {
             vec!["sooner", "later", "no due"],
             "undated tasks sort last"
         );
+    }
+
+    /// Keys are never reused (spec §5), so two live tasks under one key is
+    /// always a bug. Before the constraint it was a silent one: `find_by_key`
+    /// returned whichever row SQLite yielded first and the other task was
+    /// unreachable by `show`/`done`/`mv`/`rm` — the only interface there is.
+    #[test]
+    fn caching_two_tasks_under_one_key_is_rejected() {
+        let i = idx();
+        let err = i.cache_tasks(
+            "p",
+            &[
+                task(4, "first", "todo", None),
+                task(4, "second", "todo", None),
+            ],
+        );
+        assert!(
+            err.is_err(),
+            "a duplicate key must be a loud error, not a silently unreachable task"
+        );
+    }
+
+    #[test]
+    fn the_same_key_in_two_projects_is_fine() {
+        let i = idx();
+        i.cache_tasks("a", &[task(1, "x", "todo", None)]).unwrap();
+        i.cache_tasks("b", &[task(1, "y", "todo", None)]).unwrap();
+        assert_eq!(i.list_tasks("a", true, &[]).unwrap().len(), 1);
+        assert_eq!(i.list_tasks("b", true, &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_renumbers_round_trip_and_preserve_since_ms() {
+        let i = idx();
+        i.mark_pending_renumber("p", "a.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "a.md", &Revision::from_raw("r1"), 999_000)
+            .unwrap();
+        assert_eq!(i.pending_renumbers("p").unwrap()["a.md"].1, 100);
+        i.mark_pending_renumber("p", "a.md", &Revision::from_raw("r2"), 999_000)
+            .unwrap();
+        assert_eq!(i.pending_renumbers("p").unwrap()["a.md"].1, 999_000);
+        i.clear_pending_renumber("p", "a.md").unwrap();
+        assert!(i.pending_renumbers("p").unwrap().is_empty());
+    }
+
+    /// A `pending_deletions` row for a uid `entries` no longer knows is worse
+    /// than clutter: it reads as "already mid grace period", so if that uid
+    /// ever reappears and vanishes again it is deleted with no grace period
+    /// at all.
+    #[test]
+    fn orphaned_pending_deletions_are_reaped_and_live_ones_are_not() {
+        let i = idx();
+        let live = entry("live.md");
+        let orphan = TaskUid::generate();
+        i.apply("p", std::slice::from_ref(&live)).unwrap();
+        i.mark_pending_deletion("p", &live.uid, 100).unwrap();
+        i.mark_pending_deletion("p", &orphan, 100).unwrap();
+
+        assert_eq!(i.reap_orphaned_pending_deletions("p").unwrap(), 1);
+        let v = i.view("p").unwrap();
+        assert!(v.pending_deletions.contains_key(&live.uid));
+        assert!(!v.pending_deletions.contains_key(&orphan));
+    }
+
+    #[test]
+    fn reaping_one_project_leaves_another_alone() {
+        let i = idx();
+        let orphan = TaskUid::generate();
+        i.mark_pending_deletion("a", &orphan, 100).unwrap();
+        i.mark_pending_deletion("b", &orphan, 100).unwrap();
+        i.reap_orphaned_pending_deletions("a").unwrap();
+        assert!(i.view("a").unwrap().pending_deletions.is_empty());
+        assert!(i.view("b").unwrap().pending_deletions.contains_key(&orphan));
     }
 
     #[test]

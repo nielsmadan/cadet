@@ -1,4 +1,4 @@
-use crate::reconcile::{App, AppError, carry_pending_deletions};
+use crate::reconcile::{App, AppError, carry_absent_tasks, collision_candidates};
 use cadet_core::*;
 use cadet_store_sqlite::TaskSummary;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,18 +17,37 @@ impl App {
     /// scan-and-replace would silently drop it from `list()` the moment
     /// *any* write ran, not just the one that caused its absence.
     fn refresh_cache(&self) -> Result<(), AppError> {
-        if let ChangeSet::Snapshot { tasks, .. } = self.backend.scan(None)? {
+        if let ChangeSet::Snapshot {
+            snapshot,
+            mut tasks,
+        } = self.backend.scan(None)?
+        {
+            // The same §5 collision rule reconcile applies, minus the file
+            // writes: this path has no identity-resolution pass, but the
+            // cache it fills is subject to `tasks_unique_key` all the same,
+            // so two tasks claiming one key have to be told apart here too.
+            let high_water = self.index.high_water(&self.project)?;
+            let prefix = self.backend.load_project()?.prefix;
+            for r in resolve_collisions(collision_candidates(&tasks, &prefix), high_water) {
+                if let (Some(key), Some(from)) = (r.new_key, r.renumbered_from)
+                    && let Some(t) = tasks.get_mut(&r.path)
+                {
+                    t.key = key;
+                    t.renumbered_from = Some(from);
+                }
+            }
             let observed: BTreeSet<String> =
                 tasks.values().map(|t| t.uid.as_str().to_string()).collect();
             let mut cached: Vec<Task> = tasks.into_values().collect();
             let pending_deletions = self.index.view(&self.project)?.pending_deletions;
-            if !pending_deletions.is_empty() {
+            if !snapshot.complete || !pending_deletions.is_empty() {
                 let previously_cached = self.index.list_tasks(&self.project, true, &[])?;
                 let observed: BTreeSet<&str> = observed.iter().map(String::as_str).collect();
-                cached.extend(carry_pending_deletions(
+                cached.extend(carry_absent_tasks(
                     &pending_deletions,
                     previously_cached.iter(),
                     &observed,
+                    snapshot.complete,
                 ));
             }
             self.index.cache_tasks(&self.project, &cached)?;

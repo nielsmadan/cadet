@@ -1,7 +1,5 @@
 use cadet_backend_fs::FsBackend;
-use cadet_core::conformance::{
-    assert_round_trip, assert_scan_is_a_complete_snapshot, assert_stale_revision_is_rejected,
-};
+use cadet_core::conformance::*;
 use cadet_core::*;
 use std::collections::BTreeMap;
 
@@ -48,6 +46,23 @@ fn task(title: &str) -> Task {
         fields: BTreeMap::new(),
         body: "notes\n".into(),
     }
+}
+
+/// A task exercising every field the round-trip contract covers, not just
+/// the three a bare `task()` sets.
+fn rich(title: &str) -> Task {
+    let mut t = task(title);
+    t.due = Some("2026-09-01".into());
+    t.priority = Priority::High;
+    t.tags = vec!["home".into(), "errands".into()];
+    t.fields
+        .insert("owner".into(), FieldValue::Str("alice".into()));
+    t.fields.insert("estimate".into(), FieldValue::Int(3));
+    t.fields.insert(
+        "labels".into(),
+        FieldValue::List(vec!["a".into(), "b".into()]),
+    );
+    t
 }
 
 #[test]
@@ -295,6 +310,44 @@ fn a_declared_field_removed_from_the_task_is_removed_from_the_file() {
     );
 }
 
+/// A *declared* field whose on-disk value is not the shape its declared type
+/// demands cannot be read into `task.fields` — and must therefore not be a
+/// candidate for the removal loop either. Otherwise a plausible hand-edit
+/// (writing a scalar field as a block list, or as a nested map) is silently
+/// deleted by the next ordinary `cadet done`.
+#[test]
+fn a_declared_field_with_a_mismatched_shape_is_preserved_not_deleted() {
+    let (d, b) = setup();
+    let t = task("hand edited");
+    b.put(t.clone(), None).unwrap();
+    let path = d.path().join("hand-edited.md");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    // `estimate` is declared `int` and `owner` declared `str`; neither can
+    // be read as a scalar in these shapes.
+    std::fs::write(
+        &path,
+        raw.replace(
+            "state: todo",
+            "state: todo\nestimate:\n  - 3\n  - 5\nowner:\n  name: alice\n  team: core",
+        ),
+    )
+    .unwrap();
+
+    let mut t2 = b.get(t.uid.clone()).unwrap().unwrap();
+    t2.state = "done".into();
+    b.put(t2, None).unwrap();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("estimate:\n  - 3\n  - 5"),
+        "a declared field written as a block list must survive:\n{after}"
+    );
+    assert!(
+        after.contains("owner:\n  name: alice\n  team: core"),
+        "a declared field written as a nested map must survive:\n{after}"
+    );
+}
+
 #[test]
 fn list_items_containing_commas_round_trip_intact() {
     let (_d, b) = setup();
@@ -464,6 +517,8 @@ fn changing_a_title_does_not_rename_the_file() {
 fn fs_backend_satisfies_the_conformance_suite() {
     let (_d, b) = setup();
     assert_scan_is_a_complete_snapshot(&b);
-    assert_round_trip(&b, task("Round trip"));
+    assert_round_trip(&b, rich("Round trip"));
     assert_stale_revision_is_rejected(&b, task("Stale revision"));
+    assert_delete_removes_the_task(&b, task("Deletable"));
+    assert_scan_detects_a_change(&b, task("Changeable"));
 }
