@@ -760,6 +760,11 @@ fn a_path_reused_after_a_copy_does_not_inherit_instant_adoption() {
 struct IncompleteBackend {
     inner: FsBackend,
     incomplete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Makes `scan` fail outright rather than return a partial view — a
+    /// broken `project.toml`, a vanished vault root. Everything a write
+    /// needs (`put`, `delete`) still works, so the write lands and only the
+    /// cache refresh on top of it fails.
+    fail_scan: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl cadet_core::Backend for IncompleteBackend {
@@ -802,6 +807,9 @@ impl cadet_core::Backend for IncompleteBackend {
         &self,
         since: Option<cadet_core::Cursor>,
     ) -> Result<cadet_core::ChangeSet, cadet_core::BackendError> {
+        if self.fail_scan.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(cadet_core::BackendError::Io("scan is unavailable".into()));
+        }
         let mut cs = self.inner.scan(since)?;
         if !self.incomplete.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(cs);
@@ -842,6 +850,7 @@ fn an_incomplete_scan_does_not_drop_a_task_from_the_cache_on_a_write() {
         Box::new(IncompleteBackend {
             inner: FsBackend::new(f.vault_path.clone()),
             incomplete: std::sync::Arc::clone(&incomplete),
+            fail_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         SqliteIndex::open_in_memory().unwrap(),
         GitNet::new(f.repo_dir.clone(), f.vault_path.clone()),
@@ -922,4 +931,408 @@ fn a_failed_commit_does_not_fail_the_write() {
         "drain must clear the queue"
     );
     let _ = task;
+}
+
+/// A hand-written task file, uid and key exactly as given — including a key
+/// the project's own prefix does not cover, or one that does not parse at
+/// all. `App::add` cannot produce these; a sync from another vault, a
+/// hand-edited note, or a restored backup can.
+fn write_raw_task(
+    dir: &std::path::Path,
+    name: &str,
+    uid: &str,
+    key: &str,
+    title: &str,
+    created: &str,
+) {
+    std::fs::write(
+        dir.join(name),
+        format!(
+            "---\nuid: {uid}\nkey: {key}\ntitle: {title}\nstate: todo\ncreated: {created}\nupdated: {created}\n---\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn uid_str(n: u8) -> String {
+    format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}")
+}
+
+/// D1c: a genuine duplicate key plus any incomplete snapshot. The
+/// `!complete` early return in `renumber_duplicate_keys` skipped resolution
+/// entirely while `cache_tasks` stayed unconditional, so `ls` — a pure read
+/// — died with a raw SQLite error and deleting the index did not recover,
+/// because the fresh index IS the failing state.
+#[cfg(unix)]
+#[test]
+fn a_duplicate_key_under_an_incomplete_scan_does_not_kill_every_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    write_raw_task(
+        &f.vault_path,
+        "dup-a.md",
+        &uid_str(1),
+        "P-1",
+        "dup a",
+        "2026-01-01T00:00:00Z",
+    );
+    write_raw_task(
+        &f.vault_path,
+        "dup-b.md",
+        &uid_str(2),
+        "P-1",
+        "dup b",
+        "2026-01-02T00:00:00Z",
+    );
+    write_raw_task(
+        &f.vault_path,
+        "locked.md",
+        &uid_str(3),
+        "P-9",
+        "locked",
+        "2026-01-03T00:00:00Z",
+    );
+    let locked = f.vault_path.join("locked.md");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = f.app.reconcile(0);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        result.is_ok(),
+        "a read must never be killed by data the backend legitimately contains: {result:?}"
+    );
+
+    let tasks = f.app.list(true).unwrap();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "both duplicates must be listed, got {tasks:?}"
+    );
+    let mut keys: Vec<String> = tasks.iter().map(|t| t.key.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the duplicate key must have been resolved, got {tasks:?}"
+    );
+}
+
+/// D1a: two files carrying a key under a prefix this project does not own.
+/// `collision_candidates` filtered them out of resolution, but `cache_tasks`
+/// still had to store both. Reproduces only when the files carry a `uid` —
+/// without one they are adopted, and `Backend::adopt` restamps the key under
+/// the project prefix before the conflict is ever reached.
+#[test]
+fn two_files_sharing_a_foreign_prefix_key_do_not_kill_every_read() {
+    let f = fixture();
+    write_raw_task(
+        &f.vault_path,
+        "f1.md",
+        &uid_str(4),
+        "OTHER-1",
+        "foreign one",
+        "2026-01-01T00:00:00Z",
+    );
+    write_raw_task(
+        &f.vault_path,
+        "f2.md",
+        &uid_str(5),
+        "OTHER-1",
+        "foreign two",
+        "2026-01-02T00:00:00Z",
+    );
+
+    assert!(
+        f.app.reconcile(0).is_ok(),
+        "a foreign-prefix duplicate must not abort the read"
+    );
+    let tasks = f.app.list(true).unwrap();
+    assert_eq!(tasks.len(), 2, "got {tasks:?}");
+    let mut keys: Vec<String> = tasks.iter().map(|t| t.key.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the duplicate key must have been resolved, got {tasks:?}"
+    );
+}
+
+/// D1b: two files whose `key:` does not parse. Both read back as the `?-0`
+/// placeholder, so both were excluded from resolution and both landed in
+/// `cache_tasks` under `?-0`.
+#[test]
+fn two_files_with_an_unparseable_key_do_not_kill_every_read() {
+    let f = fixture();
+    write_raw_task(
+        &f.vault_path,
+        "b1.md",
+        &uid_str(6),
+        "not a key!!",
+        "broken one",
+        "2026-01-01T00:00:00Z",
+    );
+    write_raw_task(
+        &f.vault_path,
+        "b2.md",
+        &uid_str(7),
+        "also bad!!",
+        "broken two",
+        "2026-01-02T00:00:00Z",
+    );
+
+    assert!(
+        f.app.reconcile(0).is_ok(),
+        "an unparseable duplicate key must not abort the read"
+    );
+    let tasks = f.app.list(true).unwrap();
+    assert_eq!(tasks.len(), 2, "got {tasks:?}");
+    let mut keys: Vec<String> = tasks.iter().map(|t| t.key.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the duplicate placeholder key must have been resolved, got {tasks:?}"
+    );
+}
+
+/// D2: `cp -p` of any note made every mutating command exit 1 AFTER its
+/// write had already landed. `reconcile_with` drops a `PendingCopy` from
+/// `parsed`; `refresh_cache` had no identity pass at all, so both files
+/// reached `cache_tasks` under one uid.
+#[test]
+fn a_duplicated_uid_does_not_fail_a_write_that_already_landed() {
+    let f = fixture();
+    let alpha = f.app.add("alpha").unwrap();
+    f.app.add("beta").unwrap();
+    // The index has to know `alpha.md` BEFORE the copy appears, or this is
+    // the cold-index case instead, where the copy legitimately keeps the uid
+    // (the §5 limitation recorded in the spec, not this regression).
+    f.app.reconcile(0).unwrap();
+    // `cp -p`: the copy carries alpha's uid. Retitled afterwards purely so
+    // the two are told apart below — `alpha-copy.md` sorts BEFORE `alpha.md`
+    // ('-' < '.'), so a resolver that just takes the first path silently
+    // hands the original's row to the copy.
+    let original = std::fs::read_to_string(f.vault_path.join("alpha.md")).unwrap();
+    std::fs::write(
+        f.vault_path.join("alpha-copy.md"),
+        original.replace("title: alpha", "title: alpha copy"),
+    )
+    .unwrap();
+    f.app.reconcile(0).unwrap();
+
+    let gamma = f.app.add("gamma");
+    assert!(
+        gamma.is_ok(),
+        "the write landed; it must not report failure: {gamma:?}"
+    );
+
+    let beta_key = cadet_core::TaskKey::new("P", 2);
+    let removed = f.app.delete(&beta_key);
+    assert!(
+        removed.is_ok(),
+        "the delete landed; it must not report failure: {removed:?}"
+    );
+
+    let tasks = f.app.list(true).unwrap();
+    let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+    assert!(titles.contains(&"gamma"), "got {titles:?}");
+    assert!(!titles.contains(&"beta"), "got {titles:?}");
+    // The file the index already records for that uid keeps the row. A bare
+    // refresh that chose otherwise would disagree with the next reconcile
+    // and the two would swap the row on alternate commands.
+    assert!(
+        titles.contains(&"alpha"),
+        "the original must keep its row, got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"alpha copy"),
+        "the copy must not take it, got {titles:?}"
+    );
+    assert_eq!(f.app.get_by_key(&alpha.key).unwrap().uid, alpha.uid);
+}
+
+/// D4: `add`/`done`/`rm` run backend write → index update → cache refresh.
+/// The first two are durable by the time the third runs, so a failure there
+/// is a stale display, not a failed operation. Reporting it as one made
+/// every retry duplicate the work — the exact failure `commit_or_warn` was
+/// written to prevent on the git side.
+#[test]
+fn a_failed_cache_refresh_warns_instead_of_failing_a_durable_write() {
+    let f = fixture();
+    let fail_scan = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = App::new(
+        Box::new(IncompleteBackend {
+            inner: FsBackend::new(f.vault_path.clone()),
+            incomplete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_scan: std::sync::Arc::clone(&fail_scan),
+        }),
+        SqliteIndex::open_in_memory().unwrap(),
+        GitNet::new(f.repo_dir.clone(), f.vault_path.clone()),
+        "p".into(),
+    );
+
+    fail_scan.store(true, std::sync::atomic::Ordering::Relaxed);
+    let added = app.add("durable");
+    assert!(
+        added.is_ok(),
+        "the file was written before the refresh ran; the command must not report failure: {added:?}"
+    );
+    assert!(
+        f.vault_path.join("durable.md").exists(),
+        "the write really did land"
+    );
+    let warnings = app.drain_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("could not be refreshed")),
+        "the failure must still reach the user, got {warnings:?}"
+    );
+}
+
+/// D3, the eighth instance of the same signature: `renumber_duplicate_keys`
+/// cleared `pending_renumbers` only for paths still in `parsed`, and only
+/// under a complete scan, while `forget` cleared three of five tables. The
+/// row for a file that is simply gone had nothing left to reap it. Growth is
+/// the mild half; the sharp half is that a byte-identical file restored at
+/// the same path inherits a countdown that is already satisfied.
+#[test]
+fn a_pending_renumber_row_does_not_outlive_its_file() {
+    let f = fixture();
+    f.app.add("keeper").unwrap();
+    // Created LATER than `keeper`, so §5 makes `dup.md` the loser and the
+    // `pending_renumbers` row is the one that names it. With the timestamps
+    // the other way round the row lands on `keeper.md`, which stays on disk
+    // and is cleared by the ordinary settled path — the reaper never runs.
+    std::fs::write(
+        f.vault_path.join("dup.md"),
+        "---\nuid: 01ARZ3NDEKTSV4RRFFQ69G5F42\nkey: P-1\ntitle: dup\nstate: todo\ncreated: 2099-01-01T00:00:00Z\nupdated: 2099-01-01T00:00:00Z\n---\n",
+    )
+    .unwrap();
+    f.app.reconcile(0).unwrap();
+    assert_eq!(
+        f.app.renumber_status().unwrap().pending,
+        1,
+        "the collision must be on record before the reap can be tested"
+    );
+
+    std::fs::remove_file(f.vault_path.join("dup.md")).unwrap();
+    for now in [1_000, 2_000, 3_000] {
+        f.app.reconcile(now).unwrap();
+    }
+    assert_eq!(
+        f.app.renumber_status().unwrap().pending,
+        0,
+        "a pending_renumbers row must not outlive the file it names"
+    );
+}
+
+/// D7: `report.renumbered` counts what THIS reconcile pass did, and the pass
+/// that does the renumbering is whichever command reconciles first — almost
+/// never `doctor`. The user's diagnostic therefore reported 0 for a renumber
+/// that had demonstrably happened.
+#[test]
+fn doctor_reports_a_renumber_that_an_earlier_command_performed() {
+    let f = fixture();
+    f.app.add("keeper").unwrap();
+    std::fs::write(
+        f.vault_path.join("dup.md"),
+        "---\nuid: 01ARZ3NDEKTSV4RRFFQ69G5F43\nkey: P-1\ntitle: dup\nstate: todo\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n",
+    )
+    .unwrap();
+    f.app.reconcile(0).unwrap();
+    // The pass that actually renumbers — stand-in for the `cadet ls` the
+    // user ran before thinking to ask `doctor`.
+    let renumbering_pass = f.app.reconcile(60_001).unwrap();
+    assert_eq!(
+        renumbering_pass.renumbered, 1,
+        "the renumber really happened"
+    );
+
+    // The `doctor` invocation itself: its own reconcile has nothing left to
+    // do, so the per-pass counter is 0 and always will be.
+    let doctor_pass = f.app.reconcile(60_002).unwrap();
+    assert_eq!(doctor_pass.renumbered, 0);
+    assert_eq!(
+        f.app.renumber_status().unwrap().recorded,
+        1,
+        "doctor must report the renumber from its durable breadcrumb, not from its own pass"
+    );
+}
+
+/// D9: the rebuild-path copy gets its fresh uid through `Backend::adopt`,
+/// not the renumber path, so it recorded neither `renumbered_from` nor
+/// `possible_duplicate_of` — a file silently lost its identity and said
+/// nothing. `possible_duplicate_of` was dead plumbing: read back by the
+/// backend, never written by production code.
+#[test]
+fn a_copy_given_a_fresh_identity_records_what_it_was_copied_from() {
+    let f = fixture();
+    let shared = "01ARZ3NDEKTSV4RRFFQ69G5F44";
+    for name in ["a.md", "b.md"] {
+        std::fs::write(
+            f.vault_path.join(name),
+            format!(
+                "---\nuid: {shared}\nkey: P-1\ntitle: twin\nstate: todo\ncreated: 2026-01-01T00:00:00Z\nupdated: 2026-01-01T00:00:00Z\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+    // `a.md` claims the uid; `b.md` is the copy and waits out the grace period.
+    f.app.reconcile(0).unwrap();
+    let r = f.app.reconcile(60_001).unwrap();
+    assert_eq!(r.copies, 1, "the copy must have been given an identity");
+
+    let copy = std::fs::read_to_string(f.vault_path.join("b.md")).unwrap();
+    assert!(
+        copy.contains(&format!("possible_duplicate_of: {shared}")),
+        "the copy must record the identity it was split from:\n{copy}"
+    );
+    assert!(
+        !copy.contains(&format!("uid: {shared}")),
+        "the copy must have a fresh uid of its own:\n{copy}"
+    );
+    let kept = std::fs::read_to_string(f.vault_path.join("a.md")).unwrap();
+    assert!(
+        kept.contains(&format!("uid: {shared}")),
+        "the original must keep the uid:\n{kept}"
+    );
+}
+
+/// D8: `path_for` aborted on `Permission denied` and on `Malformed` where
+/// `scan` degrades gracefully. `put` resolves a uid through `path_for`
+/// first, so one unreadable note meant `cadet add` could never succeed again
+/// anywhere in the project.
+#[cfg(unix)]
+#[test]
+fn one_unreadable_file_does_not_block_every_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    f.app.add("existing").unwrap();
+
+    let locked = f.vault_path.join("locked.md");
+    std::fs::write(
+        &locked,
+        "---\nuid: 01ARZ3NDEKTSV4RRFFQ69G5F45\nkey: P-9\ntitle: locked\nstate: todo\n---\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A second bad file, unreadable for the other reason `scan` tolerates:
+    // task-shaped, but with no uid `read_task` can parse.
+    std::fs::write(
+        f.vault_path.join("nouid.md"),
+        "---\nkey: P-8\ntitle: no uid\nstate: todo\n---\n",
+    )
+    .unwrap();
+
+    let added = f.app.add("new one");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        added.is_ok(),
+        "one file Cadet cannot read must not block every write: {added:?}"
+    );
+    assert!(f.vault_path.join("new-one.md").exists());
 }

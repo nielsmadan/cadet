@@ -1,4 +1,4 @@
-use crate::reconcile::{App, AppError, carry_absent_tasks, collision_candidates};
+use crate::reconcile::{App, AppError};
 use cadet_core::*;
 use cadet_store_sqlite::TaskSummary;
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,49 +10,56 @@ impl App {
 
     /// Re-reads the backend once and refreshes the cached display data, so an
     /// index-backed `list()` is correct immediately after a mutation.
-    /// One pass, not one pass per task. Unlike `reconcile`, this has no
-    /// identity-resolution pass of its own — it must not blindly trust the
-    /// scan as the complete picture: a task mid pending-deletion grace
-    /// period is legitimately absent from disk right now, and a bare
-    /// scan-and-replace would silently drop it from `list()` the moment
-    /// *any* write ran, not just the one that caused its absence.
+    /// One pass, not one pass per task.
+    ///
+    /// It has no identity-resolution pass of its own, so it must not blindly
+    /// trust the scan as the complete picture. Both places that used to make
+    /// it wrong now run through the same two functions `reconcile_with` uses:
+    /// `resolve_duplicates` (one path per uid, one task per key) and
+    /// `assemble_cache` (a task mid pending-deletion grace period is
+    /// legitimately absent from disk right now, and a bare scan-and-replace
+    /// would drop it from `list()` the moment *any* write ran).
     fn refresh_cache(&self) -> Result<(), AppError> {
         if let ChangeSet::Snapshot {
             snapshot,
             mut tasks,
         } = self.backend.scan(None)?
         {
-            // The same §5 collision rule reconcile applies, minus the file
-            // writes: this path has no identity-resolution pass, but the
-            // cache it fills is subject to `tasks_unique_key` all the same,
-            // so two tasks claiming one key have to be told apart here too.
-            let high_water = self.index.high_water(&self.project)?;
             let prefix = self.backend.load_project()?.prefix;
-            for r in resolve_collisions(collision_candidates(&tasks, &prefix), high_water) {
-                if let (Some(key), Some(from)) = (r.new_key, r.renumbered_from)
-                    && let Some(t) = tasks.get_mut(&r.path)
-                {
-                    t.key = key;
-                    t.renumbered_from = Some(from);
-                }
-            }
-            let observed: BTreeSet<String> =
-                tasks.values().map(|t| t.uid.as_str().to_string()).collect();
-            let mut cached: Vec<Task> = tasks.into_values().collect();
-            let pending_deletions = self.index.view(&self.project)?.pending_deletions;
-            if !snapshot.complete || !pending_deletions.is_empty() {
-                let previously_cached = self.index.list_tasks(&self.project, true, &[])?;
-                let observed: BTreeSet<&str> = observed.iter().map(String::as_str).collect();
-                cached.extend(carry_absent_tasks(
-                    &pending_deletions,
-                    previously_cached.iter(),
-                    &observed,
-                    snapshot.complete,
-                ));
-            }
+            // Resolutions are discarded here on purpose: this path never
+            // writes to a user file. It only has to leave the cache
+            // consistent with what reconcile will settle on.
+            self.resolve_duplicates(&mut tasks, &prefix)?;
+            let observed: BTreeSet<&str> = snapshot
+                .observed
+                .iter()
+                .filter_map(|o| o.uid.as_ref().map(TaskUid::as_str))
+                .collect();
+            let previously_cached = self.index.list_tasks(&self.project, true, &[])?;
+            let cached = self.assemble_cache(
+                snapshot.complete,
+                tasks,
+                &observed,
+                previously_cached.iter(),
+            )?;
             self.index.cache_tasks(&self.project, &cached)?;
         }
         Ok(())
+    }
+
+    /// The backend write and the index update that precede every call to
+    /// this are already durable; the cache is derived display data on top of
+    /// them. A failure here must never make an already-successful write look
+    /// like it failed — a user who retries duplicates the work. Exactly the
+    /// reasoning `commit_or_warn` applies to git, and exactly what `add`,
+    /// `done` and `rm` lacked when they exited 1 after their write had
+    /// already landed.
+    fn refresh_cache_or_warn(&self) {
+        if let Err(e) = self.refresh_cache() {
+            self.warn(format!(
+                "change saved, but the task list could not be refreshed: {e}"
+            ));
+        }
     }
 
     /// The backend write and index update that precede this call are already
@@ -93,7 +100,7 @@ impl App {
         validate_task(&task, &cfg)?;
         self.backend.put(task.clone(), None)?;
         self.index.bump_high_water(&self.project, next)?;
-        self.refresh_cache()?;
+        self.refresh_cache_or_warn();
         self.commit_or_warn(&format!("add {}: {}", task.key, task.title));
         Ok(task)
     }
@@ -121,7 +128,7 @@ impl App {
         task.updated = Self::now();
         validate_task(&task, &cfg)?;
         self.backend.put(task.clone(), Some(expected))?;
-        self.refresh_cache()?;
+        self.refresh_cache_or_warn();
         self.commit_or_warn(&format!("{} -> {}", task.key, state));
         Ok(task)
     }
@@ -139,7 +146,7 @@ impl App {
         // guard) for no reason, and misreported by `cadet doctor` as still
         // pending when the user already confirmed it.
         self.index.forget(&self.project, &task.uid)?;
-        self.refresh_cache()?;
+        self.refresh_cache_or_warn();
         self.commit_or_warn(&format!("remove {key}"));
         Ok(())
     }

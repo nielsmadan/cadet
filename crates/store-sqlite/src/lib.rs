@@ -245,19 +245,57 @@ impl SqliteIndex {
         Ok(out)
     }
 
-    /// Drops `pending_deletions` rows for uids `entries` no longer knows.
-    /// `forget` and `clear_pending_deletion` are the only other reapers and
-    /// neither runs for a uid that leaves `entries` by a rebuild, so the
-    /// table would otherwise grow without bound — and, worse, a stale row is
-    /// read as "already mid grace period", which deletes the uid with no
-    /// grace period at all if it ever comes back.
-    pub fn reap_orphaned_pending_deletions(&self, project: &str) -> Result<usize, IndexError> {
-        Ok(self.conn.execute(
+    /// Drops every grace-period row whose subject no longer exists — across
+    /// all three tables, in one function, deliberately not three near-copies
+    /// of one rule. Three near-copies is how "one half of a symmetric pair
+    /// fixed, the other left" kept reproducing here; a reaper that covered
+    /// `pending_deletions` alone left `pending` and `pending_renumbers` to
+    /// grow without bound, and a stale row is worse than clutter — it reads
+    /// as "already mid grace period", so the subject gets no grace period at
+    /// all when it comes back.
+    ///
+    /// The two halves are keyed differently and cannot share a predicate.
+    /// `pending_deletions` is keyed on uid and orphaned when `entries` no
+    /// longer knows it. `pending` and `pending_renumbers` are keyed on path,
+    /// and `pending` holds paths that by definition have no `entries` row yet
+    /// (they are awaiting adoption), so only the scan's own live-path set can
+    /// judge them. Pass `None` for `live_paths` when the scan was incomplete:
+    /// absence is not evidence then, and reaping on it would wipe every
+    /// adoption countdown in the project.
+    pub fn reap_orphans(
+        &self,
+        project: &str,
+        live_paths: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<usize, IndexError> {
+        let mut reaped = self.conn.execute(
             "DELETE FROM pending_deletions
              WHERE project = ?1
                AND uid NOT IN (SELECT uid FROM entries WHERE project = ?1)",
             params![project],
-        )?)
+        )?;
+        let Some(live) = live_paths else {
+            return Ok(reaped);
+        };
+        for table in ["pending", "pending_renumbers"] {
+            let mut st = self
+                .conn
+                .prepare(&format!("SELECT path FROM {table} WHERE project = ?1"))?;
+            let rows = st.query_map(params![project], |r| r.get::<_, String>(0))?;
+            let mut orphans = Vec::new();
+            for row in rows {
+                let path = row?;
+                if !live.contains(&path) {
+                    orphans.push(path);
+                }
+            }
+            for path in orphans {
+                reaped += self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE project = ?1 AND path = ?2"),
+                    params![project, path],
+                )?;
+            }
+        }
+        Ok(reaped)
     }
 
     pub fn high_water(&self, project: &str) -> Result<u32, IndexError> {
@@ -371,17 +409,42 @@ impl SqliteIndex {
         rows.next().transpose().map_err(Into::into)
     }
 
-    /// Removes a single uid from `entries`, `tasks`, and `pending_deletions`
-    /// in one call — the narrow, uid-scoped counterpart to `clear` (which is
-    /// project-wide). For when the caller already knows, with certainty,
-    /// that this exact task is gone (an explicit delete): there is nothing
-    /// left to infer, so nothing else in the project is touched.
+    /// Removes a single uid from all five tables — the narrow, uid-scoped
+    /// counterpart to `clear` (which is project-wide). For when the caller
+    /// already knows, with certainty, that this exact task is gone (an
+    /// explicit delete): there is nothing left to infer, so nothing else in
+    /// the project is touched.
+    ///
+    /// The uid's path has to be read out of `entries` first, because
+    /// `pending` and `pending_renumbers` are keyed on path. Leaving those two
+    /// behind is not just clutter: the path is reused, and whatever file
+    /// appears there next inherits a countdown that is already satisfied.
     pub fn forget(&self, project: &str, uid: &TaskUid) -> Result<(), IndexError> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM entries WHERE project = ?1 AND uid = ?2",
+                params![project, uid.as_str()],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
         for table in ["entries", "tasks", "pending_deletions"] {
             self.conn.execute(
                 &format!("DELETE FROM {table} WHERE project = ?1 AND uid = ?2"),
                 params![project, uid.as_str()],
             )?;
+        }
+        if let Some(path) = path {
+            for table in ["pending", "pending_renumbers"] {
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE project = ?1 AND path = ?2"),
+                    params![project, path],
+                )?;
+            }
         }
         Ok(())
     }
@@ -675,10 +738,92 @@ mod tests {
         i.mark_pending_deletion("p", &live.uid, 100).unwrap();
         i.mark_pending_deletion("p", &orphan, 100).unwrap();
 
-        assert_eq!(i.reap_orphaned_pending_deletions("p").unwrap(), 1);
+        assert_eq!(i.reap_orphans("p", None).unwrap(), 1);
         let v = i.view("p").unwrap();
         assert!(v.pending_deletions.contains_key(&live.uid));
         assert!(!v.pending_deletions.contains_key(&orphan));
+    }
+
+    /// The reaper covers all three grace-period tables, not one. Three
+    /// near-copies of this rule is how "one half of a symmetric pair fixed,
+    /// the other left" kept reproducing in this codebase.
+    #[test]
+    fn reaping_covers_the_path_keyed_tables_too() {
+        let i = idx();
+        i.mark_pending("p", "live.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending("p", "gone.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "live.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "gone.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+
+        let live: std::collections::BTreeSet<String> =
+            ["live.md".to_string()].into_iter().collect();
+        i.reap_orphans("p", Some(&live)).unwrap();
+
+        let v = i.view("p").unwrap();
+        assert!(
+            v.pending.contains_key("live.md"),
+            "a live path must survive"
+        );
+        assert!(!v.pending.contains_key("gone.md"));
+        let renumbers = i.pending_renumbers("p").unwrap();
+        assert!(renumbers.contains_key("live.md"));
+        assert!(!renumbers.contains_key("gone.md"));
+    }
+
+    /// `pending` holds paths that by definition have no `entries` row yet —
+    /// they are awaiting adoption. An incomplete scan is not evidence a path
+    /// is gone, and reaping on one would wipe every adoption countdown in
+    /// the project, handing each note a fresh 60s wait on every command.
+    #[test]
+    fn an_incomplete_scan_reaps_nothing_path_keyed() {
+        let i = idx();
+        i.mark_pending("p", "awaiting.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "awaiting.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.reap_orphans("p", None).unwrap();
+        assert!(i.view("p").unwrap().pending.contains_key("awaiting.md"));
+        assert!(
+            i.pending_renumbers("p")
+                .unwrap()
+                .contains_key("awaiting.md")
+        );
+    }
+
+    /// `forget` has to clear all five tables. `pending` and
+    /// `pending_renumbers` are keyed on path, and a path is reused: leaving
+    /// a row behind means whatever file appears there next inherits a
+    /// countdown that is already satisfied.
+    #[test]
+    fn forget_clears_the_path_keyed_tables_for_that_uid_too() {
+        let i = idx();
+        let gone = entry("gone.md");
+        let other = entry("other.md");
+        i.apply("p", &[gone.clone(), other.clone()]).unwrap();
+        i.mark_pending("p", "gone.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending("p", "other.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "gone.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+        i.mark_pending_renumber("p", "other.md", &Revision::from_raw("r1"), 100)
+            .unwrap();
+
+        i.forget("p", &gone.uid).unwrap();
+
+        let v = i.view("p").unwrap();
+        assert!(!v.pending.contains_key("gone.md"));
+        assert!(
+            v.pending.contains_key("other.md"),
+            "a different uid's path must be untouched"
+        );
+        let renumbers = i.pending_renumbers("p").unwrap();
+        assert!(!renumbers.contains_key("gone.md"));
+        assert!(renumbers.contains_key("other.md"));
     }
 
     #[test]
@@ -687,7 +832,7 @@ mod tests {
         let orphan = TaskUid::generate();
         i.mark_pending_deletion("a", &orphan, 100).unwrap();
         i.mark_pending_deletion("b", &orphan, 100).unwrap();
-        i.reap_orphaned_pending_deletions("a").unwrap();
+        i.reap_orphans("a", None).unwrap();
         assert!(i.view("a").unwrap().pending_deletions.is_empty());
         assert!(i.view("b").unwrap().pending_deletions.contains_key(&orphan));
     }

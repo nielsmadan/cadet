@@ -142,9 +142,18 @@ fn first_segment(s: &str) -> &str {
 
 /// The one impurity `core` still has, kept honest rather than hidden.
 /// `TaskUid::generate` reads the system clock and an RNG through `ulid`.
-/// Threading uid generation in from `app` is the real fix and is out of this
-/// wave's scope; until then the exemption is confined to `model.rs`, so no
-/// other module can quietly acquire a clock or a source of randomness.
+/// Threading uid generation in from `app` is the real fix and is out of
+/// scope for now; until then the direct dependency on `ulid` is confined to
+/// `model.rs`.
+///
+/// Be precise about what this does and does not buy, because the fix report
+/// originally claimed more than it delivers. It asserts one thing only: no
+/// `core` source outside `model.rs` mentions `ulid::`. It does NOT assert
+/// that `model.rs` still contains the call, and it does NOT stop another
+/// module acquiring the same clock and RNG — `TaskUid::generate()` is `pub`,
+/// so any `core` module can call it without the string `ulid::` appearing
+/// anywhere in its source. What is bounded here is the second, independent
+/// reach for the crate, not access to non-determinism.
 #[test]
 fn ulid_generation_stays_confined_to_the_one_documented_exemption() {
     let mut offenders = Vec::new();

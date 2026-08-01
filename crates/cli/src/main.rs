@@ -243,6 +243,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.pending_adoption
         );
     }
+    // Reconcile runs ahead of every command, reads included, and it is where
+    // a duplicate the resolver could not settle gets held back out of the
+    // task list. That has to be visible on `cadet ls` too, not only after a
+    // write — a silently shorter list is how the user finds out otherwise.
+    print_warnings(&app);
 
     match cli.cmd.unwrap_or(Cmd::Ls { all: false }) {
         Cmd::Init { .. } => unreachable!("handled above"),
@@ -306,9 +311,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 report.adopted, report.pending_adoption
             );
             println!("pending deletions: {}", report.pending_deletion);
+            let renumbers = app.renumber_status()?;
             println!(
                 "renumbered: {}  pending renumber: {}",
-                report.renumbered, report.pending_renumber
+                renumbers.recorded, renumbers.pending
             );
             if report.scan_rejected.is_some() {
                 println!("scan rejected — see the warning above");

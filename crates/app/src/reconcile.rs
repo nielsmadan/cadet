@@ -21,6 +21,17 @@ pub struct ReconcileReport {
 
 pub const GRACE_MS: i64 = 60_000;
 
+/// What `cadet doctor` reports about renumbering. Both figures are standing
+/// state read fresh, not a tally of what one reconcile pass did.
+#[derive(Debug, Default, PartialEq)]
+pub struct RenumberStatus {
+    /// Tasks on disk carrying a `renumbered_from` breadcrumb.
+    pub recorded: usize,
+    /// Collisions resolved in the index but still waiting out the §5 grace
+    /// period before the file is rewritten.
+    pub pending: usize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -68,6 +79,29 @@ impl App {
     pub fn clear_index(&self) -> Result<(), AppError> {
         self.index.clear(&self.project)?;
         Ok(())
+    }
+
+    /// Standing renumber state, for `cadet doctor`.
+    ///
+    /// Deliberately not `ReconcileReport::renumbered`. A renumber fires in
+    /// whichever command reconciles first — almost never `doctor` itself —
+    /// so by the time a user asks, this pass has nothing left to do and the
+    /// report reads `renumbered: 0`, which is indistinguishable from "no
+    /// renumber ever happened". `recorded` counts the durable evidence
+    /// instead: the `renumbered_from` breadcrumb §5 requires the loser to
+    /// carry. Worth the extra scan — `doctor` is a diagnostic, not a hot path.
+    pub fn renumber_status(&self) -> Result<RenumberStatus, AppError> {
+        let recorded = match self.backend.scan(None)? {
+            ChangeSet::Snapshot { tasks, .. } => tasks
+                .values()
+                .filter(|t| t.renumbered_from.is_some())
+                .count(),
+            _ => 0,
+        };
+        Ok(RenumberStatus {
+            recorded,
+            pending: self.index.pending_renumbers(&self.project)?.len(),
+        })
     }
 
     /// Records a non-fatal warning for a caller to surface later. Never
@@ -221,7 +255,7 @@ impl App {
                                 });
                             }
                         }
-                        None => self.adopt(path, now_ms, &mut entries, &mut parsed)?,
+                        None => self.adopt(path, now_ms, &mut entries, &mut parsed, None)?,
                     }
                 }
                 Outcome::Update { uid, path } => {
@@ -268,14 +302,19 @@ impl App {
                     // both.
                     parsed.remove(path);
                 }
-                Outcome::Copy { path, .. } => {
+                Outcome::Copy { source, path } => {
                     report.copies += 1;
                     // Same reason `Adopt` clears it: this path's pending
                     // record has served its purpose, and paths are reused. A
                     // stale row would grant whatever file appears here next
                     // an adoption with no grace period at all.
                     self.index.clear_pending(&self.project, path)?;
-                    self.adopt(path, now_ms, &mut entries, &mut parsed)?;
+                    // A file that silently lost its identity must say so.
+                    // This is the only path that hands a file a uid it did
+                    // not have before, and it is not the renumber path, so
+                    // `renumbered_from` never gets written here — without
+                    // this the copy carries no breadcrumb at all.
+                    self.adopt(path, now_ms, &mut entries, &mut parsed, Some(source))?;
                 }
                 Outcome::PendingDeletion { uid } => {
                     report.pending_deletion += 1;
@@ -299,11 +338,12 @@ impl App {
             }
         }
 
-        self.renumber_duplicate_keys(
+        let resolved = self.resolve_duplicates(&mut parsed, &prefix)?;
+        self.apply_renumbers(
             now_ms,
-            &prefix,
             snap.complete,
-            &mut parsed,
+            &resolved,
+            &parsed,
             &mut entries,
             &mut report,
         )?;
@@ -312,76 +352,163 @@ impl App {
         // `apply` replaces `entries` wholesale, so any uid it just dropped
         // leaves its pending-deletion row behind with nothing left to reap
         // it. Read AFTER `apply` for exactly that reason.
-        self.index.reap_orphaned_pending_deletions(&self.project)?;
+        let live_paths: std::collections::BTreeSet<String> =
+            snap.observed.iter().map(|o| o.path.clone()).collect();
+        self.index.reap_orphans(
+            &self.project,
+            // An incomplete scan is not evidence a path is gone, so the
+            // path-keyed tables keep their rows until a whole-scan view says
+            // otherwise. Same reasoning as §5 guard 1 for deletions.
+            snap.complete.then_some(&live_paths),
+        )?;
         // Cache the parsed content so every later read is a SQL query, never a
         // file read (spec §3). The scan already parsed these — this is free.
-        // `carry_absent_tasks` adds back the tasks the scan didn't see
-        // this cycle but that are only pending deletion, not deleted yet —
-        // read AFTER the loop above so it sees this pass's own
-        // mark_pending_deletion/clear_pending_deletion calls.
+        // Runs AFTER the outcomes loop and the reap above so it sees this
+        // pass's own mark_pending_deletion/clear_pending_deletion calls.
         let observed_uids: std::collections::BTreeSet<&str> = snap
             .observed
             .iter()
             .filter_map(|o| o.uid.as_ref().map(TaskUid::as_str))
             .collect();
-        let pending_deletions = self.index.view(&self.project)?.pending_deletions;
-        let mut cached: Vec<Task> = parsed.into_values().collect();
-        cached.extend(carry_absent_tasks(
-            &pending_deletions,
-            cached_by_uid.values(),
-            &observed_uids,
+        let cached = self.assemble_cache(
             snap.complete,
-        ));
+            parsed,
+            &observed_uids,
+            cached_by_uid.values(),
+        )?;
         self.index.cache_tasks(&self.project, &cached)?;
         Ok(report)
     }
 
-    /// Applies the §5 whole-scan collision rule: every task claiming a key
-    /// another task also claims is renumbered from the high-water mark, in
-    /// `(created, canonical_hash, path)` order, and the loser records
-    /// `renumbered_from`.
+    /// Resolves everything that would violate a `tasks` uniqueness
+    /// constraint, in `parsed`, before either cache-filling path can hand it
+    /// to `cache_tasks`: one path per uid first, then one path per key.
     ///
-    /// The resolved key lands in `parsed` — and therefore in the index —
-    /// immediately, but the *file* write waits out the grace period, because
-    /// renumbering is one of the three situations in which reconcile mutates
-    /// a user file (§5). Splitting it that way is what keeps the index
-    /// duplicate-free while the countdown runs: two live tasks under one key
-    /// have no answer for `cadet show`, and `tasks_unique_key` now refuses to
-    /// store them at all.
-    fn renumber_duplicate_keys(
+    /// This is the single copy of that rule. `reconcile_with` and
+    /// `refresh_cache` used to be two hand-maintained copies of it that
+    /// disagreed — about the `complete` gate and about identity — and each
+    /// disagreement was its own critical regression: a duplicate key killed
+    /// every read, and a `cp -p` of any note made every mutating command
+    /// exit 1 after its write had already landed.
+    pub(crate) fn resolve_duplicates(
         &self,
-        now_ms: i64,
-        prefix: &str,
-        complete: bool,
         parsed: &mut std::collections::BTreeMap<String, Task>,
-        entries: &mut [IndexEntry],
-        report: &mut ReconcileReport,
-    ) -> Result<(), AppError> {
-        // An incomplete snapshot is not a whole-scan view, and the rule is
-        // defined over one: renumbering on a partial tree could move a key
-        // away from the task that legitimately owns it.
-        if !complete {
-            return Ok(());
+        prefix: &str,
+    ) -> Result<DuplicateResolution, AppError> {
+        // One live path per uid, chosen exactly as `resolve_identity`
+        // chooses: the path the index already records for that uid keeps it
+        // (that is the `Update` arm), and only when the index records
+        // neither does the lexicographically smallest path win (the
+        // `Adopt`-then-`Copy` arms, which classify in path order). Picking
+        // differently here would make a bare refresh disagree with the next
+        // reconcile about which file is the copy, and the two would fight
+        // over the row on alternate commands.
+        let recorded: std::collections::BTreeMap<TaskUid, String> = self
+            .index
+            .view(&self.project)?
+            .entries
+            .into_iter()
+            .map(|e| (e.uid, e.path))
+            .collect();
+        let mut by_uid: std::collections::BTreeMap<&TaskUid, Vec<&String>> =
+            std::collections::BTreeMap::new();
+        for (path, task) in parsed.iter() {
+            by_uid.entry(&task.uid).or_default().push(path);
         }
-        let high_water = self.index.high_water(&self.project)?;
-        let resolutions = resolve_collisions(collision_candidates(parsed, prefix), high_water);
-        let waiting = self.index.pending_renumbers(&self.project)?;
+        let mut copies: Vec<String> = Vec::new();
+        for (uid, paths) in by_uid {
+            if paths.len() < 2 {
+                continue;
+            }
+            let keeper = recorded
+                .get(uid)
+                .filter(|p| paths.contains(p))
+                .cloned()
+                .unwrap_or_else(|| paths[0].clone());
+            for path in paths {
+                if path != &keeper {
+                    self.warn(format!(
+                        "{path} carries the same identity as {keeper} — it stays out of the task \
+                         list until `cadet adopt` gives it one of its own"
+                    ));
+                    copies.push(path.clone());
+                }
+            }
+        }
+        for path in copies {
+            parsed.remove(&path);
+        }
 
-        for r in resolutions {
+        // One task per key, over EVERY parsed task — a foreign prefix and the
+        // `?-0` placeholder included. `cache_tasks` enforces uniqueness over
+        // `(key_prefix, key_num)` for every row it stores, so resolution has
+        // to be total over exactly that domain or it hands the index a
+        // duplicate it was never taught to resolve.
+        let high_water = self.index.high_water(&self.project)?;
+        let mut out = DuplicateResolution::default();
+        for r in resolve_collisions(collision_candidates(parsed), high_water) {
             let (Some(new_key), Some(from)) = (r.new_key, r.renumbered_from) else {
-                self.index.clear_pending_renumber(&self.project, &r.path)?;
+                out.settled.push(r.path);
                 continue;
             };
             let Some(task) = parsed.get_mut(&r.path) else {
                 continue;
             };
-            let current = revision(task);
-            task.key = new_key.clone();
+            // Always mint under this project's own prefix. `resolve_collisions`
+            // keeps the group's prefix, which is right for the ordinary case
+            // and wrong for a duplicate carried in from another vault: the
+            // loser needs a key this project owns and allocates against its
+            // own high-water mark, not a second claim on a namespace it does
+            // not control.
+            let new_key = TaskKey::new(prefix.to_string(), new_key.number);
+            out.changes.push(KeyChange {
+                path: r.path,
+                to: new_key.clone(),
+                on_disk: revision(task),
+            });
+            task.key = new_key;
             task.renumbered_from = Some(from);
+        }
+        Ok(out)
+    }
 
-            let ready = waiting
-                .get(&r.path)
-                .is_some_and(|(rev, since)| rev == &current && now_ms - since >= GRACE_MS);
+    /// Writes the resolved keys back to the files that lost them. The key
+    /// itself already landed in `parsed` — and therefore in the index — in
+    /// `resolve_duplicates`; only the *file* write waits, because
+    /// renumbering is one of the three situations in which reconcile mutates
+    /// a user file (§5).
+    ///
+    /// Splitting it that way is the whole point: an incomplete snapshot is
+    /// not a whole-scan view, so it must not move a key on disk away from the
+    /// task that legitimately owns it — but the index still has to be
+    /// duplicate-free, because `tasks_unique_key` refuses to store two live
+    /// tasks under one key and `cadet show` has no answer for them either.
+    /// Gating the whole rule on `complete` rather than just the write is what
+    /// turned an unresolvable duplicate into a hard abort on every read.
+    fn apply_renumbers(
+        &self,
+        now_ms: i64,
+        complete: bool,
+        resolved: &DuplicateResolution,
+        parsed: &std::collections::BTreeMap<String, Task>,
+        entries: &mut [IndexEntry],
+        report: &mut ReconcileReport,
+    ) -> Result<(), AppError> {
+        for path in &resolved.settled {
+            self.index.clear_pending_renumber(&self.project, path)?;
+        }
+        if resolved.changes.is_empty() {
+            return Ok(());
+        }
+        let waiting = self.index.pending_renumbers(&self.project)?;
+        for change in &resolved.changes {
+            let Some(task) = parsed.get(&change.path) else {
+                continue;
+            };
+            let ready = complete
+                && waiting.get(&change.path).is_some_and(|(rev, since)| {
+                    rev == &change.on_disk && now_ms - since >= GRACE_MS
+                });
             if !ready {
                 // Deliberately no `bump_high_water` here. The mark is what
                 // `resolve_collisions` counts up from, so raising it for a key
@@ -389,19 +516,79 @@ impl App {
                 // different key on every poll, and the index would show a key
                 // that never settles.
                 report.pending_renumber += 1;
-                self.index
-                    .mark_pending_renumber(&self.project, &r.path, &current, now_ms)?;
+                self.index.mark_pending_renumber(
+                    &self.project,
+                    &change.path,
+                    &change.on_disk,
+                    now_ms,
+                )?;
                 continue;
             }
-            let written = self.backend.put(task.clone(), Some(current))?;
-            self.index.bump_high_water(&self.project, new_key.number)?;
-            self.index.clear_pending_renumber(&self.project, &r.path)?;
+            let written = self
+                .backend
+                .put(task.clone(), Some(change.on_disk.clone()))?;
+            self.index
+                .bump_high_water(&self.project, change.to.number)?;
+            self.index
+                .clear_pending_renumber(&self.project, &change.path)?;
             report.renumbered += 1;
             if let Some(e) = entries.iter_mut().find(|e| e.uid == task.uid) {
                 e.revision = written;
             }
         }
         Ok(())
+    }
+
+    /// Everything that may enter `cache_tasks`, assembled the same way from
+    /// both paths: the parsed tasks, plus the ones the scan didn't see but
+    /// that are only pending deletion, with a final uniqueness sweep.
+    ///
+    /// `cache_tasks` keeps its hard `UNIQUE` constraints — they are what made
+    /// this class of bug loud. This is where a row that would violate one is
+    /// dropped and reported instead of aborting: `resolve_duplicates` is
+    /// total over what the scan parsed, but a task carried in from the
+    /// previous cache is not in that domain and can still collide. Losing one
+    /// row from a display cache costs the user one line of output; letting it
+    /// through kills every command in the project, `ls` included.
+    pub(crate) fn assemble_cache<'a>(
+        &self,
+        complete: bool,
+        parsed: std::collections::BTreeMap<String, Task>,
+        observed_uids: &std::collections::BTreeSet<&str>,
+        previously_cached: impl Iterator<Item = &'a TaskSummary>,
+    ) -> Result<Vec<Task>, AppError> {
+        let pending_deletions = self.index.view(&self.project)?.pending_deletions;
+        let mut candidates: Vec<Task> = parsed.into_values().collect();
+        candidates.extend(carry_absent_tasks(
+            &pending_deletions,
+            previously_cached,
+            observed_uids,
+            complete,
+        ));
+
+        let mut uids: std::collections::BTreeSet<TaskUid> = std::collections::BTreeSet::new();
+        let mut keys: std::collections::BTreeSet<TaskKey> = std::collections::BTreeSet::new();
+        let mut out = Vec::with_capacity(candidates.len());
+        for task in candidates {
+            if !uids.insert(task.uid.clone()) {
+                self.warn(format!(
+                    "two tasks share the identity {} — `{}` is hidden from the list until that is \
+                     resolved",
+                    task.uid.as_str(),
+                    task.title
+                ));
+                continue;
+            }
+            if !keys.insert(task.key.clone()) {
+                self.warn(format!(
+                    "two tasks claim key {} — `{}` is hidden from the list until that is resolved",
+                    task.key, task.title
+                ));
+                continue;
+            }
+            out.push(task);
+        }
+        Ok(out)
     }
 
     /// Stamps `uid` and `key` into a file that lacks them. The only case where
@@ -413,6 +600,7 @@ impl App {
         now_ms: i64,
         entries: &mut Vec<IndexEntry>,
         parsed: &mut std::collections::BTreeMap<String, Task>,
+        duplicate_of: Option<&TaskUid>,
     ) -> Result<(), AppError> {
         let cfg = self.backend.load_project()?;
         let next = self.index.high_water(&self.project)? + 1;
@@ -420,9 +608,18 @@ impl App {
         let key = TaskKey::new(cfg.prefix.clone(), next);
         let now = jiff::Timestamp::from_millisecond(now_ms).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
 
-        let task = self
+        let mut task = self
             .backend
             .adopt(path.to_string(), uid.clone(), key, now)?;
+        // `Backend::adopt` stamps uid, key and timestamps and nothing else,
+        // so the breadcrumb needs its own write. Second `put` rather than a
+        // wider `adopt` signature: `adopt` is a foreign-language trait
+        // method (§3) and this is the only caller that has anything to
+        // record.
+        if let Some(source) = duplicate_of {
+            task.possible_duplicate_of = Some(source.clone());
+            self.backend.put(task.clone(), None)?;
+        }
 
         self.index.bump_high_water(&self.project, next)?;
         entries.push(IndexEntry {
@@ -436,22 +633,40 @@ impl App {
     }
 }
 
-/// The §5 collision input: every parsed task carrying this project's prefix.
-/// A task whose `key` did not parse reads as the `?-0` placeholder and is
-/// excluded — those are not competing for a real key, and renumbering them
-/// would invent one under the wrong prefix.
-pub(crate) fn collision_candidates(
-    parsed: &std::collections::BTreeMap<String, Task>,
-    prefix: &str,
-) -> Vec<Candidate> {
+/// The §5 collision input: EVERY parsed task, whatever prefix its key
+/// carries. Filtering to the project's own prefix left two classes the
+/// resolver never saw — a key under a foreign prefix, and the `?-0`
+/// placeholder a key that did not parse reads back as — while `cache_tasks`
+/// still had to store both. Resolution has to be total over the same
+/// `(key_prefix, key_num)` domain the index constrains, or ordinary user data
+/// reaches a constraint nothing was taught to satisfy.
+fn collision_candidates(parsed: &std::collections::BTreeMap<String, Task>) -> Vec<Candidate> {
     parsed
         .iter()
-        .filter(|(_, t)| t.key.prefix == prefix)
         .map(|(path, task)| Candidate {
             task: task.clone(),
             path: path.clone(),
         })
         .collect()
+}
+
+/// One file's key moving out of the way of a duplicate.
+pub(crate) struct KeyChange {
+    path: String,
+    to: TaskKey,
+    /// The file's revision as it is on disk, captured before the new key was
+    /// written into the in-memory task. Both the grace-period comparison and
+    /// `put`'s optimistic check are against the on-disk state, so it has to
+    /// be taken before the rewrite, not after.
+    on_disk: Revision,
+}
+
+#[derive(Default)]
+pub(crate) struct DuplicateResolution {
+    /// Paths that kept the key they came with. Any `pending_renumbers` row
+    /// still held for one of them is obsolete.
+    settled: Vec<String>,
+    changes: Vec<KeyChange>,
 }
 
 /// Task placeholders for every uid the project's index currently has

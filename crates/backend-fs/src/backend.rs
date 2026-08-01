@@ -164,12 +164,25 @@ impl FsBackend {
         }))
     }
 
+    /// Skips a file it cannot read, exactly as `scan` does. Aborting instead
+    /// meant one `chmod 000` note, or one file whose `uid:` is missing or
+    /// malformed, blocked every write in the project — `cadet add` could
+    /// never succeed while such a file existed, because `put` looks the uid
+    /// up through here first.
+    ///
+    /// `Malformed` is unambiguous: a file with no readable uid is certainly
+    /// not the uid being looked for. `Io` is a genuine unknown, and skipping
+    /// it can let `put` create a second file for a uid that was really
+    /// there — but that file could not have been written to either, and the
+    /// alternative is that a single unreadable note locks the user out of
+    /// their own project.
     fn path_for(&self, uid: &TaskUid) -> Result<Option<PathBuf>, BackendError> {
         for p in self.markdown_files()? {
-            if let Some(t) = self.read_task(&p)?
-                && &t.uid == uid
-            {
-                return Ok(Some(p));
+            match self.read_task(&p) {
+                Ok(Some(t)) if &t.uid == uid => return Ok(Some(p)),
+                Ok(_) => {}
+                Err(BackendError::Malformed { .. }) | Err(BackendError::Io(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(None)
@@ -277,6 +290,12 @@ impl Backend for FsBackend {
             (
                 "renumbered_from".to_string(),
                 task.renumbered_from.as_ref().map(TaskKey::to_string),
+            ),
+            (
+                "possible_duplicate_of".to_string(),
+                task.possible_duplicate_of
+                    .as_ref()
+                    .map(|u| u.as_str().to_string()),
             ),
         ];
         // A *declared* custom-field key that is on disk but absent from
