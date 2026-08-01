@@ -1,4 +1,5 @@
 mod config;
+mod prompt;
 
 use cadet_app::{App, GitNet, RejectReason};
 use cadet_backend_fs::FsBackend;
