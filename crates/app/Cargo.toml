@@ -5,7 +5,7 @@ version.workspace = true
 
 [dependencies]
 cadet-core = { path = "../core" }
-cadet-backend-fs = { path = "../backend-fs" }
+cadet-backend-markdown = { path = "../backend-markdown" }
 cadet-store-sqlite = { path = "../store-sqlite" }
 jiff.workspace = true
 thiserror.workspace = true

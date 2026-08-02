@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 cadet-core = { path = "../core" }
 cadet-app = { path = "../app" }
-cadet-backend-fs = { path = "../backend-fs" }
+cadet-backend-markdown = { path = "../backend-markdown" }
 cadet-store-sqlite = { path = "../store-sqlite" }
 clap.workspace = true
 miette.workspace = true

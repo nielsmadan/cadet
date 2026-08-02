@@ -1,5 +1,5 @@
 use cadet_app::*;
-use cadet_backend_fs::FsBackend;
+use cadet_backend_markdown::MarkdownBackend;
 use cadet_store_sqlite::SqliteIndex;
 
 const CFG: &str = r#"
@@ -33,7 +33,7 @@ impl Fixture {
     /// alone" path (spec §1).
     fn with_a_deleted_index(&self) -> App {
         App::new(
-            Box::new(FsBackend::new(self.vault_path.clone())),
+            Box::new(MarkdownBackend::new(self.vault_path.clone())),
             SqliteIndex::open_in_memory().unwrap(),
             GitNet::new(self.repo_dir.clone(), self.vault_path.clone()),
             "p".into(),
@@ -45,7 +45,7 @@ fn fixture() -> Fixture {
     let vault = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(vault.path().join("project.toml"), CFG).unwrap();
-    let backend = FsBackend::new(vault.path().to_path_buf());
+    let backend = MarkdownBackend::new(vault.path().to_path_buf());
     let index = SqliteIndex::open_in_memory().unwrap();
     let repo_dir = repo.path().join("r.git");
     let git = GitNet::new(repo_dir.clone(), vault.path().to_path_buf());
@@ -809,13 +809,13 @@ fn a_path_reused_after_a_copy_does_not_inherit_instant_adoption() {
 }
 
 /// A backend that reports every scan as incomplete, wrapping a real
-/// `FsBackend` so every other operation behaves normally. That is what a
+/// `MarkdownBackend` so every other operation behaves normally. That is what a
 /// single unreadable file or an unmaterialised cloud placeholder does to a
 /// scan — and an incomplete snapshot is never evidence of absence (§5 guard
 /// 1). `reconcile` honours that; `refresh_cache` runs on every write and
 /// must not quietly reach the opposite conclusion.
 struct IncompleteBackend {
-    inner: FsBackend,
+    inner: MarkdownBackend,
     incomplete: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Makes `scan` fail outright rather than return a partial view — a
     /// broken `project.toml`, a vanished vault root. Everything a write
@@ -905,7 +905,7 @@ fn an_incomplete_scan_does_not_drop_a_task_from_the_cache_on_a_write() {
     let incomplete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app = App::new(
         Box::new(IncompleteBackend {
-            inner: FsBackend::new(f.vault_path.clone()),
+            inner: MarkdownBackend::new(f.vault_path.clone()),
             incomplete: std::sync::Arc::clone(&incomplete),
             fail_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
@@ -956,7 +956,7 @@ fn a_failed_commit_does_not_fail_the_write() {
     let vault = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(vault.path().join("project.toml"), CFG).unwrap();
-    let backend = FsBackend::new(vault.path().to_path_buf());
+    let backend = MarkdownBackend::new(vault.path().to_path_buf());
     let index = SqliteIndex::open_in_memory().unwrap();
     // Deliberately never initialised: every `git.commit` call fails with no
     // repository to write to, independent of the backend and the index.
@@ -1222,7 +1222,7 @@ fn a_failed_cache_refresh_warns_instead_of_failing_a_durable_write() {
     let fail_scan = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app = App::new(
         Box::new(IncompleteBackend {
-            inner: FsBackend::new(f.vault_path.clone()),
+            inner: MarkdownBackend::new(f.vault_path.clone()),
             incomplete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_scan: std::sync::Arc::clone(&fail_scan),
         }),

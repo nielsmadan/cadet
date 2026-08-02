@@ -170,7 +170,7 @@ impl Registry {
     /// two `[projects.<id>]` tables.
     ///
     /// Writes to a process-unique temp file next to the target and renames
-    /// it into place — the same pattern `backend-fs` uses for its
+    /// it into place — the same pattern `backend-markdown` uses for its
     /// (disposable) task files — rather than truncating `config.toml`
     /// directly: a crash mid-write must never leave this file half-written
     /// and unparseable, which would lock the user out of every project at

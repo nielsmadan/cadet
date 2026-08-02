@@ -154,7 +154,7 @@ impl App {
             tasks: mut parsed,
         } = self.backend.scan(None)?
         else {
-            // `backend-fs` never produces a Delta; a Delta here is a programming error.
+            // `backend-markdown` never produces a Delta; a Delta here is a programming error.
             return Ok(ReconcileReport::default());
         };
         // Spec §5: the high-water mark is the maximum over the keys LIVE IN

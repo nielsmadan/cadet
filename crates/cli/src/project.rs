@@ -89,7 +89,7 @@ const MANY_NOTES: usize = 50;
 /// exceeded — the folder this guard exists to catch is `$HOME`, and a full
 /// walk of it is not something to do before printing a warning.
 ///
-/// Mirrors `FsBackend::markdown_files` exactly, dot-entry skip included: a
+/// Mirrors `MarkdownBackend::markdown_files` exactly, dot-entry skip included: a
 /// count that disagreed with what adoption actually sees would be worse
 /// than no count at all.
 fn count_markdown(root: &std::path::Path, limit: usize) -> usize {

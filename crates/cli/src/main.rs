@@ -3,7 +3,7 @@ mod project;
 mod prompt;
 
 use cadet_app::{App, GitNet, RejectReason, TaskChanges, TaskDraft};
-use cadet_backend_fs::FsBackend;
+use cadet_backend_markdown::MarkdownBackend;
 use cadet_core::{Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like};
 use cadet_store_sqlite::SqliteIndex;
 use clap::{Parser, Subcommand};
@@ -145,7 +145,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Error>> {
-    let backend = FsBackend::new(p.path.clone());
+    let backend = MarkdownBackend::new(p.path.clone());
     let index = SqliteIndex::open(&reg.index_path())?;
     let git = GitNet::new(reg.repo_dir(&p.id), p.path.clone());
     git.ensure_init()?;

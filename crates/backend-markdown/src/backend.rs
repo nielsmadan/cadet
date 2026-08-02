@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub struct FsBackend {
+pub struct MarkdownBackend {
     root: PathBuf,
     config: OnceLock<ProjectConfig>,
 }
@@ -56,7 +56,7 @@ fn coerce_field(ty: &FieldType, raw: &str) -> FieldValue {
     }
 }
 
-impl FsBackend {
+impl MarkdownBackend {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
@@ -197,7 +197,7 @@ impl FsBackend {
     }
 }
 
-impl Backend for FsBackend {
+impl Backend for MarkdownBackend {
     fn load_project(&self) -> Result<ProjectConfig, BackendError> {
         let src = std::fs::read_to_string(self.root.join("project.toml")).map_err(Self::io)?;
         ProjectConfig::parse(&src).map_err(|e| BackendError::Malformed {

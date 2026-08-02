@@ -1,5 +1,5 @@
 use cadet_app::*;
-use cadet_backend_fs::FsBackend;
+use cadet_backend_markdown::MarkdownBackend;
 use cadet_store_sqlite::SqliteIndex;
 use proptest::prelude::*;
 
@@ -54,7 +54,7 @@ proptest! {
         let git = || GitNet::new(repo.path().join("r.git"), vault.path().to_path_buf());
         git().ensure_init().unwrap();
         let open = |index: SqliteIndex| App::new(
-            Box::new(FsBackend::new(vault.path().to_path_buf())),
+            Box::new(MarkdownBackend::new(vault.path().to_path_buf())),
             index,
             git(),
             "p".into(),

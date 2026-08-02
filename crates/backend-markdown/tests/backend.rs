@@ -1,4 +1,4 @@
-use cadet_backend_fs::FsBackend;
+use cadet_backend_markdown::MarkdownBackend;
 use cadet_core::conformance::*;
 use cadet_core::*;
 use std::collections::BTreeMap;
@@ -23,10 +23,10 @@ name = "labels"
 type = "list<string>"
 "#;
 
-fn setup() -> (tempfile::TempDir, FsBackend) {
+fn setup() -> (tempfile::TempDir, MarkdownBackend) {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("project.toml"), CFG).unwrap();
-    let b = FsBackend::new(d.path().to_path_buf());
+    let b = MarkdownBackend::new(d.path().to_path_buf());
     (d, b)
 }
 

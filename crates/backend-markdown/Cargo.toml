@@ -1,5 +1,5 @@
 [package]
-name = "cadet-backend-fs"
+name = "cadet-backend-markdown"
 edition.workspace = true
 version.workspace = true
 

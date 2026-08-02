@@ -315,9 +315,9 @@ mod tests {
         let f = tree.path().join("a.md");
         std::fs::write(&f, "one\n").unwrap();
         let p = f.display().to_string();
-        g.commit("first", &[p.clone()]).unwrap();
-        g.commit("nothing", &[p.clone()]).unwrap();
-        g.commit("still nothing", &[p]).unwrap();
+        g.commit("first", std::slice::from_ref(&p)).unwrap();
+        g.commit("nothing", std::slice::from_ref(&p)).unwrap();
+        g.commit("still nothing", std::slice::from_ref(&p)).unwrap();
     }
 
     #[test]

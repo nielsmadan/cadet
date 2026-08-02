@@ -1603,7 +1603,7 @@ fn re_adding_an_existing_project_is_not_blocked_by_its_own_notes() {
     .success();
 }
 
-/// The dot-entry skip has to match `FsBackend::markdown_files`, or the guard
+/// The dot-entry skip has to match `MarkdownBackend::markdown_files`, or the guard
 /// counts files adoption will never look at.
 #[test]
 fn the_many_notes_guard_ignores_dot_directories() {
