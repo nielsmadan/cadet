@@ -1242,3 +1242,101 @@ fn ls_stays_compact_when_no_task_has_a_priority() {
     let out = stdout_of(h.cadet(&["ls"]));
     assert_eq!(out, "T-1        todo     plain\n", "{out:?}");
 }
+
+/// `--force` re-registers a project; it must not silently redefine what a
+/// task *is*. Wiping `[[fields]]` strands every value already written under
+/// a declaration that no longer exists, and wiping `[workflow]` strands
+/// every task in a state that no longer exists.
+#[test]
+fn force_overwrite_preserves_declared_fields_and_workflow() {
+    let h = project_harness_with_field("estimate", "int");
+    h.cadet(&["add", "sized", "--set", "estimate=5"])
+        .assert()
+        .success();
+    let path = h.vault.path().join("project.toml");
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml = toml.replace(
+        r#"states = ["todo", "doing", "blocked", "done"]"#,
+        r#"states = ["todo", "review", "done"]"#,
+    );
+    std::fs::write(&path, &toml).unwrap();
+    assert!(
+        toml.contains("review"),
+        "harness must customise the workflow"
+    );
+
+    h.cadet(&[
+        "project",
+        "add",
+        "proj",
+        "--path",
+        h.vault.path().to_str().unwrap(),
+        "--force",
+    ])
+    .assert()
+    .success();
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("estimate"),
+        "declarations must survive: {after}"
+    );
+    assert!(
+        after.contains("review"),
+        "the workflow must survive: {after}"
+    );
+
+    // The symptom, not just the file: an already-written value stays
+    // reachable, and a task can still be moved into a customised state.
+    h.cadet(&["set", "T-1", "estimate=9"]).assert().success();
+    h.cadet(&["mv", "T-1", "review"]).assert().success();
+}
+
+/// The three keys `project add` owns are still rewritten — preservation must
+/// not turn into "ignores what you asked for".
+#[test]
+fn force_overwrite_still_rewrites_id_name_and_prefix() {
+    let h = project_harness_with_field("estimate", "int");
+    h.cadet(&[
+        "project",
+        "add",
+        "proj",
+        "--path",
+        h.vault.path().to_str().unwrap(),
+        "--prefix",
+        "ZZ",
+        "--name",
+        "Renamed",
+        "--force",
+    ])
+    .assert()
+    .success();
+    let after = std::fs::read_to_string(h.vault.path().join("project.toml")).unwrap();
+    assert!(after.contains(r#"prefix = "ZZ""#), "{after}");
+    assert!(after.contains(r#"name = "Renamed""#), "{after}");
+    assert!(after.contains("estimate"), "{after}");
+}
+
+/// A `project.toml` too broken to parse is the one case where there is
+/// nothing to preserve — `--force` falls back to a fresh template rather
+/// than refusing to proceed.
+#[test]
+fn force_overwrite_replaces_an_unparseable_project_toml() {
+    let h = project_harness();
+    let path = h.vault.path().join("project.toml");
+    std::fs::write(&path, "this is not [ toml").unwrap();
+    h.cadet(&[
+        "project",
+        "add",
+        "proj",
+        "--path",
+        h.vault.path().to_str().unwrap(),
+        "--prefix",
+        "T",
+        "--force",
+    ])
+    .assert()
+    .success();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("[workflow]"), "{after}");
+}

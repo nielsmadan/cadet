@@ -78,6 +78,34 @@ pub fn resolve_path(raw: &str) -> Result<PathBuf, String> {
     std::path::absolute(&expanded).map_err(|e| format!("could not resolve `{raw}`: {e}"))
 }
 
+/// The `project.toml` body to write for `id`/`name`/`prefix`.
+///
+/// When `existing` is a usable config, its *parsed document* is mutated and
+/// only those three keys are rewritten — `[[fields]]`, a customised
+/// `[workflow]`, `[tasks]` include/exclude, comments and unknown keys all
+/// survive. Re-emitting `TEMPLATE` instead silently redefines what a task
+/// is: every value written under a dropped declaration becomes unreachable,
+/// and every task sitting in a dropped state becomes unmovable.
+///
+/// This is deliberately the same treatment `Registry::save` gives the
+/// registry — parse, mutate, write — because it is the same bug shape, and
+/// this codebase keeps growing new instances of it.
+///
+/// `None` (no file, or one too broken to be a config) falls back to the
+/// template, since there is then nothing to preserve.
+pub fn render_project_toml(existing: Option<&str>, id: &str, name: &str, prefix: &str) -> String {
+    let mut doc: toml_edit::DocumentMut = existing
+        .and_then(|src| src.parse().ok())
+        .unwrap_or_else(|| TEMPLATE.parse().expect("TEMPLATE must be valid TOML"));
+    if !doc.get("project").is_some_and(|p| p.is_table()) {
+        doc["project"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["project"]["id"] = toml_edit::value(id);
+    doc["project"]["name"] = toml_edit::value(name);
+    doc["project"]["prefix"] = toml_edit::value(prefix);
+    doc.to_string()
+}
+
 pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
     match cmd {
         ProjectCmd::Ls => list(&reg),
@@ -200,19 +228,23 @@ fn add(
     // into "silently re-derive", which splits one project's tasks across two
     // key namespaces (`ALFA-*` and `ALPH-*`) that `doctor` has no way to see
     // are the same project.
-    let existing = if project_toml.exists() {
+    let existing_src = if project_toml.exists() {
         if !force {
             return Err(format!(
                 "{} already exists — pass --force to overwrite it",
                 project_toml.display()
             ));
         }
-        std::fs::read_to_string(&project_toml)
-            .ok()
-            .and_then(|body| ProjectConfig::parse(&body).ok())
+        std::fs::read_to_string(&project_toml).ok()
     } else {
         None
     };
+    // Only a file that is a *usable* config is worth preserving: one that
+    // does not parse cannot be repaired key by key, and `--force` on it is
+    // a request to start over.
+    let existing = existing_src
+        .as_deref()
+        .and_then(|body| ProjectConfig::parse(body).ok());
     let default_prefix = existing
         .as_ref()
         .map(|c| c.prefix.clone())
@@ -247,16 +279,17 @@ fn add(
         return Err(format!("id `{id}` yields no usable prefix — pass --prefix"));
     }
 
-    // Moved (mostly) verbatim from the old `Init` handler: creates the
-    // directory, writes TEMPLATE with id/name/prefix substituted, and
-    // validates the result by parsing it (the check that catches a
-    // whitespace-only prefix typed explicitly, since the empty-derived case
-    // is now caught above).
+    // Creates the directory, renders the body (preserving an existing
+    // config's declarations — see `render_project_toml`), and validates the
+    // result by parsing it (the check that catches a whitespace-only prefix
+    // typed explicitly, since the empty-derived case is caught above).
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let body = TEMPLATE
-        .replace("{id}", &id)
-        .replace("{name}", &name)
-        .replace("{prefix}", &prefix);
+    let body = render_project_toml(
+        existing_src.as_deref().filter(|_| existing.is_some()),
+        &id,
+        &name,
+        &prefix,
+    );
     ProjectConfig::parse(&body)
         .map_err(|e| format!("generated project.toml would not parse: {e}"))?;
     std::fs::write(&project_toml, body).map_err(|e| e.to_string())?;
@@ -331,6 +364,62 @@ mod tests {
             expand_tilde("relative/x").unwrap(),
             PathBuf::from("relative/x")
         );
+    }
+
+    const CUSTOMISED: &str = r#"# hand-written
+[project]
+id = "old"
+name = "Old"
+prefix = "OLD"
+
+[tasks]
+match = "frontmatter"
+exclude = ["archive/**"]
+
+[workflow]
+states = ["todo", "review", "done"]
+initial = "todo"
+terminal = ["done"]
+
+[[fields]]
+name = "estimate"
+type = "int"
+"#;
+
+    #[test]
+    fn render_rewrites_only_id_name_and_prefix() {
+        let got = render_project_toml(Some(CUSTOMISED), "new", "New", "NEW");
+        assert!(got.contains(r#"id = "new""#), "{got}");
+        assert!(got.contains(r#"name = "New""#), "{got}");
+        assert!(got.contains(r#"prefix = "NEW""#), "{got}");
+        assert!(got.contains("estimate"), "{got}");
+        assert!(got.contains("review"), "{got}");
+        assert!(got.contains("archive/**"), "{got}");
+        assert!(got.contains("# hand-written"), "{got}");
+    }
+
+    #[test]
+    fn render_without_an_existing_config_uses_the_template() {
+        let got = render_project_toml(None, "fresh", "Fresh", "FR");
+        let cfg = ProjectConfig::parse(&got).unwrap();
+        assert_eq!(cfg.id, "fresh");
+        assert_eq!(cfg.prefix, "FR");
+        assert!(cfg.fields.is_empty());
+        assert!(
+            !got.contains("{id}"),
+            "placeholders must be replaced: {got}"
+        );
+    }
+
+    #[test]
+    fn render_supplies_a_project_table_when_the_existing_one_has_none() {
+        let got = render_project_toml(Some("[workflow]\nstates = [\"a\"]\n"), "x", "X", "XX");
+        assert!(got.contains(r#"prefix = "XX""#), "{got}");
+    }
+
+    #[test]
+    fn the_template_is_valid_toml() {
+        assert!(TEMPLATE.parse::<toml_edit::DocumentMut>().is_ok());
     }
 
     #[test]
