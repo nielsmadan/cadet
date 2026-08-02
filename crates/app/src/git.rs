@@ -130,9 +130,65 @@ impl GitNet {
         Ok(())
     }
 
-    pub fn commit(&self, message: &str) -> Result<(), GitError> {
-        self.run(&["add", "--all"])?;
-        if self.run(&["status", "--porcelain"])?.trim().is_empty() {
+    /// Stages only `paths` — never `add --all`. The work tree is the user's
+    /// vault, which holds their own notes as well as cadet's task files; a
+    /// blanket add sweeps in whatever they edited between two cadet commands,
+    /// and `undo` then reverts their work along with cadet's. Cadet knows
+    /// exactly which file it wrote, so it says so.
+    pub fn commit(&self, message: &str, paths: &[String]) -> Result<(), GitError> {
+        // `git add -- <path>` is a hard error when the pathspec matches
+        // nothing and git does not already track it, so a path that was never
+        // committed — because an earlier commit failed and was only warned
+        // about — would turn every later write into a warning too. Keep the
+        // paths git can actually act on: present on disk (an add or an edit),
+        // or absent but tracked (a deletion to stage).
+        let stageable: Vec<&str> = paths
+            .iter()
+            .filter(|p| std::path::Path::new(p).exists() || self.is_tracked(p))
+            .map(String::as_str)
+            .collect();
+        if stageable.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["add", "--"];
+        args.extend(stageable.iter().copied());
+        self.run(&args)?;
+        // Scoped to the same paths: an unrelated dirty file elsewhere in the
+        // work tree must not make this look like there is something to commit.
+        let mut status = vec!["status", "--porcelain", "--"];
+        status.extend(stageable.iter().copied());
+        if self.run(&status)?.trim().is_empty() {
+            return Ok(());
+        }
+        self.run(&[
+            "-c",
+            "user.name=cadet",
+            "-c",
+            "user.email=cadet@localhost",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ])?;
+        Ok(())
+    }
+
+    fn is_tracked(&self, path: &str) -> bool {
+        self.run(&["ls-files", "--error-unmatch", "--", path])
+            .is_ok()
+    }
+
+    /// Commits pending edits to files the repository already tracks, and only
+    /// those: `--update` never picks up an untracked file, so a note the user
+    /// has written but cadet has never touched stays out of the safety net.
+    /// Used by `undo` to preserve uncommitted work before it resets.
+    fn commit_tracked(&self, message: &str) -> Result<(), GitError> {
+        self.run(&["add", "--update"])?;
+        if self
+            .run(&["status", "--porcelain", "--untracked-files=no"])?
+            .trim()
+            .is_empty()
+        {
             return Ok(());
         }
         self.run(&[
@@ -173,7 +229,7 @@ impl GitNet {
         // Preserve any uncommitted work so `undo` can never be the thing
         // that loses it.
         if !self.run(&["status", "--porcelain"])?.trim().is_empty() {
-            self.commit("snapshot before undo")?;
+            self.commit_tracked("snapshot before undo")?;
         }
 
         self.run(&["reset", "--hard", &target])?;
@@ -229,10 +285,12 @@ mod tests {
         let f = tree.path().join("a.md");
 
         std::fs::write(&f, "one\n").unwrap();
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
 
         std::fs::write(&f, "two\n").unwrap();
-        g.commit("second").unwrap();
+        g.commit("second", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "two\n");
 
         g.undo().unwrap();
@@ -244,18 +302,22 @@ mod tests {
         let (_repo, tree, g) = setup();
         let f = tree.path().join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        g.commit("add").unwrap();
+        g.commit("add", &[f.display().to_string()]).unwrap();
         std::fs::remove_file(&f).unwrap();
-        g.commit("delete").unwrap();
+        g.commit("delete", &[f.display().to_string()]).unwrap();
         g.undo().unwrap();
         assert!(f.exists(), "undo must bring back a deleted task");
     }
 
     #[test]
     fn committing_with_no_changes_is_not_an_error() {
-        let (_repo, _tree, g) = setup();
-        g.commit("nothing").unwrap();
-        g.commit("still nothing").unwrap();
+        let (_repo, tree, g) = setup();
+        let f = tree.path().join("a.md");
+        std::fs::write(&f, "one\n").unwrap();
+        let p = f.display().to_string();
+        g.commit("first", &[p.clone()]).unwrap();
+        g.commit("nothing", &[p.clone()]).unwrap();
+        g.commit("still nothing", &[p]).unwrap();
     }
 
     #[test]
@@ -264,10 +326,12 @@ mod tests {
         let f = tree.path().join("a.md");
 
         std::fs::write(&f, "one\n").unwrap();
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
 
         std::fs::write(&f, "two\n").unwrap();
-        g.commit("second").unwrap();
+        g.commit("second", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
 
         // A hand-edit made in the vault after the last commit, never
         // explicitly committed.
@@ -294,7 +358,8 @@ mod tests {
     fn undo_on_a_repository_with_one_commit_is_nothing_to_undo() {
         let (_repo, tree, g) = setup();
         std::fs::write(tree.path().join("a.md"), "one\n").unwrap();
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
         assert!(matches!(g.undo(), Err(GitError::NothingToUndo)));
     }
 
@@ -319,7 +384,8 @@ mod tests {
         g.ensure_init().unwrap();
         g.ensure_init().unwrap();
         std::fs::write(tree.path().join("a.md"), "one\n").unwrap();
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
     }
 
     #[test]
@@ -329,7 +395,8 @@ mod tests {
         std::fs::write(tree.path().join(".obsidian").join("workspace.json"), "{}\n").unwrap();
         std::fs::write(tree.path().join("a.md"), "task\n").unwrap();
 
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
 
         let tracked = raw_git(
             repo.path(),
@@ -350,9 +417,11 @@ mod tests {
 
         let (repo, tree, g) = setup();
         std::fs::write(tree.path().join("a.md"), "one\n").unwrap();
-        g.commit("first").unwrap();
+        g.commit("first", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
         std::fs::write(tree.path().join("a.md"), "two\n").unwrap();
-        g.commit("second").unwrap();
+        g.commit("second", &[tree.path().join("a.md").display().to_string()])
+            .unwrap();
 
         let refs_heads = repo.path().join("refs").join("heads");
         let original_mode = std::fs::metadata(&refs_heads).unwrap().permissions();

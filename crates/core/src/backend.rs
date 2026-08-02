@@ -57,4 +57,16 @@ pub trait Backend {
     ) -> Result<Task, BackendError>;
 
     fn scan(&self, since: Option<Cursor>) -> Result<ChangeSet, BackendError>;
+
+    /// Where this backend stores `uid`, if it stores tasks as files.
+    ///
+    /// Exists solely so the local git safety net can stage exactly the files
+    /// cadet wrote. Without it the net runs `add --all` over the whole work
+    /// tree, sweeping in every unrelated note the user happens to have edited
+    /// — and `undo` then reverts those too. Path-shaped, like `adopt`, and
+    /// like `adopt` it is meaningless to a backend with no filesystem: the
+    /// default returns `None`, and such a backend gets no safety net at all.
+    fn location_of(&self, _uid: TaskUid) -> Result<Option<String>, BackendError> {
+        Ok(None)
+    }
 }

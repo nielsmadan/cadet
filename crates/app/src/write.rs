@@ -115,14 +115,27 @@ impl App {
     /// truth. A commit failure here (a broken repo, a permissions glitch)
     /// must not make an already-successful write look like it failed: that
     /// would make a caller (or a user hitting Ctrl-C and retrying) create a
-    /// duplicate or try to delete something already gone. `GitNet::commit`
-    /// runs `git add --all`, so the next successful commit sweeps up the
-    /// orphaned change on its own — nothing is lost, only left uncommitted.
-    fn commit_or_warn(&self, message: &str) {
-        if let Err(e) = self.git.commit(message) {
+    /// duplicate or try to delete something already gone. The change stays on
+    /// disk either way; only the safety-net record of it is missing.
+    ///
+    /// `paths` names exactly the files cadet wrote. A backend with no
+    /// filesystem reports none, and then there is nothing to commit.
+    fn commit_or_warn(&self, message: &str, paths: &[String]) {
+        if let Err(e) = self.git.commit(message, paths) {
             self.warn(format!(
                 "change saved, but the safety net could not record it: {e}"
             ));
+        }
+    }
+
+    /// The file the backend stores this task in, as a one-element pathspec for
+    /// the safety net. Empty when the backend is not filesystem backed, or
+    /// when the location can no longer be resolved — a safety-net gap is
+    /// never worth failing a write that already succeeded.
+    fn location(&self, uid: &TaskUid) -> Vec<String> {
+        match self.backend.location_of(uid.clone()) {
+            Ok(Some(p)) => vec![p],
+            _ => vec![],
         }
     }
 
@@ -161,7 +174,8 @@ impl App {
         self.backend.put(task.clone(), None)?;
         self.index.bump_high_water(&self.project, next)?;
         self.refresh_cache_or_warn();
-        self.commit_or_warn(&format!("add {}: {}", task.key, task.title));
+        let paths = self.location(&task.uid);
+        self.commit_or_warn(&format!("add {}: {}", task.key, task.title), &paths);
         Ok(task)
     }
 
@@ -269,13 +283,17 @@ impl App {
         } else {
             format!("update {}", task.key)
         };
-        self.commit_or_warn(&message);
+        let paths = self.location(&task.uid);
+        self.commit_or_warn(&message, &paths);
         Ok(task)
     }
 
     pub fn delete(&self, key: &TaskKey) -> Result<(), AppError> {
         let task = self.get_by_key(key)?;
         let expected = revision(&task);
+        // Resolved before the delete: afterwards there is no file to locate,
+        // and the safety net would never record the removal.
+        let paths = self.location(&task.uid);
         self.backend.delete(task.uid.clone(), Some(expected))?;
         // An explicit `cadet rm` is certain, not inferred — the file's
         // absence is never going to be resolved by a sync tool catching up.
@@ -287,7 +305,7 @@ impl App {
         // pending when the user already confirmed it.
         self.index.forget(&self.project, &task.uid)?;
         self.refresh_cache_or_warn();
-        self.commit_or_warn(&format!("remove {key}"));
+        self.commit_or_warn(&format!("remove {key}"), &paths);
         Ok(())
     }
 

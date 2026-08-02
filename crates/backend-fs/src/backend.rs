@@ -379,6 +379,12 @@ impl Backend for FsBackend {
         self.read_task(&full)?.ok_or(BackendError::NotFound)
     }
 
+    fn location_of(&self, uid: TaskUid) -> Result<Option<String>, BackendError> {
+        Ok(self
+            .path_for(&uid)?
+            .map(|p| p.to_string_lossy().into_owned()))
+    }
+
     fn scan(&self, _since: Option<Cursor>) -> Result<ChangeSet, BackendError> {
         // A broken or unreadable `project.toml` is a genuine failure and
         // must error out — unlike an individual task file below, there is

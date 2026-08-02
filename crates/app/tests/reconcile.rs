@@ -1674,3 +1674,26 @@ fn commit_count(repo_dir: &std::path::Path, work_tree: &std::path::Path) -> Stri
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+
+#[test]
+fn the_safety_net_never_touches_a_file_cadet_did_not_write() {
+    let f = fixture();
+    let note = f.vault_path.join("my-own-note.md");
+    std::fs::write(&note, "notes I care about\n").unwrap();
+
+    // A cadet write happens while that note exists.
+    f.app.add("first task").unwrap();
+
+    // The user edits their own note, then runs another cadet command.
+    std::fs::write(&note, "notes I care about, now edited\n").unwrap();
+    f.app.add("second task").unwrap();
+
+    // Undo must revert cadet's own write and nothing else.
+    f.app.undo().unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap(),
+        "notes I care about, now edited\n",
+        "undo reverted a file cadet never wrote"
+    );
+}
