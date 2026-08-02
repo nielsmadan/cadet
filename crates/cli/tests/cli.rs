@@ -646,12 +646,18 @@ fn project_harness() -> ProjectHarness {
 }
 
 fn project_harness_with_field(name: &str, ty: &str) -> ProjectHarness {
+    project_harness_with_fields(&[(name, ty)])
+}
+
+fn project_harness_with_fields(defs: &[(&str, &str)]) -> ProjectHarness {
     let h = project_harness();
     let path = h.vault.path().join("project.toml");
     let mut toml = std::fs::read_to_string(&path).unwrap();
-    toml.push_str(&format!(
-        "\n[[fields]]\nname = \"{name}\"\ntype = \"{ty}\"\n"
-    ));
+    for (name, ty) in defs {
+        toml.push_str(&format!(
+            "\n[[fields]]\nname = \"{name}\"\ntype = \"{ty}\"\n"
+        ));
+    }
     std::fs::write(&path, toml).unwrap();
     h
 }
@@ -1095,4 +1101,144 @@ fn a_relative_path_is_stored_absolute_and_works_from_a_different_cwd() {
         .assert()
         .success()
         .stdout(predicates::str::contains("REL-1"));
+}
+
+fn stdout_of(cmd: Command) -> String {
+    let mut cmd = cmd;
+    let out = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8(out).unwrap()
+}
+
+/// The line `show` prints for `label`, panicking with the whole output when
+/// there is none — a plain `contains("nm")` would pass on a task whose title
+/// happened to contain the value, which is exactly the confusion this
+/// finding is about.
+fn labelled_line(out: &str, label: &str) -> String {
+    out.lines()
+        .find(|l| l.starts_with(&format!("{label}:")))
+        .unwrap_or_else(|| panic!("no `{label}:` line in show output:\n{out}"))
+        .to_string()
+}
+
+fn value_of(out: &str, label: &str) -> String {
+    labelled_line(out, label)
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn show_displays_a_custom_fields_value() {
+    let h = project_harness_with_field("owner", "str");
+    h.cadet(&["add", "owned", "--set", "owner=nm"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "owner"), "nm", "{out}");
+}
+
+#[test]
+fn show_displays_every_scalar_field_type_readably() {
+    let h = project_harness_with_fields(&[
+        ("estimate", "int"),
+        ("ratio", "float"),
+        ("shipped", "bool"),
+        ("start", "date"),
+    ]);
+    h.cadet(&[
+        "add",
+        "everything",
+        "--set",
+        "estimate=5",
+        "--set",
+        "ratio=1.5",
+        "--set",
+        "shipped=true",
+        "--set",
+        "start=2026-09-01",
+    ])
+    .assert()
+    .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "estimate"), "5", "{out}");
+    assert_eq!(value_of(&out, "ratio"), "1.5", "{out}");
+    assert_eq!(value_of(&out, "shipped"), "true", "{out}");
+    assert_eq!(value_of(&out, "start"), "2026-09-01", "{out}");
+}
+
+/// A `list<string>` must read like the `tags` line, not like `List(["ann",
+/// "bob"])` — the finding calls out Rust debug output by name.
+#[test]
+fn show_renders_a_list_field_like_the_tags_line() {
+    let h = project_harness_with_field("people", "list<string>");
+    h.cadet(&["add", "shared", "--set", "people=ann,bob"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "people"), "ann, bob", "{out}");
+    assert!(!out.contains("List("), "no debug formatting: {out}");
+    assert!(!out.contains('['), "no debug formatting: {out}");
+}
+
+#[test]
+fn show_displays_a_non_normal_priority() {
+    let h = project_harness();
+    h.cadet(&["add", "urgent", "--priority", "high"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "priority"), "high", "{out}");
+}
+
+/// `normal` is every task's default, so printing it would put a line on
+/// every task that carries no information.
+#[test]
+fn show_omits_a_normal_priority() {
+    let h = project_harness();
+    h.cadet(&["add", "ordinary"]).assert().success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(!out.contains("priority"), "{out}");
+}
+
+#[test]
+fn show_survives_a_field_cleared_back_to_nothing() {
+    let h = project_harness_with_field("owner", "str");
+    h.cadet(&["add", "owned", "--set", "owner=nm"])
+        .assert()
+        .success();
+    h.cadet(&["set", "T-1", "owner="]).assert().success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(!out.contains("owner"), "{out}");
+}
+
+#[test]
+fn ls_shows_a_non_normal_priority() {
+    let h = project_harness();
+    h.cadet(&["add", "urgent", "--priority", "high"])
+        .assert()
+        .success();
+    h.cadet(&["add", "ordinary"]).assert().success();
+    let out = stdout_of(h.cadet(&["ls"]));
+    let urgent = out
+        .lines()
+        .find(|l| l.contains("urgent"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(urgent.contains("high"), "{out}");
+    let ordinary = out
+        .lines()
+        .find(|l| l.contains("ordinary"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(!ordinary.contains("normal"), "{out}");
+}
+
+/// The priority column costs a task list nothing when no task has one — the
+/// row stays exactly as it was before the column existed.
+#[test]
+fn ls_stays_compact_when_no_task_has_a_priority() {
+    let h = project_harness();
+    h.cadet(&["add", "plain"]).assert().success();
+    let out = stdout_of(h.cadet(&["ls"]));
+    assert_eq!(out, "T-1        todo     plain\n", "{out:?}");
 }

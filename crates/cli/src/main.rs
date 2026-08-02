@@ -212,6 +212,42 @@ fn parse_priority(s: &str) -> Result<Priority, String> {
     }
 }
 
+/// Kept next to `parse_priority`: they are the two halves of one spelling,
+/// and this codebase's signature defect is a symmetric pair drifting apart.
+fn priority_label(p: Priority) -> &'static str {
+    match p {
+        Priority::High => "high",
+        Priority::Normal => "normal",
+        Priority::Low => "low",
+    }
+}
+
+/// A value the user typed, read back the way they typed it. `List` reads
+/// like the `tags` line rather than as `List(["a", "b"])` — `show` is the
+/// only way to see a custom field at all, so debug formatting there is not
+/// a cosmetic problem.
+fn render_field_value(v: &cadet_core::FieldValue) -> String {
+    use cadet_core::FieldValue as V;
+    match v {
+        V::Str(s) | V::Date(s) => s.clone(),
+        V::Int(i) => i.to_string(),
+        V::Float(f) => f.to_string(),
+        V::Bool(b) => b.to_string(),
+        V::List(items) => items.join(", "),
+    }
+}
+
+/// `label: value` lines, every value aligned to one column past the longest
+/// label. With only `state`/`due`/`tags` present this reproduces the fixed
+/// two-space layout those lines have always had, so a task carrying no
+/// priority and no custom fields prints exactly what it printed before.
+fn print_labelled(rows: &[(String, String)]) {
+    let width = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 2;
+    for (label, value) in rows {
+        println!("{:<width$}{value}", format!("{label}:"));
+    }
+}
+
 /// Shared by `apply_assignment`'s undeclared-field branch and `ls --field`,
 /// so the two ways of naming an undeclared field never drift into two
 /// different error messages.
@@ -556,21 +592,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if tasks.is_empty() {
                 println!("no tasks");
             }
+            // A list that can be sorted and filtered by priority but never
+            // shows it is the same read/write asymmetry as `show`. The column
+            // only appears when some task in the list has one, so an ordinary
+            // list keeps the row it always had.
+            let show_priority = tasks.iter().any(|t| t.priority != Priority::Normal);
             for t in tasks {
-                println!("{:<10} {:<8} {}", t.key.to_string(), t.state, t.title);
+                let key = t.key.to_string();
+                if show_priority {
+                    let p = if t.priority == Priority::Normal {
+                        ""
+                    } else {
+                        priority_label(t.priority)
+                    };
+                    println!("{:<10} {:<8} {:<5} {}", key, t.state, p, t.title);
+                } else {
+                    println!("{:<10} {:<8} {}", key, t.state, t.title);
+                }
             }
         }
         Cmd::Show { key } => {
             let k = parse_key(&app, &key)?;
             let t = app.get_by_key(&k)?;
             println!("{}  {}", t.key, t.title);
-            println!("state: {}", t.state);
+            let mut rows = vec![("state".to_string(), t.state.clone())];
+            // `normal` is every task's default, so a line for it would appear
+            // on every task and say nothing.
+            if t.priority != Priority::Normal {
+                rows.push((
+                    "priority".to_string(),
+                    priority_label(t.priority).to_string(),
+                ));
+            }
             if let Some(d) = &t.due {
-                println!("due:   {d}");
+                rows.push(("due".to_string(), d.clone()));
             }
             if !t.tags.is_empty() {
-                println!("tags:  {}", t.tags.join(", "));
+                rows.push(("tags".to_string(), t.tags.join(", ")));
             }
+            // `fields` is a `BTreeMap`, so this order is already stable
+            // across runs without a sort.
+            for (name, value) in &t.fields {
+                rows.push((name.clone(), render_field_value(value)));
+            }
+            print_labelled(&rows);
             if !t.body.trim().is_empty() {
                 println!("\n{}", t.body.trim());
             }
