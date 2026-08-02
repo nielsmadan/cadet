@@ -56,7 +56,7 @@ proptest! {
         let open = |index: SqliteIndex| App::new(
             Box::new(MarkdownBackend::new(vault.path().to_path_buf())),
             index,
-            git(),
+            Some(git()),
             "p".into(),
         );
         let app = open(SqliteIndex::open(&index_path).unwrap());

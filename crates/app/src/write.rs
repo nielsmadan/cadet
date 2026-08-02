@@ -121,7 +121,11 @@ impl App {
     /// `paths` names exactly the files cadet wrote. A backend with no
     /// filesystem reports none, and then there is nothing to commit.
     fn commit_or_warn(&self, message: &str, paths: &[String]) {
-        if let Err(e) = self.git.commit(message, paths) {
+        // No work tree, no safety net. Not a warning: a backend that stores
+        // tasks in a database has nothing for git to hold, and saying so on
+        // every write would be noise about a permanent property.
+        let Some(git) = &self.git else { return };
+        if let Err(e) = git.commit(message, paths) {
             self.warn(format!(
                 "change saved, but the safety net could not record it: {e}"
             ));
@@ -353,8 +357,19 @@ impl App {
     /// not itself a write with a durable backend result to fall back on, so
     /// there is no already-successful outcome to protect by swallowing the
     /// error into a warning.
+    ///
+    /// A backend with no safety net has no undo either, and that must fail
+    /// before any other work: a message about an empty repository would name
+    /// the wrong cause when the truth is that this backend has nothing for
+    /// git to hold at all.
     pub fn undo(&self) -> Result<(), AppError> {
-        self.git.undo()?;
+        let Some(git) = &self.git else {
+            return Err(BackendError::Unsupported {
+                capability: "undo".to_string(),
+            }
+            .into());
+        };
+        git.undo()?;
         Ok(())
     }
 }

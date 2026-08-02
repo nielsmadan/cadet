@@ -49,7 +49,7 @@ pub enum AppError {
 pub struct App {
     pub(crate) backend: Box<dyn Backend>,
     pub(crate) index: SqliteIndex,
-    pub(crate) git: GitNet,
+    pub(crate) git: Option<GitNet>,
     pub(crate) project: String,
     /// Non-fatal warnings queued by a write (currently: a failed safety-net
     /// commit). The backend is the source of truth and git is a local
@@ -64,7 +64,7 @@ impl App {
     pub fn new(
         backend: Box<dyn Backend>,
         index: SqliteIndex,
-        git: GitNet,
+        git: Option<GitNet>,
         project: String,
     ) -> Self {
         Self {

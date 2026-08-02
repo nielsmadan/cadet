@@ -35,7 +35,7 @@ impl Fixture {
         App::new(
             Box::new(MarkdownBackend::new(self.vault_path.clone())),
             SqliteIndex::open_in_memory().unwrap(),
-            GitNet::new(self.repo_dir.clone(), self.vault_path.clone()),
+            Some(GitNet::new(self.repo_dir.clone(), self.vault_path.clone())),
             "p".into(),
         )
     }
@@ -54,7 +54,28 @@ fn fixture() -> Fixture {
     Fixture {
         _vault: vault,
         _repo: repo,
-        app: App::new(Box::new(backend), index, git, "p".into()),
+        app: App::new(Box::new(backend), index, Some(git), "p".into()),
+        vault_path,
+        repo_dir,
+    }
+}
+
+/// Identical to `fixture()` except the safety net is absent, as a backend
+/// with no work tree (e.g. a SQLite-backed project) always is: there is
+/// nothing for git to hold, so the `App` is built with `None` rather than a
+/// `GitNet` over a repo that was never meant to exist.
+fn fixture_without_git() -> Fixture {
+    let vault = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(vault.path().join("project.toml"), CFG).unwrap();
+    let backend = MarkdownBackend::new(vault.path().to_path_buf());
+    let index = SqliteIndex::open_in_memory().unwrap();
+    let repo_dir = repo.path().join("r.git");
+    let vault_path = vault.path().to_path_buf();
+    Fixture {
+        _vault: vault,
+        _repo: repo,
+        app: App::new(Box::new(backend), index, None, "p".into()),
         vault_path,
         repo_dir,
     }
@@ -910,7 +931,7 @@ fn an_incomplete_scan_does_not_drop_a_task_from_the_cache_on_a_write() {
             fail_scan: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
         SqliteIndex::open_in_memory().unwrap(),
-        GitNet::new(f.repo_dir.clone(), f.vault_path.clone()),
+        Some(GitNet::new(f.repo_dir.clone(), f.vault_path.clone())),
         "p".into(),
     );
     app.reconcile(0).unwrap();
@@ -964,7 +985,7 @@ fn a_failed_commit_does_not_fail_the_write() {
         repo.path().join("never-initialised.git"),
         vault.path().to_path_buf(),
     );
-    let app = App::new(Box::new(backend), index, git, "p".into());
+    let app = App::new(Box::new(backend), index, Some(git), "p".into());
 
     let task = app.add("resilient").unwrap();
 
@@ -1227,7 +1248,7 @@ fn a_failed_cache_refresh_warns_instead_of_failing_a_durable_write() {
             fail_scan: std::sync::Arc::clone(&fail_scan),
         }),
         SqliteIndex::open_in_memory().unwrap(),
-        GitNet::new(f.repo_dir.clone(), f.vault_path.clone()),
+        Some(GitNet::new(f.repo_dir.clone(), f.vault_path.clone())),
         "p".into(),
     );
 
@@ -1695,5 +1716,34 @@ fn the_safety_net_never_touches_a_file_cadet_did_not_write() {
         std::fs::read_to_string(&note).unwrap(),
         "notes I care about, now edited\n",
         "undo reverted a file cadet never wrote"
+    );
+}
+
+/// A backend with no work tree (e.g. SQLite-backed) has nothing for git to
+/// hold, so `App` carries no `GitNet` at all — `undo` has to say so plainly
+/// rather than fail as if pointed at an empty repository.
+#[test]
+fn a_project_with_no_safety_net_reports_that_undo_is_unavailable() {
+    let f = fixture_without_git();
+    f.app.add("a task").unwrap();
+    let err = f.app.undo().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("undo"),
+        "the error must name the missing capability: {msg}"
+    );
+}
+
+/// A missing safety net is a permanent property of the backend, not
+/// something a user can act on — so it must never show up as a warning.
+#[test]
+fn writes_succeed_with_no_safety_net() {
+    let f = fixture_without_git();
+    let t = f.app.add("still works").unwrap();
+    assert_eq!(f.app.list(false).unwrap().len(), 1);
+    f.app.set_state(&t.key, "doing").unwrap();
+    assert!(
+        f.app.drain_warnings().is_empty(),
+        "a missing safety net is not a warning — it is a property of the backend"
     );
 }

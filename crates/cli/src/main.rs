@@ -149,7 +149,7 @@ fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Erro
     let index = SqliteIndex::open(&reg.index_path())?;
     let git = GitNet::new(reg.repo_dir(&p.id), p.path.clone());
     git.ensure_init()?;
-    Ok(App::new(Box::new(backend), index, git, p.id.clone()))
+    Ok(App::new(Box::new(backend), index, Some(git), p.id.clone()))
 }
 
 fn parse_key(app: &App, raw: &str) -> Result<TaskKey, Box<dyn std::error::Error>> {
