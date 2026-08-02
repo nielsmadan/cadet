@@ -8,6 +8,12 @@ pub struct Registry {
     pub projects: Vec<Project>,
     pub default: Option<String>,
     pub project_root: Option<PathBuf>,
+    // The document `load_from` parsed, kept around so `save` can mutate it
+    // in place instead of building a fresh one from scratch — that's what
+    // lets unknown top-level keys, and unknown keys inside a `[projects.x]`
+    // table, survive a load/save round trip instead of being silently
+    // dropped. `None` when there was nothing to load (fresh registry).
+    doc: Option<toml_edit::DocumentMut>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +36,17 @@ impl Registry {
         root.join("config.toml")
     }
 
+    // Process-unique so two `cadet` processes saving against the same root
+    // don't clobber each other's in-flight write: without the pid, one of
+    // them renames the other's content into place and reports `Ok(())` for
+    // data that was never its own. This doesn't make concurrent saves
+    // coordinated — last-rename-wins is still the outcome, and that's fine
+    // for a single-user CLI — it just stops a save from silently reporting
+    // success while persisting someone else's write.
+    fn tmp_file(root: &Path) -> PathBuf {
+        Self::file(root).with_extension(format!("toml.tmp.{}", std::process::id()))
+    }
+
     pub fn load() -> std::io::Result<Self> {
         Self::load_from(Self::home())
     }
@@ -41,6 +58,7 @@ impl Registry {
             projects: vec![],
             default: None,
             project_root: None,
+            doc: None,
         };
         let Ok(src) = std::fs::read_to_string(&path) else {
             return Ok(reg);
@@ -74,6 +92,7 @@ impl Registry {
                 }
             }
         }
+        reg.doc = Some(doc);
         Ok(reg)
     }
 
@@ -96,28 +115,83 @@ impl Registry {
     /// to parse, locking the user out of every project at once. This is the
     /// one piece of local state that is not disposable.
     ///
-    /// Inserting into a `Table` also subsumes the old duplicate-id guard:
-    /// re-inserting an id overwrites in place, so two entries sharing one id
-    /// can never render as two `[projects.<id>]` tables. Order is first-seen,
-    /// content is last-write-wins.
+    /// Mutates the `DocumentMut` `load_from` parsed (falling back to a fresh
+    /// one only when there was nothing to load), rather than building a new
+    /// document from scratch, so unknown top-level keys and unknown keys
+    /// inside a `[projects.x]` table — content written by a newer binary
+    /// this one doesn't understand — survive a load/save round trip instead
+    /// of being silently erased. Reinserting a project id overwrites its
+    /// `path` in place, so two entries sharing one id can never render as
+    /// two `[projects.<id>]` tables.
+    ///
+    /// Writes to a process-unique temp file next to the target and renames
+    /// it into place — the same pattern `backend-fs` uses for its
+    /// (disposable) task files — rather than truncating `config.toml`
+    /// directly: a crash mid-write must never leave this file half-written
+    /// and unparseable, which would lock the user out of every project at
+    /// once. The pid in the temp name keeps two concurrent `cadet`
+    /// processes from clobbering each other's in-flight write (see
+    /// `tmp_file`); if the rename fails, the temp file is removed rather
+    /// than left behind.
     pub fn save(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.root)?;
-        let mut doc = toml_edit::DocumentMut::new();
-        if let Some(d) = &self.default {
-            doc["default"] = toml_edit::value(d.as_str());
+        let mut doc = self.doc.clone().unwrap_or_default();
+
+        match &self.default {
+            Some(d) => doc["default"] = toml_edit::value(d.as_str()),
+            None => {
+                doc.remove("default");
+            }
         }
-        if let Some(pr) = &self.project_root {
-            doc["project_root"] = toml_edit::value(pr.to_string_lossy().as_ref());
+        match &self.project_root {
+            Some(pr) => doc["project_root"] = toml_edit::value(pr.to_string_lossy().as_ref()),
+            None => {
+                doc.remove("project_root");
+            }
         }
-        let mut projects = toml_edit::Table::new();
-        projects.set_implicit(true);
+
+        let has_projects_table = matches!(doc.get("projects"), Some(item) if item.is_table());
+        if !has_projects_table {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            doc["projects"] = toml_edit::Item::Table(t);
+        }
+        let projects = doc["projects"]
+            .as_table_mut()
+            .expect("just ensured this is a table");
+
+        let keep: Vec<&str> = self.projects.iter().map(|p| p.id.as_str()).collect();
+        let stale: Vec<String> = projects
+            .iter()
+            .map(|(id, _)| id.to_string())
+            .filter(|id| !keep.contains(&id.as_str()))
+            .collect();
+        for id in &stale {
+            projects.remove(id);
+        }
         for p in &self.projects {
-            let mut entry = toml_edit::Table::new();
-            entry["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
-            projects.insert(&p.id, toml_edit::Item::Table(entry));
+            match projects.get_mut(&p.id).and_then(|item| item.as_table_mut()) {
+                Some(existing) => {
+                    existing["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
+                }
+                None => {
+                    let mut entry = toml_edit::Table::new();
+                    entry["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
+                    projects.insert(&p.id, toml_edit::Item::Table(entry));
+                }
+            }
         }
-        doc["projects"] = toml_edit::Item::Table(projects);
-        std::fs::write(Self::file(&self.root), doc.to_string())
+
+        let target = Self::file(&self.root);
+        let tmp = Self::tmp_file(&self.root);
+        std::fs::write(&tmp, doc.to_string())?;
+        match std::fs::rename(&tmp, &target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     // Unused outside tests until Task 8 wires these into the `project` CLI
@@ -185,6 +259,7 @@ mod tests {
             projects,
             default: default.map(str::to_string),
             project_root: None,
+            doc: None,
         }
     }
 
@@ -326,5 +401,98 @@ mod tests {
         reg.save().unwrap();
         let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
         assert_eq!(again.projects[0].path, odd);
+    }
+
+    /// Guards against a future regression where `load` or `save` starts
+    /// globbing `config.toml*` (e.g. to "recover" from a previous crash) and
+    /// picks up a leftover temp file from an interrupted `save`. A save that
+    /// crashes before its rename must leave the last good `config.toml`
+    /// exactly as it was.
+    #[test]
+    fn a_stale_tmp_file_from_an_interrupted_save_does_not_corrupt_the_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        registry(
+            dir.path(),
+            vec![Project {
+                id: "a".into(),
+                path: "/tmp/a".into(),
+            }],
+            Some("a"),
+        )
+        .save()
+        .unwrap();
+
+        // Simulate a crash between the temp write and the rename: a
+        // truncated, unparseable `.tmp` sibling left next to a valid file.
+        std::fs::write(dir.path().join("config.toml.tmp"), "default = \"a").unwrap();
+
+        let loaded = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.default.as_deref(), Some("a"));
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].path, PathBuf::from("/tmp/a"));
+    }
+
+    #[test]
+    fn unknown_keys_survive_a_load_save_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "future_key = \"something\"\n\n[projects.a]\npath = \"/tmp/a\"\nfuture_project_key = \"x\"\n",
+        )
+        .unwrap();
+
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        reg.upsert_project(Project {
+            id: "a".into(),
+            path: "/tmp/a-new".into(),
+        });
+        reg.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains("future_key"), "raw file:\n{raw}");
+        assert!(raw.contains("future_project_key"), "raw file:\n{raw}");
+
+        let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(again.projects.len(), 1);
+        assert_eq!(again.projects[0].path, PathBuf::from("/tmp/a-new"));
+    }
+
+    /// Two `cadet` processes saving against the same root must not share a
+    /// temp file name — a shared name lets one process's rename silently
+    /// carry the other's content into `config.toml` while both `save()`
+    /// calls report success (see the coordinator's interleaving probe on
+    /// the prior fix round).
+    #[test]
+    fn the_temp_file_name_contains_the_current_process_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = Registry::tmp_file(dir.path());
+        assert!(
+            tmp.to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "tmp path was {tmp:?}"
+        );
+    }
+
+    #[test]
+    fn no_temp_file_remains_after_a_successful_save() {
+        let dir = tempfile::tempdir().unwrap();
+        registry(
+            dir.path(),
+            vec![Project {
+                id: "a".into(),
+                path: "/tmp/a".into(),
+            }],
+            Some("a"),
+        )
+        .save()
+        .unwrap();
+
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
     }
 }
