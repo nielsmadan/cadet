@@ -111,7 +111,9 @@ fn scan_returns_a_complete_snapshot_with_parsed_tasks() {
     b.put(task("one"), None).unwrap();
     b.put(task("two"), None).unwrap();
     match b.scan(None).unwrap() {
-        ChangeSet::Snapshot { snapshot, tasks } => {
+        ChangeSet::Snapshot {
+            snapshot, tasks, ..
+        } => {
             assert!(snapshot.complete);
             assert_eq!(snapshot.observed.len(), 2);
             // Parsed content rides along so callers never re-read the files.
@@ -466,7 +468,9 @@ fn an_unreadable_file_does_not_abort_the_scan() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     match result.unwrap() {
-        ChangeSet::Snapshot { snapshot, tasks } => {
+        ChangeSet::Snapshot {
+            snapshot, tasks, ..
+        } => {
             assert!(
                 !snapshot.complete,
                 "an unreadable file must make the snapshot incomplete"

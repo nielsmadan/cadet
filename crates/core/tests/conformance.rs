@@ -57,6 +57,7 @@ impl Backend for BrokenBackend {
                 observed: vec![],
             },
             tasks: Default::default(),
+            cursor: None,
         })
     }
 }

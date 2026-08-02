@@ -286,7 +286,9 @@ fn scan_reports_the_uid_as_the_locator() {
     let t = task(1, "locatable");
     b.put(t.clone(), None).unwrap();
     match b.scan(None).unwrap() {
-        cadet_core::ChangeSet::Snapshot { snapshot, tasks } => {
+        cadet_core::ChangeSet::Snapshot {
+            snapshot, tasks, ..
+        } => {
             let o = snapshot
                 .observed
                 .iter()

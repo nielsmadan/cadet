@@ -15,6 +15,14 @@ pub enum ChangeSet {
     Snapshot {
         snapshot: Snapshot,
         tasks: std::collections::BTreeMap<String, Task>,
+        /// `Some` when this backend can resume incrementally from this exact
+        /// point; `None` when it cannot (`backend-markdown`, which never
+        /// serves deltas at all). Without this a reconcile that took the
+        /// snapshot path has nothing to store, and the next scan is a full
+        /// scan again — forever, even for a backend that could have resumed
+        /// cheaply. A snapshot is a point in time; one that cannot say which
+        /// point is the bug, not a feature of "just a snapshot".
+        cursor: Option<Cursor>,
     },
     Delta {
         upserts: Vec<Task>,

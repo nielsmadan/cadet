@@ -160,18 +160,36 @@ impl SqliteIndex {
         self.conn
             .execute("DELETE FROM entries WHERE project = ?1", params![project])?;
         for e in entries {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO entries (project, uid, path, revision, first_seen_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    project,
-                    e.uid.as_str(),
-                    e.path,
-                    e.revision.as_str(),
-                    e.first_seen_ms
-                ],
-            )?;
+            self.upsert_entry_row(project, e)?;
         }
+        Ok(())
+    }
+
+    /// Merges `entries` into the project's index without touching any other
+    /// uid's row — the delta counterpart to `apply`, which replaces the whole
+    /// project. A delta describes a change, not the store: handing it to
+    /// `apply` would wipe every uid this call doesn't mention, including
+    /// ones from a delta batch too small to say anything about them (an
+    /// empty batch would wipe the table outright).
+    pub fn apply_upsert(&self, project: &str, entries: &[IndexEntry]) -> Result<(), IndexError> {
+        for e in entries {
+            self.upsert_entry_row(project, e)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_entry_row(&self, project: &str, e: &IndexEntry) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO entries (project, uid, path, revision, first_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                project,
+                e.uid.as_str(),
+                e.path,
+                e.revision.as_str(),
+                e.first_seen_ms
+            ],
+        )?;
         Ok(())
     }
 
@@ -685,6 +703,29 @@ mod tests {
         i.apply("p", &[entry("a.md"), entry("b.md")]).unwrap();
         i.apply("p", &[entry("c.md")]).unwrap();
         assert_eq!(i.view("p").unwrap().entries.len(), 1);
+    }
+
+    /// The delta counterpart to `apply_replaces_the_whole_project_view`:
+    /// `apply_upsert` must do the opposite — leave every uid it wasn't
+    /// handed alone, including when the batch it's handed is empty (the
+    /// no-op-delta case, which `apply` would treat as "wipe everything").
+    #[test]
+    fn apply_upsert_touches_only_the_given_entries() {
+        let i = idx();
+        i.apply("p", &[entry("a.md"), entry("b.md")]).unwrap();
+        i.apply_upsert("p", &[entry("c.md")]).unwrap();
+        assert_eq!(
+            i.view("p").unwrap().entries.len(),
+            3,
+            "a and b must survive an upsert that only mentions c"
+        );
+
+        i.apply_upsert("p", &[]).unwrap();
+        assert_eq!(
+            i.view("p").unwrap().entries.len(),
+            3,
+            "an empty upsert batch (a no-op delta) must not wipe the project"
+        );
     }
 
     #[test]

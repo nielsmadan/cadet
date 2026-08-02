@@ -243,12 +243,18 @@ impl LocalDbBackend {
             tasks.insert(uid.as_str().to_string(), task);
         }
 
+        // Unlike a filesystem, this backend always has a resume point, even
+        // when falling back to a full snapshot (a stale or lost cursor) — so
+        // the caller can resume incrementally from here rather than falling
+        // back to a full snapshot forever.
+        let head = self.current_seq()?;
         Ok(ChangeSet::Snapshot {
             snapshot: Snapshot {
                 complete: true,
                 observed,
             },
             tasks,
+            cursor: Some(Cursor(head.to_string().into_bytes())),
         })
     }
 

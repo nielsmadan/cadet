@@ -896,6 +896,7 @@ impl cadet_core::Backend for IncompleteBackend {
         if let cadet_core::ChangeSet::Snapshot {
             snapshot,
             mut tasks,
+            cursor,
         } = cs
         {
             // An incomplete scan is one that did not see everything: drop a
@@ -911,6 +912,7 @@ impl cadet_core::Backend for IncompleteBackend {
                     observed,
                 },
                 tasks,
+                cursor,
             };
         }
         Ok(cs)
@@ -1802,4 +1804,125 @@ fn deleting_the_index_rebuilds_a_local_db_project_from_the_backend() {
     let listed = f.app.list(true).unwrap();
     assert_eq!(listed.len(), 1, "a lost cursor must force a full snapshot");
     assert_eq!(listed[0].title, "survivor");
+}
+
+/// Review finding 2 (CRITICAL): the snapshot arm of `reconcile` never stored
+/// a cursor (`ChangeSet::Snapshot` used to carry none), so once
+/// `LocalDbBackend`'s prune floor had risen above zero — which any ordinary
+/// use does, just by consuming deltas — a `clear_index` (which drops our
+/// stored cursor but not the backend's own floor) permanently pinned every
+/// later reconcile onto the full-snapshot path: it asks from zero, zero is
+/// below the floor, back to a snapshot, which (with no cursor to store)
+/// leaves the next ask at zero again. There was no recovery. This must
+/// clear the index only AFTER the floor has risen past zero — the existing
+/// `deleting_the_index_rebuilds_a_local_db_project_from_the_backend` test
+/// above does not, which is exactly why it missed this.
+#[test]
+fn a_lost_cursor_after_the_prune_floor_has_risen_still_recovers_to_delta_mode() {
+    let f = local_db_fixture();
+    f.app.add("one").unwrap();
+    f.app.reconcile(1_000).unwrap();
+    f.app.add("two").unwrap();
+    f.app.reconcile(2_000).unwrap();
+    // The floor has now risen past zero: two deltas have been served and
+    // consumed.
+
+    f.app.clear_index().unwrap();
+    let snapshot_report = f.app.reconcile(3_000).unwrap();
+    assert_eq!(
+        f.app.list(true).unwrap().len(),
+        2,
+        "the rebuild itself must still recover both tasks"
+    );
+    let _ = snapshot_report;
+
+    // The decisive check: a change made AFTER the rebuild must come back as
+    // a cheap delta containing only that one change, not another full
+    // snapshot of everything. Under the bug this stays a snapshot forever,
+    // because no cursor was ever stored by the reconcile just above.
+    f.app.add("three").unwrap();
+    let r = f.app.reconcile(4_000).unwrap();
+    assert_eq!(
+        r.adopted + r.updated,
+        1,
+        "a persisted cursor must have been stored by the snapshot-fallback \
+         reconcile — otherwise every later reconcile re-adopts everything, got {r:?}"
+    );
+    assert_eq!(f.app.list(true).unwrap().len(), 3);
+}
+
+/// Review finding 3 (IMPORTANT): `apply_delta` ran neither `resolve_duplicates`
+/// nor the warn-and-drop sweep `assemble_cache` runs on the snapshot path, so
+/// a duplicate key reaching `cache_upsert_tasks` hit `tasks_unique_key` and
+/// returned `Err`. Because every CLI command reconciles first, that one
+/// duplicate bricked every command in the project — `ls` included — and did
+/// not clear on its own. This constructs the arrival-order case
+/// `resolve_duplicates` cannot see by itself: a second `LocalDbBackend`
+/// handle onto the same on-disk database writes a colliding key directly
+/// (independent devices syncing the same store, or a hand-restored backup),
+/// so the very next reconcile's delta contains only the ONE new upsert
+/// colliding against an already-cached, untouched task — not two upserts in
+/// the same batch.
+#[test]
+fn a_delta_with_one_upsert_colliding_against_an_already_cached_task_does_not_brick_the_project() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.toml"), CFG).unwrap();
+    let db_path = dir.path().join("p.db");
+
+    let backend = LocalDbBackend::open(&db_path).unwrap();
+    let index = SqliteIndex::open_in_memory().unwrap();
+    let app = App::new(Box::new(backend), index, None, "p".into());
+    let first = app.add("first").unwrap();
+    app.reconcile(1_000).unwrap();
+
+    // A second handle onto the same store, standing in for a different
+    // device or a direct restore — anything that can hand this project a
+    // task under a key it already has, without going through `App::add`
+    // (which would never mint a colliding key itself).
+    let raw = LocalDbBackend::open(&db_path).unwrap();
+    let collider = cadet_core::Task {
+        uid: cadet_core::TaskUid::generate(),
+        key: first.key.clone(),
+        title: "collider".into(),
+        state: "todo".into(),
+        created: jiff::Timestamp::now(),
+        updated: jiff::Timestamp::now(),
+        due: None,
+        priority: cadet_core::Priority::Normal,
+        tags: vec![],
+        renumbered_from: None,
+        possible_duplicate_of: None,
+        fields: Default::default(),
+        body: String::new(),
+    };
+    cadet_core::Backend::put(&raw, collider, None).unwrap();
+
+    let r = app
+        .reconcile(2_000)
+        .expect("one duplicate key must not brick reconcile, let alone every later `ls`");
+
+    let listed = app.list(true).unwrap();
+    assert_eq!(
+        listed.len(),
+        2,
+        "both the original and the collider must be visible, got {listed:?}"
+    );
+    let mut keys: Vec<String> = listed.iter().map(|t| t.key.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the duplicate key must have been resolved, got {listed:?}"
+    );
+    assert_eq!(
+        r.renumbered, 1,
+        "the incoming collider must be the one renumbered"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|t| t.title == "first" && t.key == first.key),
+        "the already-cached task must keep its key, got {listed:?}"
+    );
 }

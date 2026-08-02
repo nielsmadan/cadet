@@ -162,8 +162,12 @@ impl App {
             .index
             .cursor(&self.project)?
             .unwrap_or_else(|| Cursor(b"0".to_vec()));
-        let (snap, mut parsed) = match self.backend.scan(Some(since))? {
-            ChangeSet::Snapshot { snapshot, tasks } => (snapshot, tasks),
+        let (snap, mut parsed, snap_cursor) = match self.backend.scan(Some(since))? {
+            ChangeSet::Snapshot {
+                snapshot,
+                tasks,
+                cursor,
+            } => (snapshot, tasks, cursor),
             ChangeSet::Delta {
                 upserts,
                 deletes,
@@ -392,6 +396,17 @@ impl App {
             cached_by_uid.values(),
         )?;
         self.index.cache_tasks(&self.project, &cached)?;
+        // A backend that can resume incrementally hands back a cursor even
+        // on the snapshot path (a stale or lost cursor falling back to a
+        // full resync, or a first-ever scan) — store it, or every reconcile
+        // after this one asks from zero again and gets a full snapshot
+        // forever, having gained nothing from the resync it just paid for.
+        // `backend-markdown` always returns `None` here, so this is a no-op
+        // for it. Last, mirroring `apply_delta`: a failure before this line
+        // just repeats the same (idempotent) snapshot next time.
+        if let Some(c) = snap_cursor {
+            self.index.set_cursor(&self.project, &c)?;
+        }
         Ok(report)
     }
 
@@ -414,6 +429,58 @@ impl App {
         }
 
         let prefix = self.backend.load_project()?.prefix;
+
+        // §5's duplicate-key sweep, reused rather than reimplemented (the
+        // snapshot path's `cache_tasks` enforces the same `tasks_unique_key`
+        // constraint, and `assemble_cache`'s comment already names the
+        // stakes: "letting it through kills every command in the project,
+        // `ls` included"). Two upserts in the same delta can legitimately
+        // share a key — independent devices minting the same next-available
+        // number before syncing — so this has to run before either lands in
+        // the cache. Unlike the snapshot path there is no grace period to
+        // wait out: the delta already told us this happened, authoritatively,
+        // so the loser is renumbered and written back immediately rather than
+        // queued in `pending_renumbers`.
+        let mut parsed: std::collections::BTreeMap<String, Task> = upserts
+            .into_iter()
+            .map(|t| (t.uid.as_str().to_string(), t))
+            .collect();
+        let resolved = self.resolve_duplicates(&mut parsed, &prefix)?;
+        for change in &resolved.changes {
+            let Some(task) = parsed.get(&change.path) else {
+                continue;
+            };
+            self.backend
+                .put(task.clone(), Some(change.on_disk.clone()))?;
+            self.index
+                .bump_high_water(&self.project, change.to.number)?;
+            report.renumbered += 1;
+        }
+        let mut upserts: Vec<Task> = parsed.into_values().collect();
+
+        // A duplicate can also arrive one upsert at a time: this task's key
+        // may collide with a DIFFERENT uid the cache already holds from an
+        // earlier delta — `resolve_duplicates` only sees this batch, so it
+        // cannot catch that. Renumber only the incoming task: it is the one
+        // task in this collision we have a full, real record for (fresh from
+        // the backend); the already-cached task is only a display summary,
+        // not enough to safely rewrite without risking real data loss.
+        for task in upserts.iter_mut() {
+            let Some(existing) = self.index.find_by_key(&self.project, &task.key)? else {
+                continue;
+            };
+            if existing.uid == task.uid.as_str() {
+                continue;
+            }
+            let on_disk = revision(task);
+            let next = self.index.high_water(&self.project)? + 1;
+            task.renumbered_from = Some(task.key.clone());
+            task.key = TaskKey::new(prefix.clone(), next);
+            self.backend.put(task.clone(), Some(on_disk))?;
+            self.index.bump_high_water(&self.project, next)?;
+            report.renumbered += 1;
+        }
+
         if let Some(max) = upserts
             .iter()
             .filter(|t| t.key.prefix == prefix)
@@ -421,6 +488,25 @@ impl App {
             .max()
         {
             self.index.bump_high_water(&self.project, max)?;
+        }
+
+        // A task this project's index has never heard of is an adoption, not
+        // an update — matching the snapshot path's own `Outcome::Adopt` vs.
+        // `Outcome::Update` split. Read before `apply_upsert` mutates
+        // `entries`, or every upsert would already look known.
+        let known: std::collections::BTreeSet<TaskUid> = self
+            .index
+            .view(&self.project)?
+            .entries
+            .into_iter()
+            .map(|e| e.uid)
+            .collect();
+        for t in &upserts {
+            if known.contains(&t.uid) {
+                report.updated += 1;
+            } else {
+                report.adopted += 1;
+            }
         }
 
         let entries: Vec<IndexEntry> = upserts
@@ -432,14 +518,26 @@ impl App {
                 first_seen_ms: now_ms,
             })
             .collect();
-        self.index.apply(&self.project, &entries)?;
-        report.updated = upserts.len();
+        // `apply_upsert`, never `apply`: `apply` replaces the project's
+        // `entries` wholesale, and a delta describes a change, not the
+        // store — handing it only this batch's uids would silently forget
+        // every other uid's identity (an empty, no-op delta batch would wipe
+        // the table outright).
+        self.index.apply_upsert(&self.project, &entries)?;
 
         // Touch only what changed. `cache_tasks` replaces a whole project and
         // would need every task re-read from the backend to rebuild — one
         // query per cached task, which is worse than the single scan this
         // path exists to avoid.
         self.index.cache_upsert_tasks(&self.project, &upserts)?;
+        // A defensive backstop, not a load-bearing step for this backend
+        // under ordinary single-consumer operation (its `pending*` tables
+        // are only ever written by the snapshot path): if an earlier
+        // snapshot-arm pass left a `pending_deletions` row for a uid this
+        // delta just forgot in a way `forget` didn't already clean up, this
+        // reaps it rather than leaving it to read as "already mid grace
+        // period" forever.
+        self.index.reap_orphans(&self.project, None)?;
         self.index.set_cursor(&self.project, &cursor)?;
         Ok(report)
     }
@@ -784,5 +882,68 @@ fn task_from_summary(s: &TaskSummary) -> Task {
         possible_duplicate_of: None,
         fields: s.fields.clone(),
         body: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadet_backend_local_db::LocalDbBackend;
+
+    const CFG: &str = r#"
+[project]
+id = "p"
+name = "P"
+prefix = "P"
+[workflow]
+states = ["todo", "doing", "done"]
+initial = "todo"
+terminal = ["done"]
+"#;
+
+    fn local_db_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.toml"), CFG).unwrap();
+        let backend = LocalDbBackend::open_in_memory(dir.path().join("p.toml")).unwrap();
+        let index = SqliteIndex::open_in_memory().unwrap();
+        (dir, App::new(Box::new(backend), index, None, "p".into()))
+    }
+
+    /// Review finding 1 (CRITICAL): `apply_delta` used to hand `self.index`
+    /// only the delta's own upserts via `apply`, which — per its own doc
+    /// comment — "replaces the project's entries wholesale". A one-task
+    /// delta silently forgot every other cached task's identity, and an
+    /// empty (no-op) delta forgot all of them. This has no clean public-API
+    /// symptom for a delta-only backend (the snapshot-arm fallback that
+    /// would surface it is itself unreachable under ordinary single-consumer
+    /// operation, and reads are served from `tasks`, not `entries`), so this
+    /// asserts directly on the index's own view — legitimate for an
+    /// in-crate unit test, not a throwaway probe.
+    #[test]
+    fn a_one_task_delta_does_not_forget_another_tasks_identity() {
+        let (_dir, app) = local_db_app();
+        app.add("first").unwrap();
+        let b = app.add("second").unwrap();
+        app.reconcile(1_000).unwrap();
+        assert_eq!(app.index.view("p").unwrap().entries.len(), 2);
+
+        app.set_state(&b.key, "doing").unwrap();
+        app.reconcile(2_000).unwrap();
+
+        assert_eq!(
+            app.index.view("p").unwrap().entries.len(),
+            2,
+            "a delta that only touches one task must not forget the other's identity"
+        );
+
+        // The sharper case: a delta with NOTHING to upsert (nothing changed)
+        // still ran the old code's wholesale `apply([])`, wiping every uid.
+        let r = app.reconcile(3_000).unwrap();
+        assert_eq!(r.updated + r.adopted, 0, "nothing changed in this pass");
+        assert_eq!(
+            app.index.view("p").unwrap().entries.len(),
+            2,
+            "an empty delta must not wipe the project's entries"
+        );
     }
 }

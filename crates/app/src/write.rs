@@ -71,6 +71,11 @@ impl App {
         if let ChangeSet::Snapshot {
             snapshot,
             mut tasks,
+            // `scan(None)` always yields a `Snapshot` (never a `Delta`) by
+            // contract, so there is no cursor bookkeeping to do here — this
+            // pass exists only to keep the display cache honest after a
+            // write, independent of `reconcile`'s own cursor tracking.
+            cursor: _,
         } = self.backend.scan(None)?
         {
             let prefix = self.backend.load_project()?.prefix;

@@ -457,6 +457,9 @@ impl Backend for MarkdownBackend {
         Ok(ChangeSet::Snapshot {
             snapshot: Snapshot { complete, observed },
             tasks,
+            // A filesystem has no cursor to resume from — every scan is a
+            // full scan.
+            cursor: None,
         })
     }
 }
