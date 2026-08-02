@@ -119,10 +119,11 @@ fn count_markdown(root: &std::path::Path, limit: usize) -> usize {
 
 /// The `project.toml` body to write for `id`/`name`/`prefix`.
 ///
-/// When `existing` is a usable config, its *parsed document* is mutated and
-/// only those three keys are rewritten — `[[fields]]`, a customised
-/// `[workflow]`, `[tasks]` include/exclude, comments and unknown keys all
-/// survive. Re-emitting `TEMPLATE` instead silently redefines what a task
+/// When `existing` parses as TOML — which is all this needs, and
+/// deliberately weaker than "is a valid config" — its *parsed document* is
+/// mutated and only those three keys are rewritten: `[[fields]]`, a
+/// customised `[workflow]`, `[tasks]` include/exclude, comments and unknown
+/// keys all survive. Re-emitting `TEMPLATE` instead silently redefines what a task
 /// is: every value written under a dropped declaration becomes unreachable,
 /// and every task sitting in a dropped state becomes unmovable.
 ///
@@ -130,7 +131,7 @@ fn count_markdown(root: &std::path::Path, limit: usize) -> usize {
 /// registry — parse, mutate, write — because it is the same bug shape, and
 /// this codebase keeps growing new instances of it.
 ///
-/// `None` (no file, or one too broken to be a config) falls back to the
+/// `None` — no file at all, or one that is not even TOML — falls back to the
 /// template, since there is then nothing to preserve.
 pub fn render_project_toml(existing: Option<&str>, id: &str, name: &str, prefix: &str) -> String {
     let mut doc: toml_edit::DocumentMut = existing
@@ -280,9 +281,9 @@ fn add(
     } else {
         None
     };
-    // Only a file that is a *usable* config is worth preserving: one that
-    // does not parse cannot be repaired key by key, and `--force` on it is
-    // a request to start over.
+    // Only used for the prefix/name defaults below, which need the *values*
+    // a config carries. Whether the document is preserved is a separate
+    // question with a wider answer — see the `render_project_toml` call.
     let existing = existing_src
         .as_deref()
         .and_then(|body| ProjectConfig::parse(body).ok());
@@ -352,13 +353,17 @@ fn add(
     // config's declarations — see `render_project_toml`), and validates the
     // result by parsing it (the check that catches a whitespace-only prefix
     // typed explicitly, since the empty-derived case is caught above).
+    //
+    // The source is handed over whenever it is TOML at all, NOT only when it
+    // is a valid config: those are different sets, and the second is much
+    // larger — an enum spelling its options key wrong is valid TOML and an
+    // invalid config. Withholding the source there would make `--force`, the
+    // repair command, eat exactly the files that need repairing. Nothing
+    // unsafe follows: the validation on the next line runs before the write,
+    // so a config that is still invalid after preservation errors and
+    // touches nothing.
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let body = render_project_toml(
-        existing_src.as_deref().filter(|_| existing.is_some()),
-        &id,
-        &name,
-        &prefix,
-    );
+    let body = render_project_toml(existing_src.as_deref(), &id, &name, &prefix);
     ProjectConfig::parse(&body)
         .map_err(|e| format!("generated project.toml would not parse: {e}"))?;
     std::fs::write(&project_toml, body).map_err(|e| e.to_string())?;

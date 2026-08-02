@@ -1317,14 +1317,21 @@ fn force_overwrite_still_rewrites_id_name_and_prefix() {
     assert!(after.contains("estimate"), "{after}");
 }
 
-/// A `project.toml` too broken to parse is the one case where there is
-/// nothing to preserve — `--force` falls back to a fresh template rather
-/// than refusing to proceed.
+/// A file that is not even TOML is the ONLY case where there is nothing to
+/// preserve — `--force` falls back to a fresh template rather than refusing
+/// to proceed. Narrowly scoped on purpose: "not valid TOML" is a far smaller
+/// set than "not a valid config", and the sibling test above covers the
+/// difference. The content here must stay genuinely unparseable.
 #[test]
-fn force_overwrite_replaces_an_unparseable_project_toml() {
+fn force_overwrite_replaces_a_file_that_is_not_even_toml() {
     let h = project_harness();
     let path = h.vault.path().join("project.toml");
-    std::fs::write(&path, "this is not [ toml").unwrap();
+    let broken = "this is not [ toml";
+    assert!(
+        broken.parse::<toml_edit::DocumentMut>().is_err(),
+        "this test is only meaningful for input that is not TOML"
+    );
+    std::fs::write(&path, broken).unwrap();
     h.cadet(&[
         "project",
         "add",
@@ -1606,4 +1613,41 @@ fn the_many_notes_guard_ignores_dot_directories() {
     h.cadet(&["project", "add", "dotted", "--path", dir.to_str().unwrap()])
         .assert()
         .success();
+}
+
+/// "Not valid TOML" and "not a valid config" are different sets, and the
+/// second is much larger — an enum that spells its options key wrong is
+/// valid TOML and an invalid config. `--force` is the repair command, so it
+/// must not be the thing that eats exactly the files that need repairing:
+/// preserve the document, and let the validation before the write refuse.
+#[test]
+fn force_overwrite_of_a_config_invalid_project_toml_preserves_it_and_errors() {
+    let h = project_harness_with_field("estimate", "int");
+    let path = h.vault.path().join("project.toml");
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml = toml.replace(
+        r#"states = ["todo", "doing", "blocked", "done"]"#,
+        r#"states = ["todo", "review", "done"]"#,
+    );
+    // A plausible typo: valid TOML, rejected as a config.
+    toml.push_str("\n[[fields]]\nname = \"size\"\ntype = \"enum\"\noptions = [\"s\", \"m\"]\n");
+    std::fs::write(&path, &toml).unwrap();
+
+    h.cadet(&[
+        "project",
+        "add",
+        "proj",
+        "--path",
+        h.vault.path().to_str().unwrap(),
+        "--force",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("size"));
+
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        after, toml,
+        "nothing may be written when the result is invalid"
+    );
 }
