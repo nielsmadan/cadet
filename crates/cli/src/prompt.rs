@@ -1,13 +1,9 @@
 use std::io::{BufRead, IsTerminal, Write};
 
-// No caller until Task 8 wires this into `project add`; that task is
-// required to remove this allow when it adds the call site.
-#[allow(dead_code)]
 pub fn is_interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
-#[allow(dead_code)]
 pub fn ask(label: &str, default: Option<&str>) -> std::io::Result<String> {
     let stdin = std::io::stdin();
     let mut r = stdin.lock();

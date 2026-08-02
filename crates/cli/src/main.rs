@@ -1,9 +1,10 @@
 mod config;
+mod project;
 mod prompt;
 
 use cadet_app::{App, GitNet, RejectReason};
 use cadet_backend_fs::FsBackend;
-use cadet_core::{ProjectConfig, TaskKey};
+use cadet_core::TaskKey;
 use cadet_store_sqlite::SqliteIndex;
 use clap::{Parser, Subcommand};
 use config::{Project, Registry};
@@ -19,16 +20,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a project in an existing folder
-    Init {
-        path: String,
-        #[arg(long)]
-        prefix: String,
-        #[arg(long)]
-        name: String,
-        /// Overwrite an existing project.toml at this path
-        #[arg(long)]
-        force: bool,
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        cmd: Option<project::ProjectCmd>,
     },
     /// Add a task
     Add { title: Vec<String> },
@@ -53,7 +48,7 @@ enum Cmd {
     Undo,
 }
 
-const TEMPLATE: &str = r#"[project]
+pub(crate) const TEMPLATE: &str = r#"[project]
 id = "{id}"
 name = "{name}"
 prefix = "{prefix}"
@@ -75,17 +70,6 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
-}
-
-fn known_projects(reg: &Registry) -> String {
-    if reg.projects.is_empty() {
-        return "(none)".to_string();
-    }
-    reg.projects
-        .iter()
-        .map(|p| p.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Error>> {
@@ -144,58 +128,13 @@ fn print_warnings(app: &App) {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let mut reg = Registry::load()?;
+    let mut cli = Cli::parse();
+    let reg = Registry::load()?;
 
-    if let Some(Cmd::Init {
-        path,
-        prefix,
-        name,
-        force,
-    }) = &cli.cmd
-    {
-        let root = std::path::PathBuf::from(path);
-        std::fs::create_dir_all(&root)?;
-        let project_toml = root.join("project.toml");
-        // Re-running `init` on an already-initialised folder must not
-        // silently clobber it: a hand-edited `project.toml` (custom fields,
-        // a tweaked workflow) would be destroyed with no warning. Require
-        // an explicit `--force` to overwrite.
-        if project_toml.exists() && !force {
-            return Err(format!(
-                "{} already exists — pass --force to overwrite it",
-                project_toml.display()
-            )
-            .into());
-        }
-        let id = name.to_lowercase().replace(' ', "-");
-        let body = TEMPLATE
-            .replace("{id}", &id)
-            .replace("{name}", name)
-            .replace("{prefix}", prefix);
-        // `init` writes this file directly from a template rather than
-        // round-tripping through `ProjectConfig`, so it doesn't get that
-        // type's validation for free. Parse what we're about to write and
-        // fail loudly instead of leaving behind a `project.toml` that looks
-        // fine but can't be read back — an empty prefix, for instance,
-        // renders keys as `-1` and breaks task identity silently.
-        ProjectConfig::parse(&body)
-            .map_err(|e| format!("generated project.toml would not parse: {e}"))?;
-        std::fs::write(&project_toml, body)?;
-        // Upsert, not append: re-running `init` (with --force) for a project
-        // that's already registered must replace its entry, not add a
-        // second `[projects.<id>]` table — two tables with the same key is
-        // invalid TOML and corrupts the registry for every project in it.
-        reg.upsert_project(Project {
-            id: id.clone(),
-            path: root.clone(),
-        });
-        if reg.default.is_none() {
-            reg.default = Some(id.clone());
-        }
-        reg.save()?;
-        println!("created project `{id}` at {}", root.display());
-        return Ok(());
+    // Handled before a project is resolved, since none may exist yet.
+    if let Some(Cmd::Project { cmd }) = &mut cli.cmd {
+        let cmd = cmd.take().unwrap_or(project::ProjectCmd::Ls);
+        return project::run(cmd, reg).map_err(Into::into);
     }
 
     let project = match cli.project.as_deref() {
@@ -207,16 +146,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| {
                 format!(
                     "unknown project `{id}` — configured project(s): {}",
-                    known_projects(&reg)
+                    reg.known_projects()
                 )
             })?,
         None => reg.active(None).cloned().ok_or_else(|| {
             if reg.projects.is_empty() {
-                "no project configured — run `cadet init <path> --prefix X --name Y`".to_string()
+                "no project configured — run `cadet project add <id>`".to_string()
             } else {
                 format!(
                     "no default project set — pass --project or set one, configured project(s): {}",
-                    known_projects(&reg)
+                    reg.known_projects()
                 )
             }
         })?,
@@ -251,7 +190,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     print_warnings(&app);
 
     match cli.cmd.unwrap_or(Cmd::Ls { all: false }) {
-        Cmd::Init { .. } => unreachable!("handled above"),
+        Cmd::Project { .. } => unreachable!("handled above"),
         Cmd::Add { title } => {
             let t = app.add(&title.join(" "))?;
             println!("{}  {}", t.key, t.title);

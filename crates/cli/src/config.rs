@@ -194,32 +194,42 @@ impl Registry {
         }
     }
 
-    // Unused outside tests until Task 8 wires these into the `project` CLI
-    // commands; `cadet-cli` is a bin-only crate, so `pub` alone doesn't
-    // silence rustc's dead_code lint the way it would in a lib crate.
-    #[allow(dead_code)]
     pub fn project_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
     }
 
-    #[allow(dead_code)]
     pub fn set_project_root(&mut self, p: PathBuf) {
         self.project_root = Some(p);
     }
 
-    #[allow(dead_code)]
     pub fn set_default(&mut self, id: &str) -> Result<(), String> {
         if !self.projects.iter().any(|p| p.id == id) {
-            return Err(format!("unknown project `{id}`"));
+            return Err(format!(
+                "unknown project `{id}` — configured project(s): {}",
+                self.known_projects()
+            ));
         }
         self.default = Some(id.to_string());
         Ok(())
     }
 
+    /// A comma-separated list of every configured project id, or `(none)` —
+    /// shared by every "unknown project" error so a typo always comes back
+    /// with the same list a user could have checked with `cadet project`.
+    pub fn known_projects(&self) -> String {
+        if self.projects.is_empty() {
+            return "(none)".to_string();
+        }
+        self.projects
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Clearing the default matters as much as removing the entry: a dangling
     /// `default` makes every later command fail with "no default project set",
     /// and there is no command that repairs it.
-    #[allow(dead_code)]
     pub fn remove_project(&mut self, id: &str) -> bool {
         let before = self.projects.len();
         self.projects.retain(|p| p.id != id);
