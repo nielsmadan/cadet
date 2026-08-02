@@ -118,6 +118,17 @@ impl LocalDbBackend {
             [],
         )
         .map_err(Self::io)?;
+        // `-1` means "no cursor has ever been served" — every real seq is
+        // >= 0, so no incoming cursor can be older than that. Once a delta
+        // has been served for some seq, this becomes a watermark: a cursor
+        // presented later that is older than the watermark may reference
+        // tombstones this backend has already pruned, so `scan` must refuse
+        // to serve it incrementally rather than silently under-report.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (k, v) VALUES ('prune_floor', '-1')",
+            [],
+        )
+        .map_err(Self::io)?;
         Ok(Self {
             conn,
             config_path,
@@ -208,8 +219,9 @@ impl LocalDbBackend {
     }
 
     /// Every task currently in the store, as a complete `Snapshot`. `scan`
-    /// calls this for both `None` and `Some(_)` — Task 3 gives `Some(_)` a
-    /// real delta path and this becomes the `None` branch only.
+    /// calls this for `None`, for an unparseable cursor, and for a cursor
+    /// below the prune floor — RFC 6578's fallback to full synchronization
+    /// when an incremental sync token can no longer be honoured.
     fn full_snapshot(&self) -> Result<ChangeSet, BackendError> {
         let mut st = self
             .conn
@@ -253,6 +265,94 @@ impl LocalDbBackend {
             tasks,
         })
     }
+
+    fn current_seq(&self) -> Result<i64, BackendError> {
+        self.conn
+            .query_row(
+                "SELECT CAST(v AS INTEGER) FROM meta WHERE k = 'change_seq'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(Self::io)
+    }
+
+    /// The newest `seq` any `scan(Some(_))` call has ever been served for —
+    /// deliberately *not* `MIN(seq) FROM deleted`, because a full prune
+    /// empties that table and would make a stale cursor look safe again.
+    fn prune_floor(&self) -> Result<i64, BackendError> {
+        self.conn
+            .query_row(
+                "SELECT CAST(v AS INTEGER) FROM meta WHERE k = 'prune_floor'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(Self::io)
+    }
+
+    fn raise_prune_floor(&self, seq: i64) -> Result<(), BackendError> {
+        self.conn
+            .execute(
+                "UPDATE meta SET v = CAST(MAX(CAST(v AS INTEGER), ?1) AS TEXT)
+                 WHERE k = 'prune_floor'",
+                params![seq],
+            )
+            .map_err(Self::io)?;
+        Ok(())
+    }
+
+    fn tasks_since(&self, seq: i64) -> Result<Vec<Task>, BackendError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT uid FROM tasks WHERE seq > ?1")
+            .map_err(Self::io)?;
+        let uid_rows = st
+            .query_map(params![seq], |r| r.get::<_, String>(0))
+            .map_err(Self::io)?;
+        let mut uids = Vec::new();
+        for row in uid_rows {
+            uids.push(row.map_err(Self::io)?);
+        }
+
+        let mut out = Vec::new();
+        for uid_str in uids {
+            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
+                path: uid_str.clone(),
+                reason: "invalid uid stored in tasks table".into(),
+            })?;
+            let task = self
+                .get(uid.clone())?
+                .ok_or_else(|| BackendError::Malformed {
+                    path: uid_str.clone(),
+                    reason: "task vanished mid-scan".into(),
+                })?;
+            out.push(task);
+        }
+        Ok(out)
+    }
+
+    fn deletes_since(&self, seq: i64) -> Result<Vec<TaskUid>, BackendError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT uid FROM deleted WHERE seq > ?1")
+            .map_err(Self::io)?;
+        let uid_rows = st
+            .query_map(params![seq], |r| r.get::<_, String>(0))
+            .map_err(Self::io)?;
+        let mut out = Vec::new();
+        for row in uid_rows {
+            let uid_str = row.map_err(Self::io)?;
+            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
+                path: uid_str.clone(),
+                reason: "invalid uid stored in deleted table".into(),
+            })?;
+            out.push(uid);
+        }
+        Ok(out)
+    }
+}
+
+fn parse_cursor(c: &Cursor) -> Option<i64> {
+    std::str::from_utf8(&c.0).ok()?.parse().ok()
 }
 
 impl Backend for LocalDbBackend {
@@ -509,10 +609,38 @@ impl Backend for LocalDbBackend {
     }
 
     fn scan(&self, since: Option<Cursor>) -> Result<ChangeSet, BackendError> {
-        // `since` is unused for now: Task 3 gives `Some(_)` a real
-        // cursor-based delta. Until then both cases return the full snapshot.
-        let _ = since;
-        self.full_snapshot()
+        let Some(cursor) = since else {
+            return self.full_snapshot();
+        };
+        let Some(seq) = parse_cursor(&cursor) else {
+            return self.full_snapshot();
+        };
+        // A cursor older than the watermark of some previously served delta
+        // may reference tombstones this backend has already pruned in
+        // response to that earlier call, so it cannot be served
+        // incrementally. RFC 6578 calls for exactly this fallback when a
+        // sync token is no longer valid.
+        if seq < self.prune_floor()? {
+            return self.full_snapshot();
+        }
+
+        let upserts = self.tasks_since(seq)?;
+        let deletes = self.deletes_since(seq)?;
+        let head = self.current_seq()?;
+
+        // A consumer that has acknowledged `seq` will never ask for anything
+        // at or below it again, so those tombstones can go. Single consumer
+        // per database — see the spec.
+        self.conn
+            .execute("DELETE FROM deleted WHERE seq <= ?1", params![seq])
+            .map_err(Self::io)?;
+        self.raise_prune_floor(seq)?;
+
+        Ok(ChangeSet::Delta {
+            upserts,
+            deletes,
+            cursor: Cursor(head.to_string().into_bytes()),
+        })
     }
 }
 

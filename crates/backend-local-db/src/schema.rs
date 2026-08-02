@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS task_fields (
     PRIMARY KEY (uid, name)
 );
 -- Deletions have to be remembered, or a delta cannot report that something
--- went away. Pruned in Task 3, once there is a cursor to prune against.
+-- went away. Pruned by `scan` once a cursor has acknowledged them.
 CREATE TABLE IF NOT EXISTS deleted (
     uid TEXT PRIMARY KEY,
     seq INTEGER NOT NULL

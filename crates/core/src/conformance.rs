@@ -8,7 +8,7 @@
 //! has an `assert_*` here, and `crates/core/tests/conformance.rs` proves the
 //! suite fails for a backend that gets them wrong.
 
-use crate::{Backend, BackendError, ChangeSet, Observed, Task, TaskKey, TaskUid};
+use crate::{Backend, BackendError, ChangeSet, Cursor, Observed, Task, TaskKey, TaskUid};
 
 pub fn assert_scan_is_a_complete_snapshot(b: &dyn Backend) {
     match b.scan(None).unwrap() {
@@ -123,6 +123,101 @@ pub fn assert_scan_detects_a_change(b: &dyn Backend, mut task: Task) {
         first.revision, second.revision,
         "scan must report a new revision once the task changes"
     );
+}
+
+/// The property the delta design rests on: applying every delta since a
+/// cursor must produce exactly what a full scan returns. The snapshot path
+/// and the delta path are two descriptions of one truth, and this fails the
+/// moment they disagree — which is this codebase's most-repeated defect.
+///
+/// `serves_deltas` names what the backend claims: the assertion cannot infer
+/// it from `scan(Some(_))` returning a `Snapshot` alone, because that is also
+/// the correct response from a backend that never does deltas at all (e.g.
+/// `backend-markdown`). When the caller says `true`, a `Snapshot` in reply to
+/// a cursor the backend itself just issued is a contradiction, not a
+/// legitimate opt-out, and this panics rather than returning quietly.
+pub fn assert_deltas_reconstruct_the_snapshot(b: &dyn Backend, seed: Task, serves_deltas: bool) {
+    // Establish a cursor with one task already present.
+    b.put(seed.clone(), None).unwrap();
+    let cursor = match b.scan(None).unwrap() {
+        ChangeSet::Snapshot { .. } => match b.scan(Some(Cursor(b"0".to_vec()))).unwrap() {
+            ChangeSet::Delta { cursor, .. } => cursor,
+            ChangeSet::Snapshot { .. } if serves_deltas => panic!(
+                "a backend that claims to serve deltas returned a Snapshot for \
+                 scan(Some(_)) — a backend claiming deltas must serve one for a \
+                 cursor it just issued"
+            ),
+            ChangeSet::Snapshot { .. } => return, // backend does not do deltas
+        },
+        ChangeSet::Delta { .. } => panic!("scan(None) must not return a Delta"),
+    };
+
+    let mut changed = seed.clone();
+    changed.title = format!("{} (edited)", seed.title);
+    b.put(changed.clone(), None).unwrap();
+
+    let added = {
+        let mut t = seed.clone();
+        t.uid = TaskUid::generate();
+        t.key = TaskKey::new(seed.key.prefix.clone(), seed.key.number + 1);
+        t.title = "added after the cursor".into();
+        b.put(t.clone(), None).unwrap();
+        t
+    };
+
+    let removed = {
+        let mut t = seed.clone();
+        t.uid = TaskUid::generate();
+        t.key = TaskKey::new(seed.key.prefix.clone(), seed.key.number + 2);
+        t.title = "removed after the cursor".into();
+        b.put(t.clone(), None).unwrap();
+        b.delete(t.uid.clone(), None).unwrap();
+        t
+    };
+
+    let ChangeSet::Delta {
+        upserts, deletes, ..
+    } = b.scan(Some(cursor)).unwrap()
+    else {
+        panic!("scan(Some(cursor)) must return a Delta once the backend supports them");
+    };
+
+    assert!(
+        upserts
+            .iter()
+            .any(|t| t.uid == changed.uid && t.title == changed.title),
+        "an edit after the cursor must appear in the delta"
+    );
+    assert!(
+        upserts.iter().any(|t| t.uid == added.uid),
+        "a task created after the cursor must appear in the delta"
+    );
+    assert!(
+        deletes.contains(&removed.uid),
+        "a task deleted after the cursor must appear in the delta's deletes"
+    );
+
+    // The whole point: the delta agrees with a full scan.
+    let ChangeSet::Snapshot { tasks, .. } = b.scan(None).unwrap() else {
+        panic!("scan(None) must return a Snapshot");
+    };
+    assert!(
+        !tasks.values().any(|t| t.uid == removed.uid),
+        "a deleted task must be absent from a full scan"
+    );
+    for t in &upserts {
+        if deletes.contains(&t.uid) {
+            continue;
+        }
+        let full = tasks
+            .values()
+            .find(|f| f.uid == t.uid)
+            .expect("every upsert must be present in a full scan");
+        assert_eq!(
+            full.title, t.title,
+            "the delta and the full scan must agree on content"
+        );
+    }
 }
 
 fn observe(b: &dyn Backend, uid: &TaskUid) -> Option<Observed> {

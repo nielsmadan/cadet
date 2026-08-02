@@ -1,6 +1,7 @@
 use cadet_backend_local_db::LocalDbBackend;
 use cadet_core::{
-    Backend, BackendError, FieldValue, Priority, Task, TaskKey, TaskUid, conformance,
+    Backend, BackendError, ChangeSet, Cursor, FieldValue, Priority, Task, TaskKey, TaskUid,
+    conformance,
 };
 use std::collections::BTreeMap;
 
@@ -215,6 +216,34 @@ fn an_ordinary_edit_while_a_field_is_undeclared_does_not_delete_it() {
         "an ordinary edit made while a field was undeclared must not delete \
          it — markdown only ever hides an undeclared field, never deletes it"
     );
+}
+
+#[test]
+fn local_db_deltas_reconstruct_the_snapshot() {
+    let (_d, b) = backend();
+    conformance::assert_deltas_reconstruct_the_snapshot(&b, task(1, "seed"), true);
+}
+
+#[test]
+fn a_cursor_below_the_prune_floor_falls_back_to_a_full_snapshot() {
+    let (_d, b) = backend();
+    let t = task(1, "first");
+    b.put(t.clone(), None).unwrap();
+    b.delete(t.uid.clone(), None).unwrap();
+
+    // Presenting a current cursor prunes tombstones at or below it.
+    let ChangeSet::Delta { cursor, .. } = b.scan(Some(Cursor(b"0".to_vec()))).unwrap() else {
+        panic!("expected a delta");
+    };
+    let _ = b.scan(Some(cursor)).unwrap();
+
+    // A cursor from before the prune can no longer be served incrementally.
+    match b.scan(Some(Cursor(b"0".to_vec()))).unwrap() {
+        ChangeSet::Snapshot { snapshot, .. } => assert!(snapshot.complete),
+        ChangeSet::Delta { .. } => {
+            panic!("a cursor below the prune floor must fall back to a full snapshot")
+        }
+    }
 }
 
 #[test]
