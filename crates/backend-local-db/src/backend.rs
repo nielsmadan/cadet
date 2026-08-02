@@ -223,29 +223,15 @@ impl LocalDbBackend {
     /// below the prune floor — RFC 6578's fallback to full synchronization
     /// when an incremental sync token can no longer be honoured.
     fn full_snapshot(&self) -> Result<ChangeSet, BackendError> {
-        let mut st = self
-            .conn
-            .prepare("SELECT uid FROM tasks")
-            .map_err(Self::io)?;
-        let uid_rows = st
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(Self::io)?;
-        let mut uids = Vec::new();
-        for row in uid_rows {
-            uids.push(row.map_err(Self::io)?);
-        }
+        let uids = self.query_uids("SELECT uid FROM tasks", None, "tasks")?;
 
         let mut observed = Vec::new();
         let mut tasks = BTreeMap::new();
-        for uid_str in uids {
-            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
-                path: uid_str.clone(),
-                reason: "invalid uid stored in tasks table".into(),
-            })?;
+        for uid in uids {
             let task = self
                 .get(uid.clone())?
                 .ok_or_else(|| BackendError::Malformed {
-                    path: uid_str.clone(),
+                    path: uid.as_str().to_string(),
                     reason: "task vanished mid-scan".into(),
                 })?;
             let rev = revision(&task);
@@ -264,6 +250,36 @@ impl LocalDbBackend {
             },
             tasks,
         })
+    }
+
+    /// Shared by `full_snapshot`, `tasks_since` and `deletes_since`: read a
+    /// column of stored uid strings and parse each into a `TaskUid`, naming
+    /// `table` in the error a malformed row produces. `since` filters to
+    /// `seq > since` when given, or reads the whole table when `None`.
+    fn query_uids(
+        &self,
+        sql: &str,
+        since: Option<i64>,
+        table: &str,
+    ) -> Result<Vec<TaskUid>, BackendError> {
+        let mut st = self.conn.prepare(sql).map_err(Self::io)?;
+        let bound: Vec<i64> = since.into_iter().collect();
+        let rows = st
+            .query_map(rusqlite::params_from_iter(&bound), |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(Self::io)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let uid_str = row.map_err(Self::io)?;
+            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
+                path: uid_str.clone(),
+                reason: format!("invalid uid stored in {table} table"),
+            })?;
+            out.push(uid);
+        }
+        Ok(out)
     }
 
     fn current_seq(&self) -> Result<i64, BackendError> {
@@ -289,40 +305,27 @@ impl LocalDbBackend {
             .map_err(Self::io)
     }
 
-    fn raise_prune_floor(&self, seq: i64) -> Result<(), BackendError> {
-        self.conn
-            .execute(
-                "UPDATE meta SET v = CAST(MAX(CAST(v AS INTEGER), ?1) AS TEXT)
-                 WHERE k = 'prune_floor'",
-                params![seq],
-            )
-            .map_err(Self::io)?;
+    /// Takes `&Connection` rather than `&self` for the same reason as
+    /// `bump_seq`: a `Transaction` derefs to `Connection`, so this runs
+    /// against either a plain connection or as part of a larger transaction.
+    fn raise_prune_floor(conn: &Connection, seq: i64) -> Result<(), BackendError> {
+        conn.execute(
+            "UPDATE meta SET v = CAST(MAX(CAST(v AS INTEGER), ?1) AS TEXT)
+             WHERE k = 'prune_floor'",
+            params![seq],
+        )
+        .map_err(Self::io)?;
         Ok(())
     }
 
     fn tasks_since(&self, seq: i64) -> Result<Vec<Task>, BackendError> {
-        let mut st = self
-            .conn
-            .prepare("SELECT uid FROM tasks WHERE seq > ?1")
-            .map_err(Self::io)?;
-        let uid_rows = st
-            .query_map(params![seq], |r| r.get::<_, String>(0))
-            .map_err(Self::io)?;
-        let mut uids = Vec::new();
-        for row in uid_rows {
-            uids.push(row.map_err(Self::io)?);
-        }
-
+        let uids = self.query_uids("SELECT uid FROM tasks WHERE seq > ?1", Some(seq), "tasks")?;
         let mut out = Vec::new();
-        for uid_str in uids {
-            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
-                path: uid_str.clone(),
-                reason: "invalid uid stored in tasks table".into(),
-            })?;
+        for uid in uids {
             let task = self
                 .get(uid.clone())?
                 .ok_or_else(|| BackendError::Malformed {
-                    path: uid_str.clone(),
+                    path: uid.as_str().to_string(),
                     reason: "task vanished mid-scan".into(),
                 })?;
             out.push(task);
@@ -331,23 +334,11 @@ impl LocalDbBackend {
     }
 
     fn deletes_since(&self, seq: i64) -> Result<Vec<TaskUid>, BackendError> {
-        let mut st = self
-            .conn
-            .prepare("SELECT uid FROM deleted WHERE seq > ?1")
-            .map_err(Self::io)?;
-        let uid_rows = st
-            .query_map(params![seq], |r| r.get::<_, String>(0))
-            .map_err(Self::io)?;
-        let mut out = Vec::new();
-        for row in uid_rows {
-            let uid_str = row.map_err(Self::io)?;
-            let uid = TaskUid::parse(&uid_str).ok_or_else(|| BackendError::Malformed {
-                path: uid_str.clone(),
-                reason: "invalid uid stored in deleted table".into(),
-            })?;
-            out.push(uid);
-        }
-        Ok(out)
+        self.query_uids(
+            "SELECT uid FROM deleted WHERE seq > ?1",
+            Some(seq),
+            "deleted",
+        )
     }
 }
 
@@ -615,6 +606,16 @@ impl Backend for LocalDbBackend {
         let Some(seq) = parse_cursor(&cursor) else {
             return self.full_snapshot();
         };
+        let head = self.current_seq()?;
+        // A cursor greater than the current head is not a valid delta
+        // request — malformed input, a cursor from another project's DB, a
+        // corrupted `cursors` row — and must be rejected before it can touch
+        // `prune_floor` at all: accepting it would raise the floor past
+        // every legitimately-issued cursor still in flight, permanently
+        // forcing every later `scan(Some(_))` onto the full-snapshot path.
+        if seq > head {
+            return self.full_snapshot();
+        }
         // A cursor older than the watermark of some previously served delta
         // may reference tombstones this backend has already pruned in
         // response to that earlier call, so it cannot be served
@@ -626,15 +627,19 @@ impl Backend for LocalDbBackend {
 
         let upserts = self.tasks_since(seq)?;
         let deletes = self.deletes_since(seq)?;
-        let head = self.current_seq()?;
 
         // A consumer that has acknowledged `seq` will never ask for anything
         // at or below it again, so those tombstones can go. Single consumer
-        // per database — see the spec.
-        self.conn
-            .execute("DELETE FROM deleted WHERE seq <= ?1", params![seq])
+        // per database — see the spec. The prune and the floor raise must
+        // land together: same atomicity argument as `put` and `delete` — a
+        // mid-sequence failure must never leave tombstones pruned with the
+        // floor unraised, which would silently hide the deletions that
+        // pruning is supposed to have already handed to the caller.
+        let tx = self.conn.unchecked_transaction().map_err(Self::io)?;
+        tx.execute("DELETE FROM deleted WHERE seq <= ?1", params![seq])
             .map_err(Self::io)?;
-        self.raise_prune_floor(seq)?;
+        Self::raise_prune_floor(&tx, seq)?;
+        tx.commit().map_err(Self::io)?;
 
         Ok(ChangeSet::Delta {
             upserts,
@@ -750,6 +755,61 @@ mod tests {
             Some(t),
             "a failed delete must leave the task exactly as it was before \
              `delete` was called"
+        );
+    }
+
+    /// `scan`'s prune-and-advance is two statements: the tombstone `DELETE`
+    /// and the `prune_floor` `UPDATE`. Same argument as `put` and `delete`:
+    /// without a transaction wrapping both, a mid-sequence failure can prune
+    /// tombstones the floor was never raised to acknowledge — which reopens,
+    /// by partial failure, exactly the "the floor looks safe again after a
+    /// prune" bug the floor exists to close by construction. The trigger
+    /// fires on the `prune_floor` update, which runs after the tombstone
+    /// delete has already landed.
+    #[test]
+    fn a_failed_scan_prune_does_not_desync_the_floor_from_the_tombstones() {
+        let (_dir, b) = backend();
+        let t1 = task(1);
+        b.put(t1.clone(), None).unwrap(); // seq 1
+        b.delete(t1.uid.clone(), None).unwrap(); // seq 2, tombstone(seq=2)
+        let t2 = task(2);
+        b.put(t2.clone(), None).unwrap(); // seq 3
+        b.delete(t2.uid.clone(), None).unwrap(); // seq 4, tombstone(seq=4)
+
+        b.conn
+            .execute_batch(
+                "CREATE TRIGGER inject_failure BEFORE UPDATE ON meta
+                 WHEN NEW.k = 'prune_floor'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+
+        let err = b.scan(Some(Cursor(b"2".to_vec()))).unwrap_err();
+        assert!(matches!(err, BackendError::Io(_)), "{err:?}");
+
+        let remaining: i64 = b
+            .conn
+            .query_row("SELECT COUNT(*) FROM deleted", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "a failed scan must not prune any tombstones — the delete and \
+             the floor raise must land together or not at all"
+        );
+
+        let floor: i64 = b
+            .conn
+            .query_row(
+                "SELECT CAST(v AS INTEGER) FROM meta WHERE k = 'prune_floor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            floor, -1,
+            "a failed scan must not raise the prune floor either — a \
+             pruned-but-unacknowledged tombstone is invisible to a later \
+             scan at the same cursor"
         );
     }
 }

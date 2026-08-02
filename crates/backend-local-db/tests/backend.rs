@@ -247,6 +247,40 @@ fn a_cursor_below_the_prune_floor_falls_back_to_a_full_snapshot() {
 }
 
 #[test]
+fn a_cursor_above_head_falls_back_without_poisoning_the_floor() {
+    let (_d, b) = backend();
+    let t = task(1, "first");
+    b.put(t.clone(), None).unwrap();
+
+    // Establish a real, legitimately-issued cursor.
+    let legitimate = match b.scan(Some(Cursor(b"0".to_vec()))).unwrap() {
+        ChangeSet::Delta { cursor, .. } => cursor,
+        ChangeSet::Snapshot { .. } => panic!("expected a delta"),
+    };
+
+    // A cursor greater than the current head — malformed input, a cursor
+    // from a different project's DB, a corrupted `cursors` row — must fall
+    // back to a full snapshot rather than being accepted as a valid,
+    // if odd, request.
+    match b.scan(Some(Cursor(b"999999".to_vec()))).unwrap() {
+        ChangeSet::Snapshot { snapshot, .. } => assert!(snapshot.complete),
+        ChangeSet::Delta { .. } => {
+            panic!("a cursor above the current head must fall back to a full snapshot")
+        }
+    }
+
+    // Serving that bogus cursor must not have raised the prune floor: the
+    // legitimate cursor issued earlier must still be servable as a delta.
+    match b.scan(Some(legitimate)).unwrap() {
+        ChangeSet::Delta { .. } => {}
+        ChangeSet::Snapshot { .. } => panic!(
+            "a cursor above head must not poison the prune floor — a \
+             legitimately-issued cursor from before it must still work"
+        ),
+    }
+}
+
+#[test]
 fn scan_reports_the_uid_as_the_locator() {
     let (_d, b) = backend();
     let t = task(1, "locatable");
