@@ -15,6 +15,12 @@ uninstall:
 run *ARGS:
     @cargo run -q -p cadet-cli -- {{ARGS}}
 
+# Open the registry in $EDITOR.
+conf:
+    @# Second copy of the resolution order in `Registry::home`; keep them in step.
+    @mkdir -p "${CADET_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cadet}"
+    @${EDITOR:-vi} "${CADET_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cadet}/config.toml"
+
 test:
     @cargo test --workspace
 
