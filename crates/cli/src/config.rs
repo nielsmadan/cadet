@@ -1,5 +1,15 @@
 use std::path::{Path, PathBuf};
 
+/// The project id the environment selects, if any. A blank value counts as
+/// unset: `CADET_PROJECT=` left in a shell profile means "no override", not
+/// "select the project with the empty name".
+pub fn env_project() -> Option<String> {
+    std::env::var("CADET_PROJECT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// The one piece of local state that is NOT disposable: it is how a fresh
 /// install finds your data (spec §3).
 #[derive(Debug, Clone)]
@@ -242,12 +252,18 @@ impl Registry {
         true
     }
 
-    pub fn active(&self, requested: Option<&str>) -> Option<&Project> {
-        let id = requested
-            .map(str::to_string)
-            .or_else(|| std::env::var("CADET_PROJECT").ok())
-            .or_else(|| self.default.clone())?;
+    pub fn find(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
+    }
+
+    /// The registry default, and only that. `--project` and `CADET_PROJECT`
+    /// are resolved by the caller (see `main.rs`) so that both spellings of
+    /// "select this project" run through one lookup with one error, instead
+    /// of the env spelling falling through to "no default project set" —
+    /// which is false when a default is set, and names the wrong thing to
+    /// fix.
+    pub fn default_project(&self) -> Option<&Project> {
+        self.find(self.default.as_deref()?)
     }
 
     pub fn repo_dir(&self, project: &str) -> PathBuf {

@@ -1340,3 +1340,190 @@ fn force_overwrite_replaces_an_unparseable_project_toml() {
     let after = std::fs::read_to_string(&path).unwrap();
     assert!(after.contains("[workflow]"), "{after}");
 }
+
+/// The template's `[[fields]]` example is the only on-ramp to the headline
+/// feature, so it has to be *correct*, not just present: uncomment it as
+/// written and both fields must work.
+#[test]
+fn the_template_field_example_works_when_uncommented() {
+    let h = project_harness();
+    let path = h.vault.path().join("project.toml");
+    let toml = std::fs::read_to_string(&path).unwrap();
+    let (head, example) = toml
+        .split_once("# [[fields]]")
+        .unwrap_or_else(|| panic!("the template has no [[fields]] example:\n{toml}"));
+    let uncommented: String = example
+        .lines()
+        .map(|l| {
+            l.strip_prefix("# ")
+                .unwrap_or_else(|| l.strip_prefix('#').unwrap_or(l))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, format!("{head}[[fields]]{uncommented}\n")).unwrap();
+
+    h.cadet(&["add", "sized", "--set", "estimate=3", "--set", "size=m"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "estimate"), "3", "{out}");
+    assert_eq!(value_of(&out, "size"), "m", "{out}");
+}
+
+/// An enum declared with `choices` used to become an enum with no options,
+/// which rejected every value with an empty `expects one of:` list.
+#[test]
+fn an_enum_declared_with_choices_accepts_its_values() {
+    let h = project_harness();
+    let path = h.vault.path().join("project.toml");
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[[fields]]\nname = \"size\"\ntype = \"enum\"\nchoices = [\"s\", \"m\"]\n");
+    std::fs::write(&path, toml).unwrap();
+    h.cadet(&["add", "sized", "--set", "size=m"])
+        .assert()
+        .success();
+    h.cadet(&["add", "bad", "--set", "size=xl"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("s, m"));
+}
+
+/// An enum with no options can never be satisfied, so it is a broken
+/// declaration rather than a field that rejects everything.
+#[test]
+fn an_enum_with_no_options_is_a_config_error() {
+    let h = project_harness();
+    let path = h.vault.path().join("project.toml");
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[[fields]]\nname = \"size\"\ntype = \"enum\"\n");
+    std::fs::write(&path, toml).unwrap();
+    h.cadet(&["add", "sized", "--set", "size=m"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("size"))
+        .stderr(predicates::str::contains("no options"));
+}
+
+/// `--priority high --set priority=low` silently yielded `low`. `--set` is
+/// already refused when it repeats a name inside itself; the same collision
+/// one level out gets the same answer.
+#[test]
+fn add_rejects_set_colliding_with_a_dedicated_flag() {
+    let h = project_harness();
+    for args in [
+        vec!["add", "a", "--priority", "high", "--set", "priority=low"],
+        vec!["add", "b", "--tag", "home", "--set", "tags=work"],
+        vec!["add", "c", "--due", "2026-08-10", "--set", "due=2026-09-01"],
+        vec!["add", "d", "--state", "doing", "--set", "state=todo"],
+        vec!["add", "e", "--set", "title=other"],
+    ] {
+        let name = args[args.len() - 1].split('=').next().unwrap().to_string();
+        h.cadet(&args)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(name));
+    }
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
+}
+
+#[test]
+fn add_still_accepts_set_alongside_an_unrelated_flag() {
+    let h = project_harness_with_field("owner", "str");
+    h.cadet(&["add", "fine", "--priority", "high", "--set", "owner=nm"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "priority"), "high", "{out}");
+    assert_eq!(value_of(&out, "owner"), "nm", "{out}");
+}
+
+/// `--set title=` with no positional title is the only way to give a title
+/// that starts with a dash, so it must stay legal.
+#[test]
+fn add_accepts_set_title_when_no_positional_title_is_given() {
+    let h = project_harness();
+    h.cadet(&["add", "--set", "title=from set"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(out.contains("from set"), "{out}");
+}
+
+/// `--project bogus` and `CADET_PROJECT=bogus` select a project the same
+/// way, so they must fail the same way. `CADET_PROJECT` used to report "no
+/// default project set" — false, and it points at the wrong thing to fix.
+#[test]
+fn a_stale_cadet_project_env_var_names_itself_and_the_known_projects() {
+    let e = env();
+    let mut c = cadet(&e.home);
+    c.env("CADET_PROJECT", "ghost");
+    c.arg("ls")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ghost"))
+        .stderr(predicates::str::contains("personal"))
+        .stderr(predicates::str::contains("CADET_PROJECT"))
+        .stderr(predicates::str::contains("no default project set").not());
+}
+
+#[test]
+fn cadet_project_still_selects_a_real_project() {
+    let e = env();
+    let mut c = cadet(&e.home);
+    c.env("CADET_PROJECT", "personal");
+    c.args(["add", "via env"]).assert().success();
+    cadet(&e.home)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("via env"));
+}
+
+/// `--project` still wins over the environment.
+#[test]
+fn an_explicit_project_flag_beats_the_env_var() {
+    let h = harness();
+    for id in ["alpha", "beta"] {
+        h.cadet(&["project", "add", id, "--path", &h.vault(id)])
+            .assert()
+            .success();
+    }
+    let mut c = h.cadet(&["--project", "beta", "add", "in beta"]);
+    c.env("CADET_PROJECT", "alpha");
+    c.assert()
+        .success()
+        .stdout(predicates::str::contains("BETA-1"));
+}
+
+/// The write path already rejects an undeclared state — `mv` and `add
+/// --state` both do. `ls --state` returning `no tasks` for a typo reads as
+/// "you have none of those", which is a wrong answer rather than an error.
+#[test]
+fn ls_state_filter_rejects_an_undeclared_state() {
+    let h = project_harness();
+    h.cadet(&["add", "real"]).assert().success();
+    h.cadet(&["ls", "--state", "nonsense"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("nonsense"))
+        .stderr(predicates::str::contains("todo"));
+    // The same name the write path refuses.
+    h.cadet(&["mv", "T-1", "nonsense"]).assert().failure();
+}
+
+#[test]
+fn ls_state_filter_still_accepts_a_declared_state() {
+    let h = project_harness();
+    h.cadet(&["add", "real"]).assert().success();
+    h.cadet(&["ls", "--state", "todo"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("real"));
+    h.cadet(&["ls", "--state", "doing"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
+}

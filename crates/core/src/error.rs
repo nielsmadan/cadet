@@ -24,6 +24,8 @@ pub enum CoreError {
     UnknownFieldType { field: String, ty: String },
     #[error("duplicate field name `{0}`")]
     DuplicateFieldName(String),
+    #[error("enum field `{0}` declares no options — add `values = [\"a\", \"b\"]`")]
+    EmptyEnum(String),
     #[error("task title must not be empty")]
     EmptyTitle,
     #[error("key prefix `{found}` does not belong to this project (expected `{expected}`)")]

@@ -171,16 +171,26 @@ impl ProjectConfig {
                     "date" => FieldType::Date,
                     "datetime" => FieldType::DateTime,
                     "list<string>" => FieldType::ListStr,
-                    "enum" => FieldType::Enum(
-                        t.get("values")
-                            .and_then(|v| v.as_array())
+                    // Both spellings are accepted: `choices` is what a user
+                    // reaches for unprompted, and reading only `values`
+                    // turned that into an enum with no options — one that
+                    // rejects every value with an empty `expects one of:`
+                    // list rather than saying the declaration is wrong.
+                    "enum" => {
+                        let options: Vec<String> = ["values", "choices"]
+                            .iter()
+                            .find_map(|k| t.get(k).and_then(|v| v.as_array()))
                             .map(|a| {
                                 a.iter()
                                     .filter_map(|x| x.as_str().map(str::to_string))
                                     .collect()
                             })
-                            .unwrap_or_default(),
-                    ),
+                            .unwrap_or_default();
+                        if options.is_empty() {
+                            return Err(CoreError::EmptyEnum(name));
+                        }
+                        FieldType::Enum(options)
+                    }
                     other => {
                         return Err(CoreError::UnknownFieldType {
                             field: name,
@@ -323,6 +333,41 @@ values = ["shopping", "admin"]
         let src = format!("{SAMPLE}\n[[fields]]\nname = \"category\"\ntype = \"str\"\n");
         let err = ProjectConfig::parse(&src).unwrap_err();
         assert!(matches!(err, CoreError::DuplicateFieldName(ref n) if n == "category"));
+    }
+
+    /// `choices` is the spelling a user reaches for unprompted. Reading only
+    /// `values` turned it into an enum with no options — one that rejects
+    /// every value with `expects one of:` and an empty list.
+    #[test]
+    fn an_enum_may_spell_its_options_choices() {
+        let src = SAMPLE.replace("values = ", "choices = ");
+        let cfg = ProjectConfig::parse(&src).unwrap();
+        assert!(
+            matches!(cfg.fields[0].ty, FieldType::Enum(ref v) if v == &["shopping", "admin"]),
+            "{:?}",
+            cfg.fields[0].ty
+        );
+    }
+
+    #[test]
+    fn rejects_an_enum_with_no_options() {
+        let src = SAMPLE.replace(r#"values = ["shopping", "admin"]"#, "");
+        let err =
+            ProjectConfig::parse(&src).expect_err("an enum with no options can never be satisfied");
+        assert!(
+            matches!(err, CoreError::EmptyEnum(ref n) if n == "category"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_enum_whose_options_list_is_empty() {
+        let src = SAMPLE.replace(r#"values = ["shopping", "admin"]"#, "values = []");
+        let err = ProjectConfig::parse(&src).unwrap_err();
+        assert!(
+            matches!(err, CoreError::EmptyEnum(ref n) if n == "category"),
+            "{err:?}"
+        );
     }
 
     #[test]

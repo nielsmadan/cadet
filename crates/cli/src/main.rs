@@ -121,6 +121,17 @@ match = "frontmatter"
 states = ["todo", "doing", "blocked", "done"]
 initial = "todo"
 terminal = ["done"]
+
+# Custom fields — uncomment to declare your own, then set them with
+# `cadet add --set estimate=3` or `cadet set <KEY> size=m`.
+# [[fields]]
+# name = "estimate"
+# type = "int"
+#
+# [[fields]]
+# name = "size"
+# type = "enum"
+# values = ["s", "m", "l"]
 "#;
 
 fn main() -> std::process::ExitCode {
@@ -317,6 +328,27 @@ fn reject_duplicate_names(pairs: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The same rule as `reject_duplicate_names`, one level out. `--priority
+/// high --set priority=low` silently yielded `low`, and `--tag home --set
+/// tags=work` silently yielded `[work]` — last-wins across two spellings of
+/// one field, with no word to the user. `given` pairs each reserved name
+/// with how the dedicated flag is spelled and whether it was actually
+/// passed.
+fn reject_flag_collisions(set: &[String], given: &[(&str, &str, bool)]) -> Result<(), String> {
+    for pair in set {
+        let name = assignment_name(pair)?;
+        if let Some((n, flag, _)) = given
+            .iter()
+            .find(|(n, _, was_given)| *was_given && *n == name)
+        {
+            return Err(format!(
+                "`{n}` given twice — as {flag} and as `--set {n}=…`; use one or the other"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `cadet_core::parse_assignment` plus the CLI's error enrichment — the
 /// core error can't know which `project.toml` to name. Used by both
 /// `apply_assignment`'s undeclared-field branch and `ls --field`, so there
@@ -415,19 +447,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return project::run(cmd, reg).map_err(Into::into);
     }
 
-    let project = match cli.project.as_deref() {
-        Some(id) => reg
-            .projects
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "unknown project `{id}` — configured project(s): {}",
-                    reg.known_projects()
-                )
-            })?,
-        None => reg.active(None).cloned().ok_or_else(|| {
+    // `--project` and `CADET_PROJECT` are one selector, so they get one
+    // lookup and one error. The env spelling used to fall through to "no
+    // default project set", which is false whenever a default *is* set and
+    // sends the user to fix the wrong thing.
+    let requested = match cli.project.as_deref() {
+        Some(id) => Some((id.to_string(), "")),
+        None => config::env_project().map(|id| (id, " (from CADET_PROJECT)")),
+    };
+    let project = match requested {
+        Some((id, source)) => reg.find(&id).cloned().ok_or_else(|| {
+            format!(
+                "unknown project `{id}`{source} — configured project(s): {}",
+                reg.known_projects()
+            )
+        })?,
+        None => reg.default_project().cloned().ok_or_else(|| {
             if reg.projects.is_empty() {
                 "no project configured — run `cadet project add <id>`".to_string()
             } else {
@@ -489,6 +524,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 check_date_bound("due", d)?;
             }
             reject_duplicate_names(&set)?;
+            reject_flag_collisions(
+                &set,
+                &[
+                    ("title", "the positional title", !title.is_empty()),
+                    ("due", "`--due`", due.is_some()),
+                    ("tags", "`--tag`", !tags.is_empty()),
+                    ("priority", "`--priority`", priority.is_some()),
+                    ("state", "`--state`", state.is_some()),
+                ],
+            )?;
             let (cfg, config_path) = load_config(&project)?;
             let mut scratch = TaskChanges::default();
             for pair in &set {
@@ -568,6 +613,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 check_date_bound("due-after", d)?;
             }
             reject_duplicate_names(&fields)?;
+            // The config is only read when a filter needs it, so a plain
+            // `ls` still costs nothing.
+            let cfg = if states.is_empty() && fields.is_empty() {
+                None
+            } else {
+                Some(load_config(&project)?)
+            };
+            // The write path already refuses an undeclared state — `mv` and
+            // `add --state` both do. Without this, a typo here answers "no
+            // tasks", which is a wrong answer rather than an error.
+            if let Some((cfg, _)) = &cfg {
+                for s in &states {
+                    if !cfg.workflow.states.contains(s) {
+                        return Err(format!(
+                            "unknown state `{s}` — declared state(s): {}",
+                            cfg.workflow.states.join(", ")
+                        )
+                        .into());
+                    }
+                }
+            }
             let mut filter = TaskFilter {
                 states,
                 tags,
@@ -576,8 +642,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 due_after,
                 fields: Vec::new(),
             };
-            if !fields.is_empty() {
-                let (cfg, config_path) = load_config(&project)?;
+            if let Some((cfg, config_path)) = &cfg {
                 for pair in &fields {
                     let name = assignment_name(pair)?;
                     if let Some(msg) = reserved_field_redirect(&name) {
@@ -585,7 +650,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     filter
                         .fields
-                        .push(declared_assignment(&cfg, pair, &config_path)?);
+                        .push(declared_assignment(cfg, pair, config_path)?);
                 }
             }
             let tasks = app.list_filtered(all, &filter)?;
