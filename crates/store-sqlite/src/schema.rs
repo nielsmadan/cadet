@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS task_fields (
     value     TEXT NOT NULL,
     PRIMARY KEY (project, uid, name)
 );
+-- The delta cursor for a backend that serves them. Disposable with the rest
+-- of the index: losing it forces a full snapshot, which is exactly the
+-- recovery path, not a failure.
+CREATE TABLE IF NOT EXISTS cursors (
+    project TEXT PRIMARY KEY,
+    cursor  BLOB NOT NULL
+);
 "#;
 
 /// Created separately from `DDL` because it can legitimately fail on an index

@@ -13,3 +13,4 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+cadet-backend-local-db = { path = "../backend-local-db" }

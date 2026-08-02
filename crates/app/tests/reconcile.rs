@@ -1,4 +1,5 @@
 use cadet_app::*;
+use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
 use cadet_store_sqlite::SqliteIndex;
 
@@ -1746,4 +1747,59 @@ fn writes_succeed_with_no_safety_net() {
         f.app.drain_warnings().is_empty(),
         "a missing safety net is not a warning — it is a property of the backend"
     );
+}
+
+/// A `LocalDbBackend`-backed fixture: the only backend in the workspace that
+/// serves `ChangeSet::Delta`. Like `fixture_without_git`, there is no work
+/// tree for git to hold, so the safety net is `None`.
+struct LocalDbFixture {
+    _dir: tempfile::TempDir,
+    app: App,
+}
+
+fn local_db_fixture() -> LocalDbFixture {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.toml"), CFG).unwrap();
+    let backend = LocalDbBackend::open_in_memory(dir.path().join("p.toml")).unwrap();
+    let index = SqliteIndex::open_in_memory().unwrap();
+    LocalDbFixture {
+        app: App::new(Box::new(backend), index, None, "p".into()),
+        _dir: dir,
+    }
+}
+
+#[test]
+fn a_delta_updates_the_cache_without_a_full_rescan() {
+    let f = local_db_fixture();
+    let a = f.app.add("first").unwrap();
+    f.app.add("second").unwrap();
+    f.app.reconcile(1_000).unwrap();
+
+    f.app.set_state(&a.key, "doing").unwrap();
+    let report = f.app.reconcile(2_000).unwrap();
+
+    assert_eq!(
+        report.updated, 1,
+        "only the changed task should be in the delta"
+    );
+    let listed = f.app.list(true).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed.iter().find(|t| t.key == a.key).unwrap().state,
+        "doing"
+    );
+}
+
+#[test]
+fn deleting_the_index_rebuilds_a_local_db_project_from_the_backend() {
+    let f = local_db_fixture();
+    f.app.add("survivor").unwrap();
+    f.app.reconcile(1_000).unwrap();
+
+    f.app.clear_index().unwrap();
+    f.app.reconcile(2_000).unwrap();
+
+    let listed = f.app.list(true).unwrap();
+    assert_eq!(listed.len(), 1, "a lost cursor must force a full snapshot");
+    assert_eq!(listed[0].title, "survivor");
 }

@@ -1,6 +1,8 @@
 pub mod schema;
 
-use cadet_core::{FieldValue, IndexEntry, IndexView, Priority, Revision, Task, TaskKey, TaskUid};
+use cadet_core::{
+    Cursor, FieldValue, IndexEntry, IndexView, Priority, Revision, Task, TaskKey, TaskUid,
+};
 use rusqlite::{Connection, params};
 use std::collections::BTreeMap;
 
@@ -368,6 +370,60 @@ impl SqliteIndex {
         Ok(())
     }
 
+    /// One task's row-and-children insert, shared by `cache_tasks` (which
+    /// deletes the whole project first) and `cache_upsert_tasks` (which
+    /// deletes just this uid first). Clears this uid's `task_tags` and
+    /// `task_fields` before re-inserting them — without that, a task that
+    /// loses a tag or a field keeps it in the cache forever.
+    fn insert_one(&self, project: &str, t: &Task) -> Result<(), IndexError> {
+        self.conn.execute(
+            "DELETE FROM task_tags WHERE project = ?1 AND uid = ?2",
+            params![project, t.uid.as_str()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM task_fields WHERE project = ?1 AND uid = ?2",
+            params![project, t.uid.as_str()],
+        )?;
+        // A plain INSERT, not `INSERT OR REPLACE`: with `tasks_unique_key`
+        // in place, `OR REPLACE` would silently delete whichever task
+        // already held the key and put the duplicate in its place. Keys
+        // are never reused, so a conflict here is a bug in the caller and
+        // must surface as one.
+        self.conn.execute(
+            "INSERT INTO tasks
+             (project, uid, key_num, key_prefix, title, state, due, priority)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                project,
+                t.uid.as_str(),
+                t.key.number as i64,
+                t.key.prefix,
+                t.title,
+                t.state,
+                t.due,
+                match t.priority {
+                    Priority::High => 0i64,
+                    Priority::Normal => 1,
+                    Priority::Low => 2,
+                },
+            ],
+        )?;
+        for (i, tag) in t.tags.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO task_tags (project, uid, ord, tag) VALUES (?1, ?2, ?3, ?4)",
+                params![project, t.uid.as_str(), i as i64, tag],
+            )?;
+        }
+        for (name, value) in &t.fields {
+            let (kind, encoded) = encode_field(value);
+            self.conn.execute(
+                "INSERT INTO task_fields (project, uid, name, kind, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![project, t.uid.as_str(), name, kind, encoded],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Replaces the cached display data for a project. Called by reconcile with
     /// the tasks the scan already parsed — no extra file reads.
     pub fn cache_tasks(&self, project: &str, tasks: &[Task]) -> Result<(), IndexError> {
@@ -380,44 +436,44 @@ impl SqliteIndex {
             params![project],
         )?;
         for t in tasks {
-            // A plain INSERT, not `INSERT OR REPLACE`: with `tasks_unique_key`
-            // in place, `OR REPLACE` would silently delete whichever task
-            // already held the key and put the duplicate in its place. Keys
-            // are never reused, so a conflict here is a bug in the caller and
-            // must surface as one.
-            self.conn.execute(
-                "INSERT INTO tasks
-                 (project, uid, key_num, key_prefix, title, state, due, priority)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    project,
-                    t.uid.as_str(),
-                    t.key.number as i64,
-                    t.key.prefix,
-                    t.title,
-                    t.state,
-                    t.due,
-                    match t.priority {
-                        Priority::High => 0i64,
-                        Priority::Normal => 1,
-                        Priority::Low => 2,
-                    },
-                ],
-            )?;
-            for (i, tag) in t.tags.iter().enumerate() {
-                self.conn.execute(
-                    "INSERT INTO task_tags (project, uid, ord, tag) VALUES (?1, ?2, ?3, ?4)",
-                    params![project, t.uid.as_str(), i as i64, tag],
-                )?;
-            }
-            for (name, value) in &t.fields {
-                let (kind, encoded) = encode_field(value);
-                self.conn.execute(
-                    "INSERT INTO task_fields (project, uid, name, kind, value) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![project, t.uid.as_str(), name, kind, encoded],
-                )?;
-            }
+            self.insert_one(project, t)?;
         }
+        Ok(())
+    }
+
+    /// Replaces just these tasks in the cached view, leaving every other
+    /// cached task alone. `cache_tasks` deletes the whole project first,
+    /// which a delta must not do — it describes a change, not the store.
+    pub fn cache_upsert_tasks(&self, project: &str, tasks: &[Task]) -> Result<(), IndexError> {
+        for t in tasks {
+            // A plain INSERT would collide on the primary key for a task that
+            // is merely being updated, which is the common case for a delta.
+            self.conn.execute(
+                "DELETE FROM tasks WHERE project = ?1 AND uid = ?2",
+                params![project, t.uid.as_str()],
+            )?;
+            self.insert_one(project, t)?;
+        }
+        Ok(())
+    }
+
+    pub fn cursor(&self, project: &str) -> Result<Option<Cursor>, IndexError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT cursor FROM cursors WHERE project = ?1")?;
+        let mut rows = st.query_map(params![project], |r| r.get::<_, Vec<u8>>(0))?;
+        match rows.next() {
+            Some(v) => Ok(Some(Cursor(v?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_cursor(&self, project: &str, cursor: &Cursor) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO cursors (project, cursor) VALUES (?1, ?2)
+             ON CONFLICT(project) DO UPDATE SET cursor = excluded.cursor",
+            params![project, cursor.0],
+        )?;
         Ok(())
     }
 
@@ -583,6 +639,7 @@ impl SqliteIndex {
             "tasks",
             "task_tags",
             "task_fields",
+            "cursors",
         ] {
             self.conn.execute(
                 &format!("DELETE FROM {t} WHERE project = ?1"),
@@ -977,6 +1034,72 @@ mod tests {
             "target"
         );
         assert!(i.find_by_key("p", &TaskKey::new("P", 9)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_is_absent_until_set() {
+        let ix = SqliteIndex::open_in_memory().unwrap();
+        assert_eq!(ix.cursor("p").unwrap(), None);
+        ix.set_cursor("p", &Cursor(b"42".to_vec())).unwrap();
+        assert_eq!(ix.cursor("p").unwrap(), Some(Cursor(b"42".to_vec())));
+        ix.set_cursor("p", &Cursor(b"43".to_vec())).unwrap();
+        assert_eq!(ix.cursor("p").unwrap(), Some(Cursor(b"43".to_vec())));
+    }
+
+    #[test]
+    fn clearing_a_project_drops_its_cursor() {
+        let ix = SqliteIndex::open_in_memory().unwrap();
+        ix.set_cursor("p", &Cursor(b"42".to_vec())).unwrap();
+        ix.clear("p").unwrap();
+        assert_eq!(
+            ix.cursor("p").unwrap(),
+            None,
+            "a cleared index must force a full snapshot, not resume from a stale cursor"
+        );
+    }
+
+    #[test]
+    fn cache_upsert_tasks_leaves_other_cached_tasks_alone() {
+        let i = idx();
+        i.cache_tasks(
+            "p",
+            &[task(1, "a", "todo", None), task(2, "b", "todo", None)],
+        )
+        .unwrap();
+        let before = i.list_tasks("p", true, &[]).unwrap();
+        // `cache_upsert_tasks` matches on uid, so it has to reuse the uid
+        // already in the cache rather than minting a fresh one.
+        let b_uid = TaskUid::parse(&before.iter().find(|t| t.title == "b").unwrap().uid).unwrap();
+        let mut updated = task_with_uid(b_uid, 2, "b updated");
+        updated.state = "doing".into();
+
+        i.cache_upsert_tasks("p", &[updated]).unwrap();
+
+        let after = i.list_tasks("p", true, &[]).unwrap();
+        assert_eq!(after.len(), 2, "the untouched task must survive");
+        assert!(after.iter().any(|t| t.title == "a"));
+        let b_after = after.iter().find(|t| t.title == "b updated").unwrap();
+        assert_eq!(b_after.state, "doing");
+    }
+
+    /// `insert_one` must clear a uid's tags before re-inserting, or a task
+    /// that loses a tag keeps it in the cache forever.
+    #[test]
+    fn cache_upsert_tasks_drops_a_tag_the_task_no_longer_has() {
+        let i = idx();
+        let uid = TaskUid::generate();
+        let mut first = task_with_uid(uid.clone(), 1, "t");
+        first.tags = vec!["a".into(), "b".into()];
+        i.cache_tasks("p", &[first]).unwrap();
+        assert_eq!(i.list_tasks("p", true, &[]).unwrap()[0].tags.len(), 2);
+
+        let mut second = task_with_uid(uid, 1, "t");
+        second.tags = vec!["a".into()];
+        i.cache_upsert_tasks("p", &[second]).unwrap();
+
+        let after = i.list_tasks("p", true, &[]).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].tags, vec!["a".to_string()]);
     }
 
     #[test]

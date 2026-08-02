@@ -149,13 +149,28 @@ impl App {
         force_adopt: bool,
         immediate_deletion: bool,
     ) -> Result<ReconcileReport, AppError> {
-        let ChangeSet::Snapshot {
-            snapshot: snap,
-            tasks: mut parsed,
-        } = self.backend.scan(None)?
-        else {
-            // `backend-markdown` never produces a Delta; a Delta here is a programming error.
-            return Ok(ReconcileReport::default());
+        // A backend that has never handed out a cursor gets asked from
+        // sequence zero rather than `None`. `ChangeSet::Snapshot` carries no
+        // cursor, so a reconcile that took the snapshot path would have
+        // nothing to store and the next scan would be a full scan again,
+        // forever. Asking from zero instead makes a delta-capable backend
+        // return everything it has *and* a cursor — the same outcome as a
+        // snapshot, plus what makes the next scan cheap.
+        // `backend-markdown` ignores the argument and always returns a
+        // `Snapshot`, so this changes nothing for it.
+        let since = self
+            .index
+            .cursor(&self.project)?
+            .unwrap_or_else(|| Cursor(b"0".to_vec()));
+        let (snap, mut parsed) = match self.backend.scan(Some(since))? {
+            ChangeSet::Snapshot { snapshot, tasks } => (snapshot, tasks),
+            ChangeSet::Delta {
+                upserts,
+                deletes,
+                cursor,
+            } => {
+                return self.apply_delta(upserts, deletes, cursor, now_ms);
+            }
         };
         // Spec §5: the high-water mark is the maximum over the keys LIVE IN
         // THE SNAPSHOT, the stored mark, and quarantined files' keys — not
@@ -377,6 +392,55 @@ impl App {
             cached_by_uid.values(),
         )?;
         self.index.cache_tasks(&self.project, &cached)?;
+        Ok(report)
+    }
+
+    /// A delta is authoritative. The adoption and deletion grace periods exist
+    /// because a filesystem is ambiguous — a missing file might be deleted or
+    /// might be a sync tool mid-flight. A backend that tells you what changed
+    /// has no such ambiguity, so none of that machinery applies.
+    fn apply_delta(
+        &self,
+        upserts: Vec<Task>,
+        deletes: Vec<TaskUid>,
+        cursor: Cursor,
+        now_ms: i64,
+    ) -> Result<ReconcileReport, AppError> {
+        let mut report = ReconcileReport::default();
+
+        for uid in &deletes {
+            self.index.forget(&self.project, uid)?;
+            report.deleted += 1;
+        }
+
+        let prefix = self.backend.load_project()?.prefix;
+        if let Some(max) = upserts
+            .iter()
+            .filter(|t| t.key.prefix == prefix)
+            .map(|t| t.key.number)
+            .max()
+        {
+            self.index.bump_high_water(&self.project, max)?;
+        }
+
+        let entries: Vec<IndexEntry> = upserts
+            .iter()
+            .map(|t| IndexEntry {
+                uid: t.uid.clone(),
+                path: t.uid.as_str().to_string(),
+                revision: revision(t),
+                first_seen_ms: now_ms,
+            })
+            .collect();
+        self.index.apply(&self.project, &entries)?;
+        report.updated = upserts.len();
+
+        // Touch only what changed. `cache_tasks` replaces a whole project and
+        // would need every task re-read from the backend to rebuild — one
+        // query per cached task, which is worse than the single scan this
+        // path exists to avoid.
+        self.index.cache_upsert_tasks(&self.project, &upserts)?;
+        self.index.set_cursor(&self.project, &cursor)?;
         Ok(report)
     }
 
