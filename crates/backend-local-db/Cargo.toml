@@ -1,0 +1,12 @@
+[package]
+name = "cadet-backend-local-db"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cadet-core = { path = "../core" }
+rusqlite.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

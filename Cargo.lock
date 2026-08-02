@@ -205,6 +205,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadet-backend-local-db"
+version = "0.1.0"
+dependencies = [
+ "cadet-core",
+ "jiff",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "cadet-backend-markdown"
 version = "0.1.0"
 dependencies = [

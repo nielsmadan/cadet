@@ -8,7 +8,7 @@
 //! has an `assert_*` here, and `crates/core/tests/conformance.rs` proves the
 //! suite fails for a backend that gets them wrong.
 
-use crate::{Backend, BackendError, ChangeSet, Observed, Task, TaskUid};
+use crate::{Backend, BackendError, ChangeSet, Observed, Task, TaskKey, TaskUid};
 
 pub fn assert_scan_is_a_complete_snapshot(b: &dyn Backend) {
     match b.scan(None).unwrap() {
@@ -32,10 +32,24 @@ pub fn assert_stale_revision_is_rejected(b: &dyn Backend, mut task: Task) {
 }
 
 /// Round-trip CRUD. Compares every field a backend is responsible for
-/// persisting, not a sample of three: a backend that drops `due`, the tags,
-/// the custom fields or the body round-trips "successfully" under a weaker
-/// check while losing user data on every write.
-pub fn assert_round_trip(b: &dyn Backend, task: Task) {
+/// persisting: `uid`, `key`, `title`, `state`, `created`, `due`, `priority`,
+/// `tags`, custom `fields`, `body`, `renumbered_from` and
+/// `possible_duplicate_of` — not a sample of three. A backend that drops any
+/// one of them round-trips "successfully" under a weaker check while losing
+/// user data on every write.
+///
+/// `renumbered_from` and `possible_duplicate_of` are overwritten on `task`
+/// before the round trip regardless of what the caller passed in: leaving
+/// them at whatever a fixture happened to set (usually `None`) would let a
+/// backend that silently drops them pass every time every fixture in the
+/// suite left them unset.
+pub fn assert_round_trip(b: &dyn Backend, mut task: Task) {
+    task.renumbered_from = Some(TaskKey::new(
+        task.key.prefix.clone(),
+        task.key.number.wrapping_add(1),
+    ));
+    task.possible_duplicate_of = Some(TaskUid::generate());
+
     b.put(task.clone(), None).unwrap();
     let got = b
         .get(task.uid.clone())
@@ -45,6 +59,10 @@ pub fn assert_round_trip(b: &dyn Backend, task: Task) {
     assert_eq!(got.key, task.key, "key must survive a round trip");
     assert_eq!(got.title, task.title);
     assert_eq!(got.state, task.state);
+    assert_eq!(
+        got.created, task.created,
+        "created must survive a round trip"
+    );
     assert_eq!(got.due, task.due, "due must survive a round trip");
     assert_eq!(
         got.priority, task.priority,
@@ -54,6 +72,17 @@ pub fn assert_round_trip(b: &dyn Backend, task: Task) {
     assert_eq!(
         got.fields, task.fields,
         "custom fields must survive a round trip"
+    );
+    assert_eq!(got.body, task.body, "body must survive a round trip");
+    assert_eq!(
+        got.renumbered_from, task.renumbered_from,
+        "renumbered_from must survive a round trip — collision resolution \
+         writes it back through `put`, and losing it makes `cadet doctor`'s \
+         renumber bookkeeping permanently wrong"
+    );
+    assert_eq!(
+        got.possible_duplicate_of, task.possible_duplicate_of,
+        "possible_duplicate_of must survive a round trip"
     );
 }
 

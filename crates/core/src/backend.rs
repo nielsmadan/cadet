@@ -33,6 +33,8 @@ pub enum BackendError {
     NotFound,
     #[error("malformed task file at {path}: {reason}")]
     Malformed { path: String, reason: String },
+    #[error("this backend does not support {capability}")]
+    Unsupported { capability: String },
 }
 
 /// All parameters are by value: UniFFI cannot express references in foreign
