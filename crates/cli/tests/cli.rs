@@ -1527,3 +1527,83 @@ fn ls_state_filter_still_accepts_a_declared_state() {
         .success()
         .stdout(predicates::str::contains("no tasks"));
 }
+
+fn fill_with_notes(dir: &std::path::Path, n: usize) {
+    std::fs::create_dir_all(dir).unwrap();
+    for i in 0..n {
+        std::fs::write(dir.join(format!("note-{i}.md")), "hand written\n").unwrap();
+    }
+}
+
+/// `--path '~'` expands correctly and then makes every `.md` in the user's
+/// home directory a task. The expansion is fine; the consequence needs a
+/// gate. Refuses outside a TTY rather than prompting into a pipe.
+#[test]
+fn project_add_refuses_a_folder_already_full_of_notes() {
+    let h = harness();
+    let dir = h.root.path().join("bignotes");
+    fill_with_notes(&dir, 51);
+    h.cadet(&["project", "add", "big", "--path", dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("50"))
+        .stderr(predicates::str::contains("--yes"));
+    assert!(!dir.join("project.toml").exists(), "nothing may be written");
+}
+
+#[test]
+fn project_add_yes_overrides_the_many_notes_guard() {
+    let h = harness();
+    let dir = h.root.path().join("bignotes");
+    fill_with_notes(&dir, 51);
+    h.cadet(&[
+        "project",
+        "add",
+        "big",
+        "--path",
+        dir.to_str().unwrap(),
+        "--yes",
+    ])
+    .assert()
+    .success();
+    assert!(dir.join("project.toml").exists());
+}
+
+#[test]
+fn project_add_ignores_a_handful_of_notes() {
+    let h = harness();
+    let dir = h.root.path().join("smallnotes");
+    fill_with_notes(&dir, 3);
+    h.cadet(&["project", "add", "small", "--path", dir.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+/// A project's own task files must never make it un-re-registerable.
+#[test]
+fn re_adding_an_existing_project_is_not_blocked_by_its_own_notes() {
+    let h = project_harness();
+    fill_with_notes(h.vault.path(), 60);
+    h.cadet(&[
+        "project",
+        "add",
+        "proj",
+        "--path",
+        h.vault.path().to_str().unwrap(),
+        "--force",
+    ])
+    .assert()
+    .success();
+}
+
+/// The dot-entry skip has to match `FsBackend::markdown_files`, or the guard
+/// counts files adoption will never look at.
+#[test]
+fn the_many_notes_guard_ignores_dot_directories() {
+    let h = harness();
+    let dir = h.root.path().join("dotted");
+    fill_with_notes(&dir.join(".obsidian"), 60);
+    h.cadet(&["project", "add", "dotted", "--path", dir.to_str().unwrap()])
+        .assert()
+        .success();
+}

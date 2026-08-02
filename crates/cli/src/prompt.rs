@@ -34,10 +34,53 @@ pub fn ask_with<R: BufRead, W: Write>(
     })
 }
 
+pub fn confirm(question: &str) -> std::io::Result<bool> {
+    let stdin = std::io::stdin();
+    let mut r = stdin.lock();
+    let mut w = std::io::stderr();
+    confirm_with(&mut r, &mut w, question)
+}
+
+/// Anything but an explicit yes is a no, EOF included — this gate exists to
+/// stop an irreversible-feeling action, so silence must not consent.
+pub fn confirm_with<R: BufRead, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    question: &str,
+) -> std::io::Result<bool> {
+    write!(w, "  {question} [y/N] ")?;
+    w.flush()?;
+    let mut line = String::new();
+    r.read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn confirmed(input: &str) -> bool {
+        let mut r = Cursor::new(input.as_bytes().to_vec());
+        let mut w: Vec<u8> = vec![];
+        confirm_with(&mut r, &mut w, "go ahead?").unwrap()
+    }
+
+    #[test]
+    fn confirm_accepts_y_and_yes() {
+        assert!(confirmed("y\n"));
+        assert!(confirmed("YES\n"));
+    }
+
+    #[test]
+    fn confirm_defaults_to_no() {
+        assert!(!confirmed("\n"));
+        assert!(!confirmed(""));
+        assert!(!confirmed("maybe\n"));
+    }
 
     fn run(input: &str, label: &str, default: Option<&str>) -> (String, String) {
         let mut r = Cursor::new(input.as_bytes().to_vec());

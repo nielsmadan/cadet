@@ -19,6 +19,9 @@ pub enum ProjectCmd {
         /// Overwrite an existing project.toml at this path
         #[arg(long)]
         force: bool,
+        /// Use the path even when it already holds many notes
+        #[arg(long)]
+        yes: bool,
     },
     /// List configured projects
     Ls,
@@ -76,6 +79,42 @@ fn home_dir() -> Result<PathBuf, String> {
 pub fn resolve_path(raw: &str) -> Result<PathBuf, String> {
     let expanded = expand_tilde(raw)?;
     std::path::absolute(&expanded).map_err(|e| format!("could not resolve `{raw}`: {e}"))
+}
+
+/// Above this many existing notes, a folder is almost certainly somebody's
+/// whole document collection rather than an empty place for tasks.
+const MANY_NOTES: usize = 50;
+
+/// Counts markdown files under `root`, stopping as soon as `limit` is
+/// exceeded — the folder this guard exists to catch is `$HOME`, and a full
+/// walk of it is not something to do before printing a warning.
+///
+/// Mirrors `FsBackend::markdown_files` exactly, dot-entry skip included: a
+/// count that disagreed with what adoption actually sees would be worse
+/// than no count at all.
+fn count_markdown(root: &std::path::Path, limit: usize) -> usize {
+    let mut found = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                found += 1;
+                if found > limit {
+                    return found;
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The `project.toml` body to write for `id`/`name`/`prefix`.
@@ -160,7 +199,8 @@ pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
             prefix,
             name,
             force,
-        } => add(&mut reg, id, path, prefix, name, force),
+            yes,
+        } => add(&mut reg, id, path, prefix, name, force, yes),
     }
 }
 
@@ -194,6 +234,7 @@ fn add(
     prefix: Option<String>,
     name: Option<String>,
     force: bool,
+    yes: bool,
 ) -> Result<(), String> {
     let interactive = prompt::is_interactive();
 
@@ -245,6 +286,34 @@ fn add(
     let existing = existing_src
         .as_deref()
         .and_then(|body| ProjectConfig::parse(body).ok());
+    // `--path '~'` expands correctly and then roots a project at the user's
+    // home directory, where every `.md` underneath becomes an adoption
+    // candidate. `~` and `~/` are plausible things to type, so the
+    // consequence gets a gate. Skipped when the folder is already a cadet
+    // project: its own task files are exactly what we would be counting.
+    if existing_src.is_none() {
+        let found = count_markdown(&root, MANY_NOTES);
+        if found > MANY_NOTES {
+            let question = format!(
+                "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Use it anyway?",
+                root.display()
+            );
+            let approved = if yes {
+                true
+            } else if interactive {
+                prompt::confirm(&question).map_err(|e| e.to_string())?
+            } else {
+                false
+            };
+            if !approved {
+                return Err(format!(
+                    "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Point --path at a subfolder, or pass --yes to use it anyway.",
+                    root.display()
+                ));
+            }
+        }
+    }
+
     let default_prefix = existing
         .as_ref()
         .map(|c| c.prefix.clone())
@@ -415,6 +484,35 @@ type = "int"
     fn render_supplies_a_project_table_when_the_existing_one_has_none() {
         let got = render_project_toml(Some("[workflow]\nstates = [\"a\"]\n"), "x", "X", "XX");
         assert!(got.contains(r#"prefix = "XX""#), "{got}");
+    }
+
+    #[test]
+    fn count_markdown_stops_once_the_limit_is_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("n{i}.md")), "x").unwrap();
+        }
+        assert_eq!(count_markdown(dir.path(), 3), 4);
+        assert_eq!(count_markdown(dir.path(), 100), 10);
+    }
+
+    #[test]
+    fn count_markdown_recurses_but_skips_dot_entries_and_other_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::write(dir.path().join("a.md"), "x").unwrap();
+        std::fs::write(dir.path().join("sub/b.md"), "x").unwrap();
+        std::fs::write(dir.path().join("sub/c.txt"), "x").unwrap();
+        std::fs::write(dir.path().join(".hidden/d.md"), "x").unwrap();
+        std::fs::write(dir.path().join(".e.md"), "x").unwrap();
+        assert_eq!(count_markdown(dir.path(), 100), 2);
+    }
+
+    #[test]
+    fn count_markdown_of_a_missing_folder_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_markdown(&dir.path().join("nope"), 100), 0);
     }
 
     #[test]
