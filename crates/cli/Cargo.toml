@@ -14,7 +14,6 @@ cadet-backend-fs = { path = "../backend-fs" }
 cadet-store-sqlite = { path = "../store-sqlite" }
 clap.workspace = true
 miette.workspace = true
-directories.workspace = true
 toml_edit.workspace = true
 jiff.workspace = true
 

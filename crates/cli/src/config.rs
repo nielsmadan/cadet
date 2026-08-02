@@ -10,6 +10,35 @@ pub fn env_project() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// A directory named by an environment variable. A blank or whitespace-only
+/// value counts as unset — `CADET_HOME=` left in a shell profile means "no
+/// override", not "put the registry in the current working directory". Same
+/// rule `env_project` applies, for the same reason.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Split out from `home` so it is testable without mutating process
+/// environment, which is `unsafe` in edition 2024 and racy under a parallel
+/// test runner.
+fn resolve_home(
+    cadet_home: Option<PathBuf>,
+    xdg_config: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(h) = cadet_home {
+        return h;
+    }
+    if let Some(x) = xdg_config {
+        return x.join("cadet");
+    }
+    home.map(|h| h.join(".config").join("cadet"))
+        .unwrap_or_else(|| PathBuf::from(".cadet"))
+}
+
 /// The one piece of local state that is NOT disposable: it is how a fresh
 /// install finds your data (spec §3).
 #[derive(Debug, Clone)]
@@ -33,13 +62,19 @@ pub struct Project {
 }
 
 impl Registry {
+    /// `CADET_HOME`, then `$XDG_CONFIG_HOME/cadet`, then `~/.config/cadet`.
+    ///
+    /// Deliberately not `directories::ProjectDirs`, which implements Apple's
+    /// HIG and resolves to `~/Library/Application Support/cadet` on macOS —
+    /// correct for a GUI app, wrong for a CLI. `git`, `gh`, `starship` and
+    /// `helix` all use `~/.config` on every platform, and that is where a
+    /// user looks for a file they might hand-edit.
     pub fn home() -> PathBuf {
-        if let Ok(h) = std::env::var("CADET_HOME") {
-            return PathBuf::from(h);
-        }
-        directories::ProjectDirs::from("", "", "cadet")
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".cadet"))
+        resolve_home(
+            env_dir("CADET_HOME"),
+            env_dir("XDG_CONFIG_HOME"),
+            std::env::home_dir(),
+        )
     }
 
     fn file(root: &Path) -> PathBuf {
@@ -520,5 +555,48 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
+    }
+
+    #[test]
+    fn cadet_home_wins_over_everything() {
+        assert_eq!(
+            resolve_home(
+                Some(PathBuf::from("/explicit")),
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            PathBuf::from("/explicit")
+        );
+    }
+
+    #[test]
+    fn xdg_config_home_is_used_when_cadet_home_is_unset() {
+        assert_eq!(
+            resolve_home(
+                None,
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/u"))
+            ),
+            PathBuf::from("/xdg/cadet")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_dot_config_under_home() {
+        assert_eq!(
+            resolve_home(None, None, Some(PathBuf::from("/home/u"))),
+            PathBuf::from("/home/u/.config/cadet")
+        );
+    }
+
+    #[test]
+    fn with_no_home_at_all_it_stays_relative_rather_than_guessing() {
+        assert_eq!(resolve_home(None, None, None), PathBuf::from(".cadet"));
+    }
+
+    #[test]
+    fn a_blank_env_var_counts_as_unset() {
+        // `CADET_HOME=` in a shell profile must not put the registry in $PWD.
+        assert_eq!(env_dir("CADET_HOME_DEFINITELY_UNSET_XYZ"), None);
     }
 }
