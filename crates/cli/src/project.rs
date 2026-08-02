@@ -1,5 +1,5 @@
 use crate::TEMPLATE;
-use crate::config::{Project, Registry};
+use crate::config::{BackendKind, Project, Registry};
 use crate::prompt;
 use cadet_core::ProjectConfig;
 use clap::Subcommand;
@@ -370,6 +370,7 @@ fn add(
     reg.upsert_project(Project {
         id: id.clone(),
         path: root.clone(),
+        backend: BackendKind::Markdown,
     });
     if reg.default.is_none() {
         reg.default = Some(id.clone());

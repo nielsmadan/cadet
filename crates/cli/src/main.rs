@@ -3,11 +3,12 @@ mod project;
 mod prompt;
 
 use cadet_app::{App, GitNet, RejectReason, TaskChanges, TaskDraft};
+use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
-use cadet_core::{Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like};
+use cadet_core::{Backend, Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like};
 use cadet_store_sqlite::SqliteIndex;
 use clap::{Parser, Subcommand};
-use config::{Project, Registry};
+use config::{BackendKind, Project, Registry};
 
 #[derive(Parser)]
 #[command(name = "cadet", version, about = "Tasks that live in your files")]
@@ -145,11 +146,17 @@ fn main() -> std::process::ExitCode {
 }
 
 fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Error>> {
-    let backend = MarkdownBackend::new(p.path.clone());
     let index = SqliteIndex::open(&reg.index_path())?;
-    let git = GitNet::new(reg.repo_dir(&p.id), p.path.clone());
-    git.ensure_init()?;
-    Ok(App::new(Box::new(backend), index, Some(git), p.id.clone()))
+    let (backend, git): (Box<dyn Backend>, Option<GitNet>) = match p.backend {
+        BackendKind::Markdown => {
+            let git = GitNet::new(reg.repo_dir(&p.id), p.path.clone());
+            git.ensure_init()?;
+            (Box::new(MarkdownBackend::new(p.path.clone())), Some(git))
+        }
+        // No work tree, so nothing for git to hold.
+        BackendKind::LocalDb => (Box::new(LocalDbBackend::open(&p.path)?), None),
+    };
+    Ok(App::new(backend, index, git, p.id.clone()))
 }
 
 fn parse_key(app: &App, raw: &str) -> Result<TaskKey, Box<dyn std::error::Error>> {

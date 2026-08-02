@@ -11,6 +11,7 @@ path = "src/main.rs"
 cadet-core = { path = "../core" }
 cadet-app = { path = "../app" }
 cadet-backend-markdown = { path = "../backend-markdown" }
+cadet-backend-local-db = { path = "../backend-local-db" }
 cadet-store-sqlite = { path = "../store-sqlite" }
 clap.workspace = true
 miette.workspace = true

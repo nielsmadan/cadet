@@ -55,10 +55,41 @@ pub struct Registry {
     doc: Option<toml_edit::DocumentMut>,
 }
 
+/// Which backend a project's data lives in. Absent in the file means
+/// `Markdown` — the only backend that existed before this field did, so a
+/// registry with no `backend` key must keep working untouched. An
+/// unrecognised value is a loud error rather than a silent default: pointing
+/// a local-db project at a directory that does not exist reports a
+/// confusing I/O error instead of the real problem (spec §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    #[default]
+    Markdown,
+    LocalDb,
+}
+
+impl BackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendKind::Markdown => "markdown",
+            BackendKind::LocalDb => "local-db",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "markdown" => Some(BackendKind::Markdown),
+            "local-db" => Some(BackendKind::LocalDb),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Project {
     pub id: String,
     pub path: PathBuf,
+    pub backend: BackendKind,
 }
 
 impl Registry {
@@ -130,9 +161,22 @@ impl Registry {
         if let Some(tbl) = doc.get("projects").and_then(|p| p.as_table_like()) {
             for (id, item) in tbl.iter() {
                 if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
+                    let backend = match item.get("backend").and_then(|v| v.as_str()) {
+                        None => BackendKind::Markdown,
+                        Some(raw) => BackendKind::parse(raw).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "project `{id}` in {}: unknown backend `{raw}` — expected `markdown` or `local-db`",
+                                    path.display()
+                                ),
+                            )
+                        })?,
+                    };
                     reg.projects.push(Project {
                         id: id.to_string(),
                         path: PathBuf::from(p),
+                        backend,
                     });
                 }
             }
@@ -218,10 +262,12 @@ impl Registry {
             match projects.get_mut(&p.id).and_then(|item| item.as_table_mut()) {
                 Some(existing) => {
                     existing["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
+                    existing["backend"] = toml_edit::value(p.backend.as_str());
                 }
                 None => {
                     let mut entry = toml_edit::Table::new();
                     entry["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
+                    entry["backend"] = toml_edit::value(p.backend.as_str());
                     projects.insert(&p.id, toml_edit::Item::Table(entry));
                 }
             }
@@ -337,6 +383,7 @@ mod tests {
             vec![Project {
                 id: "personal".into(),
                 path: awkward.clone(),
+                backend: BackendKind::Markdown,
             }],
             Some("personal"),
         )
@@ -357,6 +404,7 @@ mod tests {
             vec![Project {
                 id: "my project".into(),
                 path: PathBuf::from("/tmp/v"),
+                backend: BackendKind::Markdown,
             }],
             None,
         )
@@ -377,10 +425,12 @@ mod tests {
                 Project {
                     id: "p".into(),
                     path: PathBuf::from("/old"),
+                    backend: BackendKind::Markdown,
                 },
                 Project {
                     id: "p".into(),
                     path: PathBuf::from("/new"),
+                    backend: BackendKind::Markdown,
                 },
             ],
             None,
@@ -411,10 +461,12 @@ mod tests {
         reg.upsert_project(Project {
             id: "a".into(),
             path: "/tmp/a".into(),
+            backend: BackendKind::Markdown,
         });
         reg.upsert_project(Project {
             id: "b".into(),
             path: "/tmp/b".into(),
+            backend: BackendKind::Markdown,
         });
         reg.set_default("a").unwrap();
 
@@ -430,6 +482,7 @@ mod tests {
         reg.upsert_project(Project {
             id: "only".into(),
             path: "/tmp/only".into(),
+            backend: BackendKind::Markdown,
         });
         reg.set_default("only").unwrap();
         assert!(reg.remove_project("only"));
@@ -458,6 +511,7 @@ mod tests {
         reg.upsert_project(Project {
             id: "odd".into(),
             path: odd.clone(),
+            backend: BackendKind::Markdown,
         });
         reg.save().unwrap();
         let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
@@ -477,6 +531,7 @@ mod tests {
             vec![Project {
                 id: "a".into(),
                 path: "/tmp/a".into(),
+                backend: BackendKind::Markdown,
             }],
             Some("a"),
         )
@@ -507,6 +562,7 @@ mod tests {
         reg.upsert_project(Project {
             id: "a".into(),
             path: "/tmp/a-new".into(),
+            backend: BackendKind::Markdown,
         });
         reg.save().unwrap();
 
@@ -543,6 +599,7 @@ mod tests {
             vec![Project {
                 id: "a".into(),
                 path: "/tmp/a".into(),
+                backend: BackendKind::Markdown,
             }],
             Some("a"),
         )
@@ -598,5 +655,51 @@ mod tests {
     fn a_blank_env_var_counts_as_unset() {
         // `CADET_HOME=` in a shell profile must not put the registry in $PWD.
         assert_eq!(env_dir("CADET_HOME_DEFINITELY_UNSET_XYZ"), None);
+    }
+
+    #[test]
+    fn a_project_with_no_backend_key_defaults_to_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default = \"a\"\n\n[projects.a]\npath = \"/tmp/a\"\n",
+        )
+        .unwrap();
+        let reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reg.projects[0].backend, BackendKind::Markdown);
+    }
+
+    #[test]
+    fn the_backend_kind_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        reg.upsert_project(Project {
+            id: "scratch".into(),
+            path: "/tmp/scratch.db".into(),
+            backend: BackendKind::LocalDb,
+        });
+        reg.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains("backend = \"local-db\""), "{raw}");
+
+        let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(again.projects[0].backend, BackendKind::LocalDb);
+    }
+
+    #[test]
+    fn an_unknown_backend_kind_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[projects.a]\npath = \"/tmp/a\"\nbackend = \"telepathy\"\n",
+        )
+        .unwrap();
+        let err = Registry::load_from(dir.path().to_path_buf()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("telepathy"),
+            "the error must name the value: {msg}"
+        );
     }
 }

@@ -232,6 +232,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "cadet-app",
+ "cadet-backend-local-db",
  "cadet-backend-markdown",
  "cadet-core",
  "cadet-store-sqlite",
