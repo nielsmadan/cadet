@@ -1925,3 +1925,186 @@ fn a_markdown_and_a_local_db_project_coexist_with_separate_key_spaces() {
         .success()
         .stdout(predicates::str::contains("S-1"));
 }
+
+/// Directory-associated projects: a command run from inside a configured
+/// directory selects that project without `--project`.
+#[test]
+fn a_configured_directory_selects_its_project() {
+    let h = harness();
+    h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let repo = h.root.path().join("code").join("cadet");
+    std::fs::create_dir_all(repo.join("crates").join("cli")).unwrap();
+    h.cadet(&["project", "add", "general", "--prefix", "GEN"])
+        .assert()
+        .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "cadet",
+        "--prefix",
+        "CAD",
+        "--dir",
+        repo.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let mut from_repo = h.cadet(&["add", "inside"]);
+    from_repo.current_dir(&repo);
+    from_repo
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("CAD-1"))
+        .stderr(predicates::str::contains("cwd matches"));
+
+    // A subdirectory counts: configuring a repo root covers everything in it.
+    let mut nested = h.cadet(&["add", "nested"]);
+    nested.current_dir(repo.join("crates").join("cli"));
+    nested
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("CAD-2"));
+
+    // Anywhere else still gets the default.
+    let mut outside = h.cadet(&["add", "elsewhere"]);
+    outside.current_dir(h.home.path());
+    outside
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("GEN-1"))
+        .stderr(predicates::str::contains("cwd matches").not());
+}
+
+/// An explicit selector always beats a directory the user merely happens to
+/// be standing in.
+#[test]
+fn a_flag_and_the_env_var_both_beat_a_matching_directory() {
+    let h = harness();
+    h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let repo = h.root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    h.cadet(&["project", "add", "general", "--prefix", "GEN"])
+        .assert()
+        .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "cadet",
+        "--prefix",
+        "CAD",
+        "--dir",
+        repo.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let mut flagged = h.cadet(&["--project", "general", "add", "by flag"]);
+    flagged.current_dir(&repo);
+    flagged
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("GEN-1"));
+
+    let mut env = h.cadet(&["add", "by env"]);
+    env.current_dir(&repo).env("CADET_PROJECT", "general");
+    env.assert()
+        .success()
+        .stdout(predicates::str::contains("GEN-2"));
+}
+
+/// Two projects claiming the same directory is ambiguous. Guessing would
+/// silently write into the wrong one.
+#[test]
+fn two_projects_claiming_one_directory_is_an_error_naming_both() {
+    let h = harness();
+    h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let repo = h.root.path().join("shared");
+    std::fs::create_dir_all(&repo).unwrap();
+    for id in ["alpha", "beta"] {
+        h.cadet(&[
+            "project",
+            "add",
+            id,
+            "--prefix",
+            &id[..3].to_uppercase(),
+            "--dir",
+            repo.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    }
+    let mut ambiguous = h.cadet(&["add", "which one"]);
+    ambiguous.current_dir(&repo);
+    ambiguous.assert().failure().stderr(
+        predicates::str::contains("alpha")
+            .and(predicates::str::contains("beta"))
+            .and(predicates::str::contains("more than one project")),
+    );
+}
+
+/// `project dirs` inspects and edits the list, and `project which` reports
+/// the same answer the real commands act on.
+#[test]
+fn project_dirs_round_trips_and_which_reports_the_source() {
+    let h = harness();
+    h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let repo = h.root.path().join("later");
+    std::fs::create_dir_all(&repo).unwrap();
+    h.cadet(&["project", "add", "solo", "--prefix", "SOL"])
+        .assert()
+        .success();
+
+    h.cadet(&["project", "dirs", "solo"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("(none)"));
+
+    h.cadet(&["project", "dirs", "solo", "--add", repo.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let mut which = h.cadet(&["project", "which"]);
+    which.current_dir(&repo);
+    which
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("solo").and(predicates::str::contains("cwd matches")));
+
+    h.cadet(&["project", "dirs", "solo", "--rm", repo.to_str().unwrap()])
+        .assert()
+        .success();
+    h.cadet(&["project", "dirs", "solo"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("(none)"));
+}
+
+/// A registry that configures no directories must behave exactly as before —
+/// no note, no change in selection.
+#[test]
+fn a_registry_with_no_directories_behaves_as_it_always_did() {
+    let h = harness();
+    h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
+        .assert()
+        .success();
+    h.cadet(&["project", "add", "only", "--prefix", "ONL"])
+        .assert()
+        .success();
+    let mut add = h.cadet(&["add", "a task"]);
+    add.current_dir(h.root.path());
+    add.assert()
+        .success()
+        .stdout(predicates::str::contains("ONL-1"))
+        .stderr(predicates::str::contains("cwd matches").not());
+    // And the stored registry gains no `dirs` key at all.
+    let raw = std::fs::read_to_string(h.home.path().join("config.toml")).unwrap();
+    assert!(!raw.contains("dirs"), "{raw}");
+}

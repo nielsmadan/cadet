@@ -10,6 +10,22 @@ pub fn env_project() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Writes `dirs` into a project table, or removes the key when there are none.
+/// Shared by `save`'s two branches — the existing-table and new-table paths —
+/// because writing this twice is how a `dirs = []` gets left behind in one of
+/// them and not the other.
+fn write_dirs(tbl: &mut toml_edit::Table, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        tbl.remove("dirs");
+        return;
+    }
+    let mut arr = toml_edit::Array::new();
+    for d in dirs {
+        arr.push(d.to_string_lossy().as_ref());
+    }
+    tbl["dirs"] = toml_edit::value(arr);
+}
+
 /// A directory named by an environment variable. A blank or whitespace-only
 /// value counts as unset — `CADET_HOME=` left in a shell profile means "no
 /// override", not "put the registry in the current working directory". Same
@@ -90,6 +106,11 @@ pub struct Project {
     pub id: String,
     pub path: PathBuf,
     pub backend: BackendKind,
+    /// Directories whose contents belong to this project, as glob patterns.
+    /// A command run from a matching directory selects this project without
+    /// `--project`. Empty for every project that has never configured one,
+    /// which is what keeps an existing registry behaving exactly as before.
+    pub dirs: Vec<PathBuf>,
 }
 
 impl Project {
@@ -188,10 +209,21 @@ impl Registry {
                             )
                         })?,
                     };
+                    let dirs = item
+                        .get("dirs")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(PathBuf::from)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     reg.projects.push(Project {
                         id: id.to_string(),
                         path: PathBuf::from(p),
                         backend,
+                        dirs,
                     });
                 }
             }
@@ -278,11 +310,13 @@ impl Registry {
                 Some(existing) => {
                     existing["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
                     existing["backend"] = toml_edit::value(p.backend.as_str());
+                    write_dirs(existing, &p.dirs);
                 }
                 None => {
                     let mut entry = toml_edit::Table::new();
                     entry["path"] = toml_edit::value(p.path.to_string_lossy().as_ref());
                     entry["backend"] = toml_edit::value(p.backend.as_str());
+                    write_dirs(&mut entry, &p.dirs);
                     projects.insert(&p.id, toml_edit::Item::Table(entry));
                 }
             }
@@ -399,6 +433,7 @@ mod tests {
                 id: "personal".into(),
                 path: awkward.clone(),
                 backend: BackendKind::Markdown,
+                dirs: vec![],
             }],
             Some("personal"),
         )
@@ -420,6 +455,7 @@ mod tests {
                 id: "my project".into(),
                 path: PathBuf::from("/tmp/v"),
                 backend: BackendKind::Markdown,
+                dirs: vec![],
             }],
             None,
         )
@@ -441,11 +477,13 @@ mod tests {
                     id: "p".into(),
                     path: PathBuf::from("/old"),
                     backend: BackendKind::Markdown,
+                    dirs: vec![],
                 },
                 Project {
                     id: "p".into(),
                     path: PathBuf::from("/new"),
                     backend: BackendKind::Markdown,
+                    dirs: vec![],
                 },
             ],
             None,
@@ -477,11 +515,13 @@ mod tests {
             id: "a".into(),
             path: "/tmp/a".into(),
             backend: BackendKind::Markdown,
+            dirs: vec![],
         });
         reg.upsert_project(Project {
             id: "b".into(),
             path: "/tmp/b".into(),
             backend: BackendKind::Markdown,
+            dirs: vec![],
         });
         reg.set_default("a").unwrap();
 
@@ -498,6 +538,7 @@ mod tests {
             id: "only".into(),
             path: "/tmp/only".into(),
             backend: BackendKind::Markdown,
+            dirs: vec![],
         });
         reg.set_default("only").unwrap();
         assert!(reg.remove_project("only"));
@@ -527,6 +568,7 @@ mod tests {
             id: "odd".into(),
             path: odd.clone(),
             backend: BackendKind::Markdown,
+            dirs: vec![],
         });
         reg.save().unwrap();
         let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
@@ -547,6 +589,7 @@ mod tests {
                 id: "a".into(),
                 path: "/tmp/a".into(),
                 backend: BackendKind::Markdown,
+                dirs: vec![],
             }],
             Some("a"),
         )
@@ -578,6 +621,7 @@ mod tests {
             id: "a".into(),
             path: "/tmp/a-new".into(),
             backend: BackendKind::Markdown,
+            dirs: vec![],
         });
         reg.save().unwrap();
 
@@ -615,6 +659,7 @@ mod tests {
                 id: "a".into(),
                 path: "/tmp/a".into(),
                 backend: BackendKind::Markdown,
+                dirs: vec![],
             }],
             Some("a"),
         )
@@ -692,6 +737,7 @@ mod tests {
             id: "scratch".into(),
             path: "/tmp/scratch.db".into(),
             backend: BackendKind::LocalDb,
+            dirs: vec![],
         });
         reg.save().unwrap();
 

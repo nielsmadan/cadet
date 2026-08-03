@@ -48,7 +48,24 @@ pub enum ProjectCmd {
         /// Use the path even when it already holds many notes
         #[arg(long)]
         yes: bool,
+        /// A directory whose contents belong to this project. Running cadet
+        /// from inside it selects this project automatically. Repeatable;
+        /// `*` matches within one path segment, `**` across segments.
+        #[arg(long = "dir")]
+        dirs: Vec<String>,
     },
+    /// Show or change the directories that select a project
+    Dirs {
+        id: String,
+        /// Add a directory pattern. Repeatable.
+        #[arg(long = "add")]
+        add: Vec<String>,
+        /// Remove a directory pattern by its exact stored value. Repeatable.
+        #[arg(long = "rm")]
+        rm: Vec<String>,
+    },
+    /// Report which project the current directory selects, and why
+    Which,
     /// List configured projects
     Ls,
     /// Set the default project
@@ -175,6 +192,8 @@ pub fn render_project_toml(existing: Option<&str>, id: &str, name: &str, prefix:
 pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
     match cmd {
         ProjectCmd::Ls => list(&reg),
+        ProjectCmd::Dirs { id, add, rm } => dirs_cmd(&mut reg, &id, &add, &rm),
+        ProjectCmd::Which => which(&reg),
         ProjectCmd::Root { path } => match path {
             None => {
                 match reg.project_root() {
@@ -228,6 +247,7 @@ pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
             name,
             force,
             yes,
+            dirs,
         } => add(
             &mut reg,
             NewProject {
@@ -238,6 +258,7 @@ pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
                 name,
                 force,
                 yes,
+                dirs,
             },
         ),
     }
@@ -254,6 +275,65 @@ struct NewProject {
     name: Option<String>,
     force: bool,
     yes: bool,
+    dirs: Vec<String>,
+}
+
+/// Two new subcommands and a listing line, all reading the same `dirs`
+/// field — `which` deliberately calls `dirmatch::resolve` rather than
+/// re-deriving precedence, so what it reports is what actually happens.
+fn dirs_cmd(reg: &mut Registry, id: &str, add: &[String], rm: &[String]) -> Result<(), String> {
+    let mut project = reg.find(id).cloned().ok_or_else(|| {
+        format!(
+            "unknown project `{id}` — configured project(s): {}",
+            reg.known_projects()
+        )
+    })?;
+
+    if add.is_empty() && rm.is_empty() {
+        if project.dirs.is_empty() {
+            println!("(none)");
+        }
+        for d in &project.dirs {
+            println!("{}", d.display());
+        }
+        return Ok(());
+    }
+
+    for pattern in rm {
+        let want = resolve_path(pattern)?;
+        let before = project.dirs.len();
+        project.dirs.retain(|d| d != &want);
+        if project.dirs.len() == before {
+            return Err(format!(
+                "`{}` is not a directory of `{id}` — run `cadet project dirs {id}` to see them",
+                want.display()
+            ));
+        }
+    }
+    for pattern in add {
+        let want = resolve_path(pattern)?;
+        if !project.dirs.contains(&want) {
+            project.dirs.push(want);
+        }
+    }
+
+    let n = project.dirs.len();
+    reg.upsert_project(project);
+    reg.save().map_err(|e| e.to_string())?;
+    println!(
+        "`{id}` now has {n} director{}",
+        if n == 1 { "y" } else { "ies" }
+    );
+    Ok(())
+}
+
+fn which(reg: &Registry) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // The same resolver the real commands use, so this cannot report one
+    // thing while `cadet add` does another.
+    let sel = crate::dirmatch::resolve(reg, None, &cwd)?;
+    println!("{}  ({})", sel.project.id, sel.source.describe());
+    Ok(())
 }
 
 fn list(reg: &Registry) -> Result<(), String> {
@@ -273,6 +353,9 @@ fn list(reg: &Registry) -> Result<(), String> {
             p.backend.as_str(),
             p.path.display()
         );
+        for d in &p.dirs {
+            println!("{:<24}dir: {}", "", d.display());
+        }
     }
     Ok(())
 }
@@ -293,7 +376,14 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
         name,
         force,
         yes,
+        dirs,
     } = new;
+    // Stored absolute and tilde-expanded, exactly like `path` — one
+    // expansion rule, applied once at write time rather than on every match.
+    let resolved_dirs: Vec<std::path::PathBuf> = dirs
+        .iter()
+        .map(|d| resolve_path(d))
+        .collect::<Result<_, _>>()?;
     let interactive = prompt::is_interactive();
 
     // Resolved before anything else that follows: it changes what the path
@@ -353,6 +443,7 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
         id: id.clone(),
         path: root.clone(),
         backend,
+        dirs: vec![],
     }
     .config_path();
 
@@ -482,6 +573,7 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
         id: id.clone(),
         path: root.clone(),
         backend,
+        dirs: resolved_dirs.clone(),
     });
     if reg.default.is_none() {
         reg.default = Some(id.clone());

@@ -1,4 +1,5 @@
 mod config;
+mod dirmatch;
 mod project;
 mod prompt;
 
@@ -500,32 +501,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return project::run(cmd, reg).map_err(Into::into);
     }
 
-    // `--project` and `CADET_PROJECT` are one selector, so they get one
-    // lookup and one error. The env spelling used to fall through to "no
-    // default project set", which is false whenever a default *is* set and
-    // sends the user to fix the wrong thing.
-    let requested = match cli.project.as_deref() {
-        Some(id) => Some((id.to_string(), "")),
-        None => config::env_project().map(|id| (id, " (from CADET_PROJECT)")),
-    };
-    let project = match requested {
-        Some((id, source)) => reg.find(&id).cloned().ok_or_else(|| {
-            format!(
-                "unknown project `{id}`{source} — configured project(s): {}",
-                reg.known_projects()
-            )
-        })?,
-        None => reg.default_project().cloned().ok_or_else(|| {
-            if reg.projects.is_empty() {
-                "no project configured — run `cadet project add <id>`".to_string()
-            } else {
-                format!(
-                    "no default project set — pass --project or set one, configured project(s): {}",
-                    reg.known_projects()
-                )
-            }
-        })?,
-    };
+    // One resolver, shared with `cadet project which`, so the precedence
+    // rule exists once. `--project` and `CADET_PROJECT` are one selector and
+    // get one error: the env spelling used to fall through to "no default
+    // project set", which is false whenever a default *is* set and sends the
+    // user to fix the wrong thing.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let selection = dirmatch::resolve(&reg, cli.project.as_deref(), &cwd)?;
+    if let dirmatch::Source::Dir(pattern) = &selection.source {
+        eprintln!(
+            "note: selected `{}` — cwd matches `{}`",
+            selection.project.id,
+            pattern.display()
+        );
+    }
+    let project = selection.project;
     let app = open_app(&reg, &project)?;
 
     let now = jiff_now_ms();
