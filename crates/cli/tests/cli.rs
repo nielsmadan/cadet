@@ -880,6 +880,40 @@ fn tag_flag_trims_whitespace() {
         .stdout(predicates::str::contains("spaced"));
 }
 
+/// The other half of the same rule: `--set tags=a,,b` drops an empty item,
+/// so `--tag ""` must not quietly store one. It also split the backends —
+/// markdown drops an empty tag on the way back out of frontmatter, local-db
+/// keeps it.
+#[test]
+fn tag_flag_rejects_an_empty_tag() {
+    let h = project_harness();
+    h.cadet(&["add", "x", "--tag", "  "])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("empty"));
+}
+
+/// `--set title=` trims and the positional title did not, so the same field
+/// had two spellings that disagreed — and the padded version then stored
+/// differently on each backend, since a frontmatter scalar reads back trimmed
+/// and a database column keeps every space. On a local-db project only, which
+/// is where the difference is visible: markdown launders the padding away on
+/// the read-back that fills the cache, so it cannot see this at all.
+/// `show <prefix>` matches on the title, so it finds this task only if the
+/// padding never reached the store.
+#[test]
+fn a_padded_positional_title_is_trimmed_like_set_title_is() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["add", "   spaced out   "]).assert().success();
+    h.cadet(&["show", "spaced"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("spaced out"));
+}
+
 #[test]
 fn tag_flag_rejects_an_embedded_comma() {
     let h = project_harness();
@@ -902,6 +936,54 @@ fn tag_flag_and_set_tags_agree_on_two_tags() {
         .assert()
         .success()
         .stdout(predicates::str::contains("viaflags").and(predicates::str::contains("viaset")));
+}
+
+/// Review finding 2, the twentieth instance of the signature defect.
+/// `parse_field_value` rejects a newline in a custom field value because
+/// frontmatter is line-oriented and a newline is an injection vector. A title
+/// goes into the same frontmatter, and had no guard: `title: two\nlines`
+/// writes an orphan frontmatter line and `cadet show` reads the title back as
+/// `two`, with the rest unrecoverable. Every route that sets a title is
+/// covered, because the one that is not is the one a user finds.
+#[test]
+fn a_newline_in_a_title_is_rejected_for_every_route_that_sets_one() {
+    let h = project_harness();
+    for args in [
+        vec!["add", "two\nlines"],
+        vec!["add", "--set", "title=two\nlines"],
+    ] {
+        h.cadet(&args)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("title").and(predicates::str::contains("newline")));
+    }
+    h.cadet(&["add", "settable"]).assert().success();
+    h.cadet(&["set", "T-1", "title=two\nlines"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("title").and(predicates::str::contains("newline")));
+
+    // Nothing may have landed on the way out.
+    h.cadet(&["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("lines").not());
+}
+
+/// The same input must be rejected on a local-db project too, even though
+/// that backend stores a multi-line title perfectly well. A CLI where `add`
+/// succeeds on one project and fails on another for the same input is worse
+/// than losing a capability nobody wants.
+#[test]
+fn a_newline_in_a_title_is_rejected_on_a_local_db_project_too() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["add", "two\nlines"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("title").and(predicates::str::contains("newline")));
 }
 
 /// Also-do: `add --set due=` with a bad value should give the CLI's date

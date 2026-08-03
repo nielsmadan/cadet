@@ -9,13 +9,28 @@ fn wrong(field: &str, expected: &str) -> CoreError {
     }
 }
 
+/// Rejects a line break in a value that has to occupy exactly one line.
+///
+/// Frontmatter is line-oriented: a value carrying a newline does not merely
+/// render badly, it ends the entry and turns the remainder into its own
+/// frontmatter line — an orphan at best, and an injected key (`estimate: 999`)
+/// at worst, with everything after the break lost from the value forever.
+///
+/// The single copy of that rule. `parse_field_value` applies it to every
+/// single-line field type, and the CLI applies it to a task's title, which
+/// lands in the same frontmatter block through a different door.
+pub fn reject_newlines(field: &str, value: &str) -> Result<(), CoreError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(wrong(field, "text without newlines"));
+    }
+    Ok(())
+}
+
 pub fn parse_field_value(def: &FieldDef, raw: &str) -> Result<FieldValue, CoreError> {
     let v = raw.trim();
     Ok(match &def.ty {
         FieldType::Str | FieldType::Text => {
-            if v.contains('\n') || v.contains('\r') {
-                return Err(wrong(&def.name, "text without newlines"));
-            }
+            reject_newlines(&def.name, v)?;
             FieldValue::Str(v.to_string())
         }
         FieldType::Int => {
@@ -40,9 +55,7 @@ pub fn parse_field_value(def: &FieldDef, raw: &str) -> Result<FieldValue, CoreEr
             FieldValue::Date(v.to_string())
         }
         FieldType::Enum(choices) => {
-            if v.contains('\n') || v.contains('\r') {
-                return Err(wrong(&def.name, "text without newlines"));
-            }
+            reject_newlines(&def.name, v)?;
             if choices.iter().any(|c| c == v) {
                 FieldValue::Str(v.to_string())
             } else {
@@ -50,9 +63,7 @@ pub fn parse_field_value(def: &FieldDef, raw: &str) -> Result<FieldValue, CoreEr
             }
         }
         FieldType::ListStr => {
-            if v.contains('\n') || v.contains('\r') {
-                return Err(wrong(&def.name, "text without newlines"));
-            }
+            reject_newlines(&def.name, v)?;
             if v.is_empty() {
                 FieldValue::List(vec![])
             } else {

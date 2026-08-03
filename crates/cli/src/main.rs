@@ -290,6 +290,14 @@ fn parse_tag(raw: &str) -> Result<String, String> {
             "tag `{raw}` contains a comma — repeat --tag instead of joining tags with a comma"
         ));
     }
+    // `--set tags=a,,b` drops an empty item; `--tag ""` used to keep one, and
+    // the backends then disagreed about it — markdown drops an empty tag on
+    // the way back out of frontmatter, local-db stores it. Say so rather than
+    // dropping it silently: an explicit `--tag ""` is a mistake, not a stray
+    // separator in a list.
+    if t.is_empty() {
+        return Err("tag is empty — a tag needs a name".to_string());
+    }
     Ok(t.to_string())
 }
 
@@ -387,6 +395,21 @@ fn check_date_bound(flag: &str, raw: &str) -> Result<(), String> {
     }
 }
 
+/// A title lands in the same line-oriented frontmatter block a custom field
+/// value does, so it gets the same guard `parse_field_value` gives every
+/// single-line field — `cadet_core::reject_newlines`, the one copy of that
+/// rule, not a second one that agrees today. Without it `cadet add $'two\nlines'`
+/// writes an orphan frontmatter line, silently truncates the task to `two`, and
+/// a value shaped like `estimate: 999` is injected outright.
+///
+/// Applied here rather than in a backend: local-db stores a multi-line title
+/// correctly, so rejecting everywhere costs it a capability it has — but a CLI
+/// where `add` succeeds on one project and fails on another for the same input
+/// is worse, and a title containing a newline is pathological regardless.
+fn check_title(raw: &str) -> Result<(), String> {
+    cadet_core::reject_newlines("title", raw).map_err(|e| e.to_string())
+}
+
 /// Turns `name=value` into a change. Reserved names are handled directly;
 /// everything else must be declared in project.toml, and the error says so.
 /// Shared by `add --set` and `set` — the single most common defect in this
@@ -402,7 +425,10 @@ fn apply_assignment(
         .ok_or_else(|| format!("expected name=value, got `{pair}`"))?;
     let raw = raw.trim();
     match name.trim() {
-        "title" => changes.title = Some(raw.to_string()),
+        "title" => {
+            check_title(raw)?;
+            changes.title = Some(raw.to_string());
+        }
         "state" => changes.state = Some(raw.to_string()),
         "priority" => changes.priority = Some(parse_priority(raw)?),
         "due" => {
@@ -547,7 +573,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 apply_assignment(&cfg, &mut scratch, pair, &config_path)?;
             }
             let mut draft = TaskDraft {
-                title: title.join(" "),
+                // Trimmed, because `--set title=` trims and the two spellings
+                // of one field must not disagree. Untrimmed they also split
+                // the backends: markdown reads a frontmatter scalar back
+                // trimmed, local-db keeps the padding verbatim, so the same
+                // `cadet add` stored two different titles depending on the
+                // project.
+                title: title.join(" ").trim().to_string(),
                 due,
                 priority: priority.map(Priority::from),
                 tags,
@@ -575,6 +607,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(t) = scratch.tags {
                 draft.tags = t;
             }
+            check_title(&draft.title)?;
             for (name, value) in scratch.fields {
                 match value {
                     Some(v) => {

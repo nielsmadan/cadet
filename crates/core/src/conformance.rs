@@ -43,12 +43,37 @@ pub fn assert_stale_revision_is_rejected(b: &dyn Backend, mut task: Task) {
 /// them at whatever a fixture happened to set (usually `None`) would let a
 /// backend that silently drops them pass every time every fixture in the
 /// suite left them unset.
+///
+/// `title`, `tags` and `body` are overwritten for the same reason, one step
+/// further: every fixture in the suite was friendly, so nothing here could see
+/// a value that fights the storage format. These are hostile to a
+/// line-oriented, comma-separated, fence-delimited encoding specifically — a
+/// title carrying `:` and `#` and a leading `-`, tags carrying commas, quotes,
+/// brackets and their own padding, and a body whose first lines are a
+/// frontmatter block of their own. All of it is ordinary text a user can type,
+/// and a backend that mangles any of it loses their data silently.
+///
+/// What is deliberately NOT here: a newline in the title, a title padded with
+/// spaces, and an empty tag. Those are hostile to the *user's intent* rather
+/// than to a format — the CLI rejects the first, trims the second and rejects
+/// the third, and each has a test there. This assertion says what a backend
+/// must round-trip given valid input; the CLI decides what input is valid.
 pub fn assert_round_trip(b: &dyn Backend, mut task: Task) {
     task.renumbered_from = Some(TaskKey::new(
         task.key.prefix.clone(),
         task.key.number.wrapping_add(1),
     ));
     task.possible_duplicate_of = Some(TaskUid::generate());
+    task.title = r#"- "Ship: v2" #1 -- [now]"#.to_string();
+    task.tags = vec![
+        "with,comma".into(),
+        "q\"uote".into(),
+        " padded ".into(),
+        "#hash".into(),
+        "a: b".into(),
+        "[bracket]".into(),
+    ];
+    task.body = "---\ntitle: not the title\n---\n\n- a list\n".to_string();
 
     b.put(task.clone(), None).unwrap();
     let got = b
