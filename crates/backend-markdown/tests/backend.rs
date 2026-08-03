@@ -514,6 +514,33 @@ fn changing_a_title_does_not_rename_the_file() {
     );
 }
 
+/// The other half of `LocalDbBackend`'s
+/// `save_project_is_unsupported_rather_than_lossy`. Both backends decline for
+/// the same reason — a from-scratch renderer would destroy the comments,
+/// unmodelled keys and section ordering `render_project_toml` exists to
+/// preserve — so both must decline the same WAY. The CLI already matches on
+/// `Unsupported` to phrase capability errors for `undo` and `adopt`; an
+/// `Io("… not implemented in milestone 1")` here reads to that matcher as a
+/// real I/O failure and would be reported as one.
+#[test]
+fn save_project_is_unsupported_rather_than_a_bare_io_error() {
+    let (d, b) = setup();
+    let before = std::fs::read_to_string(d.path().join("project.toml")).unwrap();
+
+    let cfg = b.load_project().unwrap();
+    let err = b.save_project(cfg).unwrap_err();
+    assert!(
+        matches!(err, BackendError::Unsupported { .. }),
+        "save_project must report Unsupported, as the other backend does: {err:?}"
+    );
+
+    let after = std::fs::read_to_string(d.path().join("project.toml")).unwrap();
+    assert_eq!(
+        before, after,
+        "an Unsupported save_project must not touch the file at all"
+    );
+}
+
 /// Proves the reusable contract in `cadet_core::conformance` is not just
 /// self-consistent but actually satisfied by the only real implementation of
 /// `Backend` — the whole point of extracting the suite.

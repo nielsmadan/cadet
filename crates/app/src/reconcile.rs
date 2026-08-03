@@ -456,8 +456,6 @@ impl App {
                 .bump_high_water(&self.project, change.to.number)?;
             report.renumbered += 1;
         }
-        let mut upserts: Vec<Task> = parsed.into_values().collect();
-
         // A duplicate can also arrive one upsert at a time: this task's key
         // may collide with a DIFFERENT uid the cache already holds from an
         // earlier delta — `resolve_duplicates` only sees this batch, so it
@@ -465,7 +463,24 @@ impl App {
         // task in this collision we have a full, real record for (fresh from
         // the backend); the already-cached task is only a display summary,
         // not enough to safely rewrite without risking real data loss.
-        for task in upserts.iter_mut() {
+        //
+        // The counter's floor is `resolve_collisions`'s, carried across rather
+        // than reinvented: the greater of the stored high-water mark and the
+        // maximum key number in this batch. `high_water + 1` alone hands the
+        // loser a number a legitimate task in the SAME batch is already
+        // holding — neither the batch's own `resolve_duplicates` (both keys
+        // were distinct when it ran) nor `find_by_key` (the other task is not
+        // cached yet) can see that, and the collision only surfaces as a
+        // `tasks_unique_key` abort after the rename has already been written
+        // to the store.
+        let mut next = self.index.high_water(&self.project)?.max(
+            parsed
+                .values()
+                .map(|t| t.key.number)
+                .max()
+                .unwrap_or_default(),
+        );
+        for task in parsed.values_mut() {
             let Some(existing) = self.index.find_by_key(&self.project, &task.key)? else {
                 continue;
             };
@@ -473,7 +488,7 @@ impl App {
                 continue;
             }
             let on_disk = revision(task);
-            let next = self.index.high_water(&self.project)? + 1;
+            next += 1;
             task.renumbered_from = Some(task.key.clone());
             task.key = TaskKey::new(prefix.clone(), next);
             self.backend.put(task.clone(), Some(on_disk))?;
@@ -481,8 +496,8 @@ impl App {
             report.renumbered += 1;
         }
 
-        if let Some(max) = upserts
-            .iter()
+        if let Some(max) = parsed
+            .values()
             .filter(|t| t.key.prefix == prefix)
             .map(|t| t.key.number)
             .max()
@@ -501,16 +516,26 @@ impl App {
             .into_iter()
             .map(|e| e.uid)
             .collect();
-        for t in &upserts {
+        for t in parsed.values() {
             if known.contains(&t.uid) {
                 report.updated += 1;
             } else {
                 report.adopted += 1;
             }
+            // The same rule the snapshot arm's `Update` and `Rename` outcomes
+            // apply, for the same reason: reclaiming a uid MUST retire any
+            // pending-deletion record for it, or a task that vanishes,
+            // returns, then vanishes again is deleted immediately next scan.
+            // `reap_orphans` below does not cover it — `apply_upsert` puts the
+            // uid back in `entries`, so the stale row has an owner and
+            // survives. A local-db project only writes such a record from the
+            // snapshot arm (a stale cursor, or a rebuilt index), which is
+            // exactly the state this arm then has to clear up after.
+            self.index.clear_pending_deletion(&self.project, &t.uid)?;
         }
 
-        let entries: Vec<IndexEntry> = upserts
-            .iter()
+        let entries: Vec<IndexEntry> = parsed
+            .values()
             .map(|t| IndexEntry {
                 uid: t.uid.clone(),
                 path: t.uid.as_str().to_string(),
@@ -525,11 +550,25 @@ impl App {
         // the table outright).
         self.index.apply_upsert(&self.project, &entries)?;
 
+        // Through `assemble_cache`, the same final uniqueness sweep the
+        // snapshot path gets, rather than a second copy of it: a row that
+        // would violate a `tasks` UNIQUE constraint is dropped and reported,
+        // because "letting it through kills every command in the project, `ls`
+        // included". Nothing is carried in from the previous cache — a delta
+        // says what changed and the rest of the cache is left standing — so
+        // the `complete` flag and the observed-uid set have nothing to gate
+        // and are passed at their most conservative.
+        let swept = self.assemble_cache(
+            false,
+            parsed,
+            &std::collections::BTreeSet::new(),
+            std::iter::empty(),
+        )?;
         // Touch only what changed. `cache_tasks` replaces a whole project and
         // would need every task re-read from the backend to rebuild — one
         // query per cached task, which is worse than the single scan this
         // path exists to avoid.
-        self.index.cache_upsert_tasks(&self.project, &upserts)?;
+        self.index.cache_upsert_tasks(&self.project, &swept)?;
         // A defensive backstop, not a load-bearing step for this backend
         // under ordinary single-consumer operation (its `pending*` tables
         // are only ever written by the snapshot path): if an earlier
@@ -909,6 +948,26 @@ terminal = ["done"]
         (dir, App::new(Box::new(backend), index, None, "p".into()))
     }
 
+    /// A task written by something other than `App` — the second writer the
+    /// delta path exists for.
+    fn foreign_task(number: u32, title: &str) -> Task {
+        Task {
+            uid: TaskUid::generate(),
+            key: TaskKey::new("P", number),
+            title: title.into(),
+            state: "todo".into(),
+            created: jiff::Timestamp::UNIX_EPOCH,
+            updated: jiff::Timestamp::UNIX_EPOCH,
+            due: None,
+            priority: Priority::Normal,
+            tags: vec![],
+            renumbered_from: None,
+            possible_duplicate_of: None,
+            fields: std::collections::BTreeMap::new(),
+            body: String::new(),
+        }
+    }
+
     /// Review finding 1 (CRITICAL): `apply_delta` used to hand `self.index`
     /// only the delta's own upserts via `apply`, which — per its own doc
     /// comment — "replaces the project's entries wholesale". A one-task
@@ -944,6 +1003,82 @@ terminal = ["done"]
             app.index.view("p").unwrap().entries.len(),
             2,
             "an empty delta must not wipe the project's entries"
+        );
+    }
+
+    /// Review finding 1 (CRITICAL), the nineteenth instance of the signature
+    /// defect. `apply_delta` minted a replacement key from `high_water + 1`
+    /// while `resolve_collisions` — the codebase's other minting site — floors
+    /// the same operation at `high_water.max(observed_max)` and has
+    /// `renumbering_never_collides_with_a_key_already_in_the_batch` to say so.
+    ///
+    /// The cache holds `A: P-1` at `high_water = 1`, and one delta carries both
+    /// `B` (duplicating `P-1`) and `C` (legitimately holding `P-2`, the number
+    /// the unfloored counter is about to mint for `B`). Both arrive through
+    /// `Backend::put`, the public trait — exactly the second writer this path
+    /// exists for.
+    #[test]
+    fn a_delta_renumber_does_not_take_a_key_another_task_in_the_batch_holds() {
+        let (_dir, app) = local_db_app();
+        let a = app.add("A").unwrap();
+        app.reconcile(1_000).unwrap();
+        assert_eq!(a.key, TaskKey::new("P", 1));
+
+        let b = foreign_task(1, "B duplicates A");
+        let c = foreign_task(2, "C already holds P-2");
+        app.backend.put(b.clone(), None).unwrap();
+        app.backend.put(c.clone(), None).unwrap();
+
+        app.reconcile(2_000).unwrap();
+
+        let listed = app.list(true).unwrap();
+        assert_eq!(listed.len(), 3, "all three tasks must be listed");
+        let keys: std::collections::BTreeSet<String> =
+            listed.iter().map(|s| s.key.to_string()).collect();
+        assert_eq!(keys.len(), 3, "every listed task must hold its own key");
+        let c_row = listed
+            .iter()
+            .find(|s| s.uid == c.uid.as_str())
+            .expect("C must still be listed");
+        assert_eq!(
+            c_row.key,
+            TaskKey::new("P", 2),
+            "C never duplicated anything and must not be renumbered"
+        );
+    }
+
+    /// Review finding 3. `clear_pending_deletion` is in the snapshot arm's
+    /// `Update`/`Rename` outcomes with a comment giving the reason — "a task
+    /// that vanishes, returns, then vanishes again is deleted immediately next
+    /// scan" — and was missing from `apply_delta`. `reap_orphans` does not
+    /// cover it: `apply_upsert` puts the uid back in `entries`, so the stale
+    /// row has an owner and survives.
+    ///
+    /// A local-db project reaches the snapshot arm whenever its cursor is
+    /// stale (or the index was rebuilt), which is where the record is written;
+    /// the delta arm is where the task comes back. `mark_pending_deletion` is
+    /// called directly here for the same reason `resolve_identity` cannot call
+    /// `clear_pending_deletion` itself — arranging the two-arm sequence for
+    /// real would test the arm-switching, not this.
+    #[test]
+    fn a_delta_upsert_clears_a_stale_pending_deletion_record() {
+        let (_dir, app) = local_db_app();
+        let a = app.add("A").unwrap();
+        app.reconcile(1_000).unwrap();
+
+        app.index.mark_pending_deletion("p", &a.uid, 1_000).unwrap();
+        app.set_state(&a.key, "doing").unwrap();
+        app.reconcile(2_000).unwrap();
+
+        assert!(
+            !app.index
+                .view("p")
+                .unwrap()
+                .pending_deletions
+                .contains_key(&a.uid),
+            "a task the delta just upserted is present, so its deletion \
+             grace-period record must be retired — leaving it makes the next \
+             absence a same-scan deletion"
         );
     }
 }

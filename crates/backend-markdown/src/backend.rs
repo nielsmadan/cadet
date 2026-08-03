@@ -206,10 +206,20 @@ impl Backend for MarkdownBackend {
         })
     }
 
+    /// Declined for exactly the reason `LocalDbBackend::save_project` gives,
+    /// in the same words: a from-scratch renderer would overwrite
+    /// `project.toml` wholesale, destroying the comments, unmodelled keys and
+    /// section ordering `render_project_toml` in `crates/cli/src/project.rs`
+    /// was written to preserve. Nothing calls this today; when something does,
+    /// it should go through that renderer.
+    ///
+    /// `Unsupported`, not `Io`: the CLI matches on `Unsupported` to phrase a
+    /// capability error, and an `Io` here would be reported to the user as a
+    /// failed write that never happened.
     fn save_project(&self, _cfg: ProjectConfig) -> Result<(), BackendError> {
-        Err(BackendError::Io(
-            "save_project is not implemented in milestone 1".into(),
-        ))
+        Err(BackendError::Unsupported {
+            capability: "writing the project config".into(),
+        })
     }
 
     fn get(&self, uid: TaskUid) -> Result<Option<Task>, BackendError> {
