@@ -65,6 +65,10 @@ impl Harness {
     fn vault(&self, name: &str) -> String {
         self.root.path().join(name).to_str().unwrap().to_string()
     }
+
+    fn home(&self) -> &std::path::Path {
+        self.home.path()
+    }
 }
 
 #[test]
@@ -1650,4 +1654,145 @@ fn force_overwrite_of_a_config_invalid_project_toml_preserves_it_and_errors() {
         after, toml,
         "nothing may be written when the result is invalid"
     );
+}
+
+#[test]
+fn a_local_db_project_needs_no_path_and_lands_in_cadet_home() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    assert!(h.home().join("projects").join("scratch.db").exists());
+    assert!(h.home().join("projects").join("scratch.toml").exists());
+}
+
+#[test]
+fn tasks_round_trip_through_a_local_db_project() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "scratch",
+        "--backend",
+        "local-db",
+        "--prefix",
+        "S",
+    ])
+    .assert()
+    .success();
+    h.cadet(&["add", "buy milk", "--tag", "errand"])
+        .assert()
+        .success();
+    h.cadet(&["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("S-1").and(predicates::str::contains("buy milk")));
+    h.cadet(&["ls", "--tag", "errand"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("buy milk"));
+    h.cadet(&["done", "S-1"]).assert().success();
+    h.cadet(&["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("buy milk").not());
+}
+
+#[test]
+fn undo_reports_that_a_local_db_project_has_none() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["add", "a task"]).assert().success();
+    h.cadet(&["undo"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("undo"));
+}
+
+#[test]
+fn adopt_reports_that_a_local_db_project_has_nothing_to_adopt() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["add", "a task"]).assert().success();
+    h.cadet(&["adopt"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("adopt"));
+}
+
+#[test]
+fn the_listing_shows_each_project_backend() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "notes",
+        "--path",
+        &h.vault("notes"),
+        "--prefix",
+        "N",
+    ])
+    .assert()
+    .success();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["project"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("markdown").and(predicates::str::contains("local-db")));
+}
+
+#[test]
+fn an_unknown_backend_on_the_flag_is_rejected_with_the_choices() {
+    let h = harness();
+    h.cadet(&["project", "add", "x", "--backend", "telepathy"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("markdown").and(predicates::str::contains("local-db")));
+}
+
+#[test]
+fn a_markdown_and_a_local_db_project_coexist_with_separate_key_spaces() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "notes",
+        "--path",
+        &h.vault("notes"),
+        "--prefix",
+        "N",
+    ])
+    .assert()
+    .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "scratch",
+        "--backend",
+        "local-db",
+        "--prefix",
+        "S",
+    ])
+    .assert()
+    .success();
+    h.cadet(&["--project", "notes", "add", "a note task"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "scratch", "add", "a scratch task"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "notes", "ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("N-1").and(predicates::str::contains("scratch").not()));
+    h.cadet(&["--project", "scratch", "ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("S-1"));
 }

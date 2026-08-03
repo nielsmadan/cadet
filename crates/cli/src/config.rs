@@ -92,6 +92,21 @@ pub struct Project {
     pub backend: BackendKind,
 }
 
+impl Project {
+    /// Where this project's hand-editable config lives: inside the folder
+    /// for `markdown` (`path` names the folder), in the sibling `.toml` next
+    /// to the storage file for `local-db` (`path` names the `.db` itself —
+    /// see `LocalDbBackend::open`). Shared by `project::add`, which writes
+    /// this file, and `load_config` in `main.rs`, which reads it back, so
+    /// the two halves of this rule can't drift apart.
+    pub fn config_path(&self) -> PathBuf {
+        match self.backend {
+            BackendKind::Markdown => self.path.join("project.toml"),
+            BackendKind::LocalDb => self.path.with_extension("toml"),
+        }
+    }
+}
+
 impl Registry {
     /// `CADET_HOME`, then `$XDG_CONFIG_HOME/cadet`, then `~/.config/cadet`.
     ///

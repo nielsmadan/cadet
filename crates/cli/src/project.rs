@@ -1,15 +1,40 @@
 use crate::TEMPLATE;
 use crate::config::{BackendKind, Project, Registry};
 use crate::prompt;
+use cadet_backend_local_db::LocalDbBackend;
 use cadet_core::ProjectConfig;
 use clap::Subcommand;
 use std::path::PathBuf;
+
+/// The `--backend` flag's own type, kept separate from `config::BackendKind`
+/// the same way `PriorityArg` is kept separate from `cadet_core::Priority` in
+/// `main.rs`: clap derives `--help`'s choice list and the "invalid value"
+/// rejection straight off this enum, so the type clap renders from must be
+/// the one the flag is declared with, not one converted into later.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum BackendArg {
+    Markdown,
+    LocalDb,
+}
+
+impl From<BackendArg> for BackendKind {
+    fn from(b: BackendArg) -> Self {
+        match b {
+            BackendArg::Markdown => BackendKind::Markdown,
+            BackendArg::LocalDb => BackendKind::LocalDb,
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub enum ProjectCmd {
     /// Register a project and create its folder
     Add {
         id: String,
+        /// Where this project's tasks live: `markdown` (a folder of files)
+        /// or `local-db` (a single SQLite file). Defaults to `markdown`.
+        #[arg(long, value_enum, ignore_case = true)]
+        backend: Option<BackendArg>,
         #[arg(long)]
         path: Option<String>,
         #[arg(long)]
@@ -196,13 +221,38 @@ pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
         }
         ProjectCmd::Add {
             id,
+            backend,
             path,
             prefix,
             name,
             force,
             yes,
-        } => add(&mut reg, id, path, prefix, name, force, yes),
+        } => add(
+            &mut reg,
+            NewProject {
+                id,
+                backend,
+                path,
+                prefix,
+                name,
+                force,
+                yes,
+            },
+        ),
     }
+}
+
+/// `ProjectCmd::Add`'s fields, bundled for `add` — one struct rather than
+/// seven positional arguments, which is also what clippy's
+/// `too_many_arguments` lint is for.
+struct NewProject {
+    id: String,
+    backend: Option<BackendArg>,
+    path: Option<String>,
+    prefix: Option<String>,
+    name: Option<String>,
+    force: bool,
+    yes: bool,
 }
 
 fn list(reg: &Registry) -> Result<(), String> {
@@ -216,7 +266,12 @@ fn list(reg: &Registry) -> Result<(), String> {
         } else {
             " "
         };
-        println!("{marker} {:<12} {}", p.id, p.path.display());
+        println!(
+            "{marker} {:<12} {:<9} {}",
+            p.id,
+            p.backend.as_str(),
+            p.path.display()
+        );
     }
     Ok(())
 }
@@ -228,20 +283,49 @@ fn list(reg: &Registry) -> Result<(), String> {
 /// configured, `<root>/<id>/tasks` is exactly as good a default there as it
 /// is inside a prompt, and treating the two modes differently would make
 /// `project_root` mean two different things depending on `isatty(0)`.
-fn add(
-    reg: &mut Registry,
-    id: String,
-    path: Option<String>,
-    prefix: Option<String>,
-    name: Option<String>,
-    force: bool,
-    yes: bool,
-) -> Result<(), String> {
+fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
+    let NewProject {
+        id,
+        backend,
+        path,
+        prefix,
+        name,
+        force,
+        yes,
+    } = new;
     let interactive = prompt::is_interactive();
 
-    let default_path = reg
-        .project_root()
-        .map(|r| r.join(&id).join("tasks").display().to_string());
+    // Resolved before anything else that follows: it changes what the path
+    // default means (a folder of notes vs. a single database file) and
+    // where the generated config is written, so every later default has to
+    // be computed after this, not before it.
+    let backend: BackendKind = match backend {
+        Some(b) => b.into(),
+        None if interactive => {
+            let got = prompt::ask("backend", Some(BackendKind::Markdown.as_str()))
+                .map_err(|e| e.to_string())?;
+            BackendKind::parse(&got).ok_or_else(|| {
+                format!("unknown backend `{got}` — expected `markdown` or `local-db`")
+            })?
+        }
+        None => BackendKind::Markdown,
+    };
+
+    let default_path = match backend {
+        BackendKind::Markdown => reg
+            .project_root()
+            .map(|r| r.join(&id).join("tasks").display().to_string()),
+        // No project root involved: a local-db project's storage is a file
+        // under the registry's own home, not under the (markdown-only)
+        // notes root a user may have configured with `cadet project root`.
+        BackendKind::LocalDb => Some(
+            reg.root
+                .join("projects")
+                .join(format!("{id}.db"))
+                .display()
+                .to_string(),
+        ),
+    };
 
     let path = match (path, interactive) {
         (Some(p), _) => p,
@@ -259,7 +343,17 @@ fn add(
     };
 
     let root = resolve_path(&path)?;
-    let project_toml = root.join("project.toml");
+    // `Project::config_path` is the single place that knows where a
+    // project's config lives for each backend — shared with `load_config`
+    // in `main.rs` so the two can't drift apart. `id` doesn't matter for
+    // this lookup, only `path` and `backend` do, so it's fine to derive it
+    // from a throwaway value ahead of the real `Project` built below.
+    let project_toml = Project {
+        id: id.clone(),
+        path: root.clone(),
+        backend,
+    }
+    .config_path();
 
     // Read the config being overwritten (if any) before it's gone, so a
     // `--force` re-add without explicit --prefix/--name re-derives from the
@@ -292,7 +386,10 @@ fn add(
     // candidate. `~` and `~/` are plausible things to type, so the
     // consequence gets a gate. Skipped when the folder is already a cadet
     // project: its own task files are exactly what we would be counting.
-    if existing_src.is_none() {
+    // Also skipped outright for `local-db`: `root` there is a single
+    // database file, not a folder of notes, so there is nothing for this
+    // guard to count.
+    if backend == BackendKind::Markdown && existing_src.is_none() {
         let found = count_markdown(&root, MANY_NOTES);
         if found > MANY_NOTES {
             let question = format!(
@@ -362,7 +459,20 @@ fn add(
     // unsafe follows: the validation on the next line runs before the write,
     // so a config that is still invalid after preservation errors and
     // touches nothing.
-    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    match backend {
+        BackendKind::Markdown => {
+            std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        }
+        BackendKind::LocalDb => {
+            if let Some(parent) = root.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            // Opens (creating the file if absent) and runs its schema
+            // migration now, so a bad `--path` is caught here rather than on
+            // the first `cadet ls` against this project.
+            LocalDbBackend::open(&root).map_err(|e| e.to_string())?;
+        }
+    }
     let body = render_project_toml(existing_src.as_deref(), &id, &name, &prefix);
     ProjectConfig::parse(&body)
         .map_err(|e| format!("generated project.toml would not parse: {e}"))?;
@@ -370,7 +480,7 @@ fn add(
     reg.upsert_project(Project {
         id: id.clone(),
         path: root.clone(),
-        backend: BackendKind::Markdown,
+        backend,
     });
     if reg.default.is_none() {
         reg.default = Some(id.clone());

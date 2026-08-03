@@ -213,7 +213,7 @@ fn print_warnings(app: &App) {
 fn load_config(
     project: &Project,
 ) -> Result<(ProjectConfig, std::path::PathBuf), Box<dyn std::error::Error>> {
-    let config_path = project.path.join("project.toml");
+    let config_path = project.config_path();
     let src = std::fs::read_to_string(&config_path)?;
     let cfg = ProjectConfig::parse(&src)?;
     Ok((cfg, config_path))
@@ -731,6 +731,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_warnings(&app);
         }
         Cmd::Adopt => {
+            // `LocalDbBackend::adopt` is never actually reached: reconcile
+            // short-circuits `Outcome::Adopt` the moment an observed entry
+            // already carries a uid, and every row a local-db backend serves
+            // has one by construction — there are no loose rows for it to
+            // find. Left unchecked, `adopt_pending` would run to completion
+            // and print "adopted 0 note(s)", a fake success spec §6
+            // explicitly rules out. Gate here, on the project's backend
+            // kind, before the call.
+            if project.backend == BackendKind::LocalDb {
+                return Err(
+                    "this backend does not support adopt — a local-db project has no loose notes to adopt; every task is already written with a uid"
+                        .into(),
+                );
+            }
             let r = app.adopt_pending(now)?;
             // A forced `PendingCopy` lands in `copies`, not `adopted` — both
             // are notes the user just asked to be given an identity.
