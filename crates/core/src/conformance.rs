@@ -53,11 +53,23 @@ pub fn assert_stale_revision_is_rejected(b: &dyn Backend, mut task: Task) {
 /// frontmatter block of their own. All of it is ordinary text a user can type,
 /// and a backend that mangles any of it loses their data silently.
 ///
-/// What is deliberately NOT here: a newline in the title, a title padded with
-/// spaces, and an empty tag. Those are hostile to the *user's intent* rather
-/// than to a format — the CLI rejects the first, trims the second and rejects
-/// the third, and each has a test there. This assertion says what a backend
-/// must round-trip given valid input; the CLI decides what input is valid.
+/// What is deliberately NOT here, stated honestly because the easy version of
+/// this paragraph is wrong: a newline in the title, a title padded with spaces,
+/// and an empty tag. All three are things `MarkdownBackend` *cannot* round-trip
+/// — `split_line` trims every frontmatter scalar, and `render_list`/`list` drop
+/// an empty item — while local-db keeps all three. They are not excluded
+/// because the CLI launders them: note that ` padded ` IS in the tag list
+/// above, and the CLI trims padded tags too, so "the CLI trims it" cannot be
+/// the reason. Only the newline is genuinely a validity call, and it earns that
+/// on its own merits: a title that ends its own frontmatter line is pathological
+/// whatever stores it.
+///
+/// The consequence, which the CLI guards hide rather than resolve: a direct
+/// `Backend::put` with a padded title, or an empty tag, still diverges between
+/// the two backends, and nothing in this suite asserts either way. Resolving it
+/// means either quoting frontmatter scalars — a file-format change, with
+/// hand-written `title: "x"` to disambiguate — or declaring the divergence
+/// acceptable at the trait level. Neither belongs in a review-fix wave.
 pub fn assert_round_trip(b: &dyn Backend, mut task: Task) {
     task.renumbered_from = Some(TaskKey::new(
         task.key.prefix.clone(),

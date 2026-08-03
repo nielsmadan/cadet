@@ -1738,6 +1738,53 @@ fn force_overwrite_of_a_config_invalid_project_toml_preserves_it_and_errors() {
     );
 }
 
+/// Review finding 4. `project add --help` said "create its folder", which is
+/// wrong for a local-db project — it is one file — and clap propagated the
+/// global `--project` into a command group where selecting a project to act on
+/// means nothing.
+#[test]
+fn project_add_help_fits_both_backends_and_drops_the_global_project_flag() {
+    let h = harness();
+    h.cadet(&["project", "add", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicates::str::contains("create its folder")
+                .not()
+                .and(predicates::str::contains("database file"))
+                .and(predicates::str::contains("--project").not()),
+        );
+    // Still there everywhere it means something.
+    h.cadet(&["ls", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--project"));
+    h.cadet(&["project", "--project", "anything", "ls"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("does not apply"));
+}
+
+/// The root spelling, which is the one people actually have: `alias c='cadet
+/// --project work'` makes every invocation carry the flag, `c project ls`
+/// included. Keeping the flag out of `project --help` must not cost that —
+/// clap propagates the root global's VALUE into the variant's field, so a
+/// guard written for the subcommand position fires here too. A global that
+/// does not apply to one subcommand is ignored, not fatal; say so on stderr
+/// so it is not silently swallowed either.
+#[test]
+fn the_global_project_flag_in_root_position_still_works_with_the_project_group() {
+    let h = harness();
+    h.cadet(&["project", "add", "work", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "work", "project", "ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("work"))
+        .stderr(predicates::str::contains("does not apply"));
+}
+
 #[test]
 fn a_local_db_project_needs_no_path_and_lands_in_cadet_home() {
     let h = harness();

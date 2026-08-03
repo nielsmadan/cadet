@@ -446,6 +446,19 @@ impl App {
             .map(|t| (t.uid.as_str().to_string(), t))
             .collect();
         let resolved = self.resolve_duplicates(&mut parsed, &prefix)?;
+        // `resolve_duplicates` fills both halves of a `DuplicateResolution`,
+        // so both arms have to spend both. This is `apply_renumbers`'s opening
+        // loop, which the snapshot arm runs for exactly the same reason: a
+        // path that came back settled kept the key it already had, and any
+        // `pending_renumbers` row still held for it is obsolete. `reap_orphans`
+        // does not cover it — the delta arm passes `None` for `live_paths`, and
+        // a settled task is live anyway. Left behind, the row makes `cadet
+        // doctor` report a pending renumber forever, and its grace check is
+        // already satisfied, so the next duplicate to land at that path is
+        // renumbered with no grace period at all.
+        for path in &resolved.settled {
+            self.index.clear_pending_renumber(&self.project, path)?;
+        }
         for change in &resolved.changes {
             let Some(task) = parsed.get(&change.path) else {
                 continue;
@@ -1079,6 +1092,48 @@ terminal = ["done"]
             "a task the delta just upserted is present, so its deletion \
              grace-period record must be retired — leaving it makes the next \
              absence a same-scan deletion"
+        );
+    }
+
+    /// Re-review finding 1, the twenty-first instance of the signature defect
+    /// and the exact sibling of the one above. `resolve_duplicates` fills BOTH
+    /// halves of a `DuplicateResolution`, and both arms call it — but only
+    /// `apply_renumbers`, on the snapshot arm, clears the `pending_renumbers`
+    /// row for a path that came back settled. `apply_delta` iterated
+    /// `resolved.changes` and dropped `resolved.settled` on the floor, and a
+    /// local-db project stops calling `apply_renumbers` at all the moment it
+    /// has a cursor.
+    ///
+    /// `reap_orphans` cannot cover this: it returns early when `live_paths` is
+    /// `None`, which is what the delta arm passes, and a settled task is live
+    /// anyway so it would never be an orphan. The harm is the adoption side's
+    /// verbatim: `cadet doctor` reads `pending: 1` forever, and because the
+    /// grace check for that path is already long satisfied, the next duplicate
+    /// to land there is renumbered with no grace period at all.
+    #[test]
+    fn a_delta_clears_the_pending_renumber_row_of_a_task_that_came_back_settled() {
+        let (_dir, app) = local_db_app();
+        let a = app.add("A").unwrap();
+        app.reconcile(1_000).unwrap();
+
+        // What the snapshot arm leaves behind for a duplicate still waiting
+        // out §5's grace period. `apply_delta` keys `parsed` on the uid, so
+        // that is the "path" `resolve_duplicates` reports as settled.
+        app.index
+            .mark_pending_renumber("p", a.uid.as_str(), &revision(&a), 1_000)
+            .unwrap();
+        assert_eq!(app.renumber_status().unwrap().pending, 1);
+
+        app.set_state(&a.key, "doing").unwrap();
+        app.reconcile(2_000).unwrap();
+
+        assert_eq!(
+            app.renumber_status().unwrap().pending,
+            0,
+            "a task the delta resolved with the key it already had is settled, \
+             so its pending-renumber row must be retired — `cadet doctor` \
+             reports it forever otherwise, and the next duplicate at that path \
+             gets no grace period"
         );
     }
 }

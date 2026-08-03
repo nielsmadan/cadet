@@ -28,7 +28,8 @@ impl From<BackendArg> for BackendKind {
 
 #[derive(Subcommand)]
 pub enum ProjectCmd {
-    /// Register a project and create its folder
+    /// Register a project and create its store: a folder of notes for
+    /// `markdown`, a single database file for `local-db`
     Add {
         id: String,
         /// Where this project's tasks live: `markdown` (a folder of files)

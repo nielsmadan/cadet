@@ -40,6 +40,16 @@ impl From<PriorityArg> for Priority {
 enum Cmd {
     /// Manage projects
     Project {
+        /// Declared only to keep clap's global `--project` out of this
+        /// subtree: a global arg is propagated to every subcommand that does
+        /// not already define one by that name, and `cadet project add
+        /// --help` listing a flag for selecting the project to act on is
+        /// nonsense in a command group that creates and lists them. Noted on
+        /// stderr rather than ignored if it is actually passed, and never
+        /// fatal: clap fills this field from the root spelling too, so
+        /// refusing it would break `cadet --project work project ls`.
+        #[arg(long, hide = true)]
+        project: Option<String>,
         #[command(subcommand)]
         cmd: Option<project::ProjectCmd>,
     },
@@ -475,7 +485,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let reg = Registry::load()?;
 
     // Handled before a project is resolved, since none may exist yet.
-    if let Some(Cmd::Project { cmd }) = &mut cli.cmd {
+    if let Some(Cmd::Project { cmd, project }) = &mut cli.cmd {
+        // Noted, never fatal. `--project` is global, and clap propagates the
+        // ROOT spelling's value into this field too — so refusing here breaks
+        // `cadet --project work project ls`, which is what anyone with
+        // `alias c='cadet --project work'` types every time. A global flag that
+        // does not apply to one subcommand is conventionally ignored; saying
+        // nothing at all is the wart that put it in `project add --help` in the
+        // first place.
+        if project.is_some() {
+            eprintln!("note: --project does not apply to `cadet project`; ignoring");
+        }
         let cmd = cmd.take().unwrap_or(project::ProjectCmd::Ls);
         return project::run(cmd, reg).map_err(Into::into);
     }
