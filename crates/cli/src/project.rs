@@ -2,7 +2,7 @@ use crate::TEMPLATE;
 use crate::config::{BackendKind, Project, Registry};
 use crate::prompt;
 use cadet_backend_local_db::LocalDbBackend;
-use cadet_core::ProjectConfig;
+use cadet_core::{ProjectConfig, TaskFilter, TaskKey, Workflow};
 use clap::Subcommand;
 use std::path::PathBuf;
 
@@ -74,6 +74,52 @@ pub enum ProjectCmd {
     Rm { id: String },
     /// Show or set the folder new projects are offered under
     Root { path: Option<String> },
+    /// Show or change the states a task can be in
+    State {
+        #[command(subcommand)]
+        cmd: StateCmd,
+    },
+}
+
+/// The workflow's states are edited here rather than by hand so that removing
+/// one can see the tasks still in it. A hand edit strands them: every write
+/// path refuses a task whose state the workflow no longer declares, so it can
+/// no longer be moved, finished, or edited at all. `cadet doctor` is the way
+/// back from a hand edit that already happened.
+#[derive(Subcommand)]
+pub enum StateCmd {
+    /// List the states, in order
+    Ls { id: Option<String> },
+    /// Add a state
+    Add {
+        state: String,
+        id: Option<String>,
+        /// Place it after this state. Defaults to last.
+        #[arg(long, conflicts_with = "before")]
+        after: Option<String>,
+        /// Place it before this state
+        #[arg(long)]
+        before: Option<String>,
+        /// Tasks in this state are complete, and hidden from `cadet ls`
+        #[arg(long)]
+        terminal: bool,
+    },
+    /// Remove a state
+    Rm {
+        state: String,
+        id: Option<String>,
+        /// Move tasks still in this state here first
+        #[arg(long = "move-to")]
+        move_to: Option<String>,
+    },
+    /// Rename a state, moving every task that holds it
+    Rename {
+        from: String,
+        to: String,
+        id: Option<String>,
+    },
+    /// Use this project's workflow for every project created from now on
+    SetDefault { id: Option<String> },
 }
 
 pub fn derive_prefix(id: &str) -> String {
@@ -176,21 +222,320 @@ fn count_markdown(root: &std::path::Path, limit: usize) -> usize {
 ///
 /// `None` — no file at all, or one that is not even TOML — falls back to the
 /// template, since there is then nothing to preserve.
-pub fn render_project_toml(existing: Option<&str>, id: &str, name: &str, prefix: &str) -> String {
-    let mut doc: toml_edit::DocumentMut = existing
-        .and_then(|src| src.parse().ok())
-        .unwrap_or_else(|| TEMPLATE.parse().expect("TEMPLATE must be valid TOML"));
+///
+/// `default_workflow` is the registry's, applied only when there is no
+/// existing config: on `--force` the file's own `[workflow]` is what the
+/// project's tasks are already sitting in, and overwriting it is exactly the
+/// "every task in a dropped state becomes unmovable" bug above.
+pub fn render_project_toml(
+    existing: Option<&str>,
+    id: &str,
+    name: &str,
+    prefix: &str,
+    default_workflow: Option<&Workflow>,
+) -> String {
+    let parsed: Option<toml_edit::DocumentMut> = existing.and_then(|src| src.parse().ok());
+    let is_new = parsed.is_none();
+    let mut doc = parsed.unwrap_or_else(|| TEMPLATE.parse().expect("TEMPLATE must be valid TOML"));
     if !doc.get("project").is_some_and(|p| p.is_table()) {
         doc["project"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     doc["project"]["id"] = toml_edit::value(id);
     doc["project"]["name"] = toml_edit::value(name);
     doc["project"]["prefix"] = toml_edit::value(prefix);
+    if let Some(wf) = default_workflow.filter(|_| is_new) {
+        if !doc.get("workflow").is_some_and(|w| w.is_table()) {
+            doc["workflow"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        wf.write_into(
+            doc["workflow"]
+                .as_table_mut()
+                .expect("just ensured a table"),
+        );
+    }
     doc.to_string()
+}
+
+/// A project's `project.toml`, parsed, with its workflow lifted out. Every
+/// `state` subcommand goes through this: read, mutate the `Workflow` value,
+/// hand it back to `write_workflow`. Nothing formats a `[workflow]` table by
+/// hand, and nothing re-derives the state rules.
+struct WorkflowFile {
+    project: Project,
+    path: PathBuf,
+    doc: toml_edit::DocumentMut,
+    workflow: Workflow,
+}
+
+fn read_workflow(reg: &Registry, id: Option<&str>) -> Result<WorkflowFile, String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let project = crate::dirmatch::resolve(reg, id, &cwd)?.project;
+    let path = project.config_path();
+    let src = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let doc: toml_edit::DocumentMut = src
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+    let item = doc
+        .get("workflow")
+        .ok_or_else(|| format!("{} has no [workflow] table", path.display()))?;
+    let workflow = Workflow::from_toml_item(item).map_err(|e| e.to_string())?;
+    Ok(WorkflowFile {
+        project,
+        path,
+        doc,
+        workflow,
+    })
+}
+
+/// Validates twice on purpose: once as a workflow, then once as a whole
+/// config by reparsing the rendered document. The second catches anything the
+/// first cannot see — and it runs before the write, so a rejected edit leaves
+/// the file exactly as it was.
+fn write_workflow(f: &mut WorkflowFile, wf: &Workflow) -> Result<(), String> {
+    wf.validate().map_err(|e| e.to_string())?;
+    if !f.doc.get("workflow").is_some_and(|w| w.is_table()) {
+        f.doc["workflow"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    wf.write_into(
+        f.doc["workflow"]
+            .as_table_mut()
+            .expect("just ensured a table"),
+    );
+    let body = f.doc.to_string();
+    ProjectConfig::parse(&body)
+        .map_err(|e| format!("that edit would make {} invalid: {e}", f.path.display()))?;
+    std::fs::write(&f.path, body).map_err(|e| e.to_string())?;
+    f.workflow = wf.clone();
+    Ok(())
+}
+
+fn known_states(wf: &Workflow) -> String {
+    wf.states.join(", ")
+}
+
+/// The tasks currently in `state`, with a fresh index behind them.
+fn tasks_in(reg: &Registry, project: &Project, state: &str) -> Result<Vec<TaskKey>, String> {
+    let app = crate::open_app(reg, project).map_err(|e| e.to_string())?;
+    app.reconcile(crate::jiff_now_ms())
+        .map_err(|e| e.to_string())?;
+    let filter = TaskFilter {
+        states: vec![state.to_string()],
+        ..Default::default()
+    };
+    Ok(app
+        .list_filtered(true, &filter)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|s| s.key)
+        .collect())
+}
+
+fn move_them(reg: &Registry, project: &Project, keys: &[TaskKey], to: &str) -> Result<(), String> {
+    let app = crate::open_app(reg, project).map_err(|e| e.to_string())?;
+    let moved = app.move_tasks(keys, to).map_err(|e| e.to_string())?;
+    println!("moved {moved} task(s) to `{to}`");
+    Ok(())
+}
+
+fn state_cmd(reg: &mut Registry, cmd: StateCmd) -> Result<(), String> {
+    match cmd {
+        StateCmd::Ls { id } => {
+            let f = read_workflow(reg, id.as_deref())?;
+            for s in &f.workflow.states {
+                let mut notes = vec![];
+                if *s == f.workflow.initial {
+                    notes.push("initial");
+                }
+                if f.workflow.terminal.contains(s) {
+                    notes.push("terminal");
+                }
+                match notes.is_empty() {
+                    true => println!("{s}"),
+                    false => println!("{s}  ({})", notes.join(", ")),
+                }
+            }
+            Ok(())
+        }
+        StateCmd::SetDefault { id } => {
+            let f = read_workflow(reg, id.as_deref())?;
+            reg.workflow = Some(f.workflow.clone());
+            reg.save().map_err(|e| e.to_string())?;
+            println!(
+                "new projects will use `{}`'s workflow: {}",
+                f.project.id,
+                known_states(&f.workflow)
+            );
+            Ok(())
+        }
+        StateCmd::Add {
+            state,
+            id,
+            after,
+            before,
+            terminal,
+        } => {
+            let mut f = read_workflow(reg, id.as_deref())?;
+            let mut wf = f.workflow.clone();
+            if wf.states.contains(&state) {
+                return Err(format!("`{state}` is already a state"));
+            }
+            let anchor = after.as_ref().or(before.as_ref());
+            let at = match anchor {
+                None => wf.states.len(),
+                Some(a) => {
+                    let i = wf.states.iter().position(|s| s == a).ok_or_else(|| {
+                        format!(
+                            "unknown state `{a}` — declared state(s): {}",
+                            known_states(&wf)
+                        )
+                    })?;
+                    if after.is_some() { i + 1 } else { i }
+                }
+            };
+            wf.states.insert(at, state.clone());
+            if terminal {
+                wf.terminal.push(state.clone());
+            }
+            write_workflow(&mut f, &wf)?;
+            println!("added `{state}` — states are now: {}", known_states(&wf));
+            Ok(())
+        }
+        StateCmd::Rm { state, id, move_to } => {
+            let mut f = read_workflow(reg, id.as_deref())?;
+            let mut wf = f.workflow.clone();
+            if !wf.states.contains(&state) {
+                return Err(format!(
+                    "unknown state `{state}` — declared state(s): {}",
+                    known_states(&wf)
+                ));
+            }
+            if wf.initial == state {
+                return Err(format!(
+                    "`{state}` is where new tasks start — set another `initial` in {} first",
+                    f.path.display()
+                ));
+            }
+            if wf.states.len() == 1 {
+                return Err("a workflow needs at least one state".to_string());
+            }
+            let holders = tasks_in(reg, &f.project, &state)?;
+            if !holders.is_empty() {
+                let dest = resolve_destination(&wf, &state, move_to, holders.len())?;
+                move_them(reg, &f.project, &holders, &dest)?;
+            }
+            wf.states.retain(|s| *s != state);
+            wf.terminal.retain(|s| *s != state);
+            wf.transitions.remove(&state);
+            for allowed in wf.transitions.values_mut() {
+                allowed.retain(|s| *s != state);
+            }
+            write_workflow(&mut f, &wf)?;
+            println!("removed `{state}` — states are now: {}", known_states(&wf));
+            Ok(())
+        }
+        StateCmd::Rename { from, to, id } => {
+            let mut f = read_workflow(reg, id.as_deref())?;
+            if !f.workflow.states.contains(&from) {
+                return Err(format!(
+                    "unknown state `{from}` — declared state(s): {}",
+                    known_states(&f.workflow)
+                ));
+            }
+            if f.workflow.states.contains(&to) {
+                return Err(format!(
+                    "`{to}` already exists — use `cadet project state rm {from} --move-to {to}` to merge them"
+                ));
+            }
+            // The new name is declared before any task moves into it, because
+            // a move into an undeclared state is exactly what strands tasks.
+            // That leaves both names declared for the duration of the move; if
+            // the move fails, the extra state is visible and removable rather
+            // than a set of tasks nothing can touch.
+            let mut widened = f.workflow.clone();
+            let at = widened
+                .states
+                .iter()
+                .position(|s| *s == from)
+                .expect("checked above");
+            widened.states.insert(at + 1, to.clone());
+            if widened.terminal.contains(&from) {
+                widened.terminal.push(to.clone());
+            }
+            write_workflow(&mut f, &widened)?;
+
+            let holders = tasks_in(reg, &f.project, &from)?;
+            if !holders.is_empty() {
+                move_them(reg, &f.project, &holders, &to)?;
+            }
+
+            let mut wf = widened;
+            wf.states.retain(|s| *s != from);
+            wf.terminal.retain(|s| *s != from);
+            if wf.initial == from {
+                wf.initial = to.clone();
+            }
+            if let Some(allowed) = wf.transitions.remove(&from) {
+                wf.transitions.insert(to.clone(), allowed);
+            }
+            for allowed in wf.transitions.values_mut() {
+                for s in allowed.iter_mut() {
+                    if *s == from {
+                        *s = to.clone();
+                    }
+                }
+            }
+            write_workflow(&mut f, &wf)?;
+            println!("renamed `{from}` to `{to}`");
+            Ok(())
+        }
+    }
+}
+
+/// Where tasks go when their state is removed. `--move-to` answers it
+/// outright; otherwise a terminal prompts and a script gets a message naming
+/// the flag. Never guesses — picking a state for someone silently rewrites
+/// their tasks.
+fn resolve_destination(
+    wf: &Workflow,
+    removing: &str,
+    move_to: Option<String>,
+    count: usize,
+) -> Result<String, String> {
+    let candidates: Vec<&str> = wf
+        .states
+        .iter()
+        .map(String::as_str)
+        .filter(|s| *s != removing)
+        .collect();
+    let dest = match move_to {
+        Some(d) => d,
+        None if prompt::is_interactive() => {
+            println!(
+                "{count} task(s) are in `{removing}`. Move them to which state? ({})",
+                candidates.join(", ")
+            );
+            prompt::ask("state", candidates.first().copied()).map_err(|e| e.to_string())?
+        }
+        None => {
+            return Err(format!(
+                "{count} task(s) are still in `{removing}` — pass --move-to <state> ({})",
+                candidates.join(", ")
+            ));
+        }
+    };
+    if !candidates.contains(&dest.as_str()) {
+        return Err(format!(
+            "unknown state `{dest}` — declared state(s): {}",
+            candidates.join(", ")
+        ));
+    }
+    Ok(dest)
 }
 
 pub fn run(cmd: ProjectCmd, mut reg: Registry) -> Result<(), String> {
     match cmd {
+        ProjectCmd::State { cmd } => state_cmd(&mut reg, cmd),
         ProjectCmd::Ls => list(&reg),
         ProjectCmd::Dirs { id, add, rm } => dirs_cmd(&mut reg, &id, &add, &rm),
         ProjectCmd::Which => which(&reg),
@@ -565,7 +910,13 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
             LocalDbBackend::open(&root).map_err(|e| e.to_string())?;
         }
     }
-    let body = render_project_toml(existing_src.as_deref(), &id, &name, &prefix);
+    let body = render_project_toml(
+        existing_src.as_deref(),
+        &id,
+        &name,
+        &prefix,
+        reg.workflow.as_ref(),
+    );
     ProjectConfig::parse(&body)
         .map_err(|e| format!("generated project.toml would not parse: {e}"))?;
     std::fs::write(&project_toml, body).map_err(|e| e.to_string())?;
@@ -666,7 +1017,7 @@ type = "int"
 
     #[test]
     fn render_rewrites_only_id_name_and_prefix() {
-        let got = render_project_toml(Some(CUSTOMISED), "new", "New", "NEW");
+        let got = render_project_toml(Some(CUSTOMISED), "new", "New", "NEW", None);
         assert!(got.contains(r#"id = "new""#), "{got}");
         assert!(got.contains(r#"name = "New""#), "{got}");
         assert!(got.contains(r#"prefix = "NEW""#), "{got}");
@@ -678,7 +1029,7 @@ type = "int"
 
     #[test]
     fn render_without_an_existing_config_uses_the_template() {
-        let got = render_project_toml(None, "fresh", "Fresh", "FR");
+        let got = render_project_toml(None, "fresh", "Fresh", "FR", None);
         let cfg = ProjectConfig::parse(&got).unwrap();
         assert_eq!(cfg.id, "fresh");
         assert_eq!(cfg.prefix, "FR");
@@ -691,7 +1042,7 @@ type = "int"
 
     #[test]
     fn render_supplies_a_project_table_when_the_existing_one_has_none() {
-        let got = render_project_toml(Some("[workflow]\nstates = [\"a\"]\n"), "x", "X", "XX");
+        let got = render_project_toml(Some("[workflow]\nstates = [\"a\"]\n"), "x", "X", "XX", None);
         assert!(got.contains(r#"prefix = "XX""#), "{got}");
     }
 

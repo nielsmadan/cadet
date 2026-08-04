@@ -116,9 +116,23 @@ enum Cmd {
     /// Adopt every pending hand-written note immediately
     Adopt,
     /// Report quarantined tasks
-    Doctor,
+    Doctor {
+        #[command(subcommand)]
+        cmd: Option<DoctorCmd>,
+    },
     /// Revert the last change
     Undo,
+}
+
+#[derive(Subcommand)]
+enum DoctorCmd {
+    /// Move every task stuck in an undeclared state into a declared one.
+    ///
+    /// The way back from a `[workflow]` edited by hand, pulled in from
+    /// another machine, or otherwise changed out from under tasks that were
+    /// already in the removed state — every ordinary write refuses those
+    /// tasks, including the move that would fix them.
+    RepairState { from: String, to: String },
 }
 
 pub(crate) const TEMPLATE: &str = r#"[project]
@@ -156,7 +170,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Error>> {
+pub(crate) fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::error::Error>> {
     let index = SqliteIndex::open(&reg.index_path())?;
     let (backend, git): (Box<dyn Backend>, Option<GitNet>) = match p.backend {
         BackendKind::Markdown => {
@@ -794,7 +808,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("adopted {} note(s)", r.adopted + r.copies);
             print_warnings(&app);
         }
-        Cmd::Doctor => {
+        Cmd::Doctor {
+            cmd: Some(DoctorCmd::RepairState { from, to }),
+        } => {
+            let filter = TaskFilter {
+                states: vec![from.clone()],
+                ..Default::default()
+            };
+            let keys: Vec<TaskKey> = app
+                .list_filtered(true, &filter)?
+                .into_iter()
+                .map(|s| s.key)
+                .collect();
+            if keys.is_empty() {
+                println!("no tasks are in `{from}`");
+            } else {
+                let moved = app.move_tasks(&keys, &to)?;
+                println!("moved {moved} task(s) from `{from}` to `{to}`");
+            }
+        }
+        Cmd::Doctor { cmd: None } => {
             println!(
                 "adopted: {}  pending: {}",
                 report.adopted, report.pending_adoption
@@ -805,6 +838,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "renumbered: {}  pending renumber: {}",
                 renumbers.recorded, renumbers.pending
             );
+            let stranded = app.stranded()?;
+            if !stranded.is_empty() {
+                let mut states: Vec<&str> = stranded.iter().map(|s| s.state.as_str()).collect();
+                states.sort_unstable();
+                states.dedup();
+                println!(
+                    "stranded: {} task(s) in undeclared state(s): {}",
+                    stranded.len(),
+                    states.join(", ")
+                );
+                println!(
+                    "  nothing can be written to these until they move — \
+                     `cadet doctor repair-state <from> <to>`"
+                );
+            }
             if report.scan_rejected.is_some() {
                 println!("scan rejected — see the warning above");
             }
@@ -828,6 +876,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn jiff_now_ms() -> i64 {
+pub(crate) fn jiff_now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }

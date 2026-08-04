@@ -2108,3 +2108,276 @@ fn a_registry_with_no_directories_behaves_as_it_always_did() {
     let raw = std::fs::read_to_string(h.home.path().join("config.toml")).unwrap();
     assert!(!raw.contains("dirs"), "{raw}");
 }
+
+fn project_toml(e: &Env) -> String {
+    std::fs::read_to_string(e.vault.join("project.toml")).unwrap()
+}
+
+#[test]
+fn state_ls_shows_the_declared_order_and_marks_initial_and_terminal() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("todo  (initial)"))
+        .stdout(predicates::str::contains("done  (terminal)"));
+}
+
+#[test]
+fn state_add_places_a_state_where_asked() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "add", "review", "--after", "doing"])
+        .assert()
+        .success();
+    let raw = project_toml(&e);
+    assert!(
+        raw.contains(r#"states = ["todo", "doing", "review", "blocked", "done"]"#),
+        "{raw}"
+    );
+}
+
+#[test]
+fn state_add_refuses_a_name_that_is_already_a_state() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "add", "todo"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already a state"));
+}
+
+#[test]
+fn state_rm_with_no_tasks_in_it_just_removes_it() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "rm", "blocked"])
+        .assert()
+        .success();
+    let raw = project_toml(&e);
+    assert!(!raw.contains("blocked"), "{raw}");
+    assert!(
+        raw.contains("[[fields]]") || raw.contains("# [[fields]]"),
+        "{raw}"
+    );
+}
+
+#[test]
+fn state_rm_refuses_non_interactively_while_tasks_hold_it_and_changes_nothing() {
+    let e = env();
+    cadet(&e.home).args(["add", "stuck"]).assert().success();
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "blocked"])
+        .assert()
+        .success();
+    let before = project_toml(&e);
+
+    cadet(&e.home)
+        .args(["project", "state", "rm", "blocked"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--move-to"));
+
+    assert_eq!(project_toml(&e), before, "a refusal must change nothing");
+    cadet(&e.home)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("blocked"));
+}
+
+#[test]
+fn state_rm_with_move_to_migrates_the_tasks_then_removes_the_state() {
+    let e = env();
+    for t in ["one", "two"] {
+        cadet(&e.home).args(["add", t]).assert().success();
+    }
+    for k in ["PERS-1", "PERS-2"] {
+        cadet(&e.home).args(["mv", k, "blocked"]).assert().success();
+    }
+    cadet(&e.home)
+        .args(["project", "state", "rm", "blocked", "--move-to", "doing"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("moved 2 task(s)"));
+
+    assert!(!project_toml(&e).contains("blocked"));
+    cadet(&e.home)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("doing").and(predicates::str::contains("blocked").not()));
+}
+
+#[test]
+fn state_rm_refuses_an_unknown_state_and_the_initial_one() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "rm", "ghost"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown state"));
+    cadet(&e.home)
+        .args(["project", "state", "rm", "todo"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("new tasks start"));
+}
+
+#[test]
+fn state_rm_rejects_an_undeclared_move_to_target_before_touching_anything() {
+    let e = env();
+    cadet(&e.home).args(["add", "stuck"]).assert().success();
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "blocked"])
+        .assert()
+        .success();
+    let before = project_toml(&e);
+    cadet(&e.home)
+        .args(["project", "state", "rm", "blocked", "--move-to", "ghost"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unknown state"));
+    assert_eq!(project_toml(&e), before);
+}
+
+#[test]
+fn state_rename_moves_every_task_that_holds_it() {
+    let e = env();
+    cadet(&e.home).args(["add", "one"]).assert().success();
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "blocked"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["project", "state", "rename", "blocked", "waiting"])
+        .assert()
+        .success();
+
+    let raw = project_toml(&e);
+    assert!(raw.contains("waiting"), "{raw}");
+    assert!(!raw.contains("blocked"), "{raw}");
+    cadet(&e.home)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("waiting"));
+    // The task is not stranded: an ordinary write still works on it.
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "todo"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn state_rename_refuses_a_name_already_in_use() {
+    let e = env();
+    cadet(&e.home)
+        .args(["project", "state", "rename", "blocked", "done"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("already exists"));
+}
+
+#[test]
+fn set_default_makes_new_projects_inherit_the_workflow() {
+    let h = harness();
+    h.cadet(&["project", "add", "a", "--path", &h.vault("a")])
+        .assert()
+        .success();
+    h.cadet(&["project", "state", "add", "review", "--after", "doing", "a"])
+        .assert()
+        .success();
+    h.cadet(&["project", "state", "set-default", "a"])
+        .assert()
+        .success();
+
+    let registry = std::fs::read_to_string(h.home().join("config.toml")).unwrap();
+    assert!(registry.contains("[workflow]"), "{registry}");
+
+    h.cadet(&["project", "add", "b", "--path", &h.vault("b")])
+        .assert()
+        .success();
+    let raw =
+        std::fs::read_to_string(std::path::Path::new(&h.vault("b")).join("project.toml")).unwrap();
+    assert!(
+        raw.contains("review"),
+        "the new project must inherit: {raw}"
+    );
+}
+
+#[test]
+fn a_project_created_without_a_registry_workflow_still_gets_the_template() {
+    let h = harness();
+    h.cadet(&["project", "add", "a", "--path", &h.vault("a")])
+        .assert()
+        .success();
+    let raw =
+        std::fs::read_to_string(std::path::Path::new(&h.vault("a")).join("project.toml")).unwrap();
+    assert!(
+        raw.contains(r#"states = ["todo", "doing", "blocked", "done"]"#),
+        "{raw}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_stranded_task_and_repair_state_frees_it() {
+    let e = env();
+    cadet(&e.home).args(["add", "stuck"]).assert().success();
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "blocked"])
+        .assert()
+        .success();
+    // A hand edit — exactly what the `state rm` command exists to prevent,
+    // and what a pull from another machine can do anyway.
+    let cfg = project_toml(&e).replace(
+        r#"states = ["todo", "doing", "blocked", "done"]"#,
+        r#"states = ["todo", "doing", "done"]"#,
+    );
+    std::fs::write(e.vault.join("project.toml"), cfg).unwrap();
+
+    cadet(&e.home)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("stranded: 1"))
+        .stdout(predicates::str::contains("blocked"));
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "todo"])
+        .assert()
+        .failure();
+
+    cadet(&e.home)
+        .args(["doctor", "repair-state", "blocked", "todo"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("moved 1 task(s)"));
+
+    cadet(&e.home)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("stranded").not());
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "doing"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn ls_groups_tasks_by_the_declared_state_order() {
+    let e = env();
+    for t in ["first", "second"] {
+        cadet(&e.home).args(["add", t]).assert().success();
+    }
+    cadet(&e.home)
+        .args(["mv", "PERS-1", "blocked"])
+        .assert()
+        .success();
+    let out = cadet(&e.home).arg("ls").assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let todo_at = stdout.find("PERS-2").unwrap();
+    let blocked_at = stdout.find("PERS-1").unwrap();
+    assert!(todo_at < blocked_at, "todo must precede blocked:\n{stdout}");
+}

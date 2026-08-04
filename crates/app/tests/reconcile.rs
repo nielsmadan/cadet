@@ -1926,3 +1926,132 @@ fn a_delta_with_one_upsert_colliding_against_an_already_cached_task_does_not_bri
         "the already-cached task must keep its key, got {listed:?}"
     );
 }
+
+#[test]
+fn a_bulk_move_leaves_one_commit_for_the_whole_batch() {
+    let f = fixture();
+    let keys: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|t| f.app.add(t).unwrap().key)
+        .collect();
+    let before: usize = commit_count(&f.repo_dir, &f.vault_path).parse().unwrap();
+
+    assert_eq!(f.app.move_tasks(&keys, "doing").unwrap(), 3);
+
+    let after: usize = commit_count(&f.repo_dir, &f.vault_path).parse().unwrap();
+    assert_eq!(
+        after - before,
+        1,
+        "a bulk move must be one commit, not one per task"
+    );
+    for s in f.app.list(false).unwrap() {
+        assert_eq!(s.state, "doing", "{s:?}");
+    }
+}
+
+#[test]
+fn a_bulk_move_rescues_a_task_whose_state_is_no_longer_declared() {
+    let f = fixture();
+    let key = f.app.add("stuck").unwrap().key;
+    f.app.set_state(&key, "doing").unwrap();
+    // The state is removed from the workflow while a task still holds it.
+    std::fs::write(
+        f.vault_path.join("project.toml"),
+        CFG.replace(
+            r#"states = ["todo", "doing", "done"]"#,
+            r#"states = ["todo", "done"]"#,
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        f.app.set_state(&key, "todo").is_err(),
+        "the ordinary write path must still refuse a stranded task"
+    );
+    assert_eq!(f.app.stranded().unwrap().len(), 1);
+
+    assert_eq!(
+        f.app
+            .move_tasks(std::slice::from_ref(&key), "todo")
+            .unwrap(),
+        1
+    );
+    assert!(f.app.stranded().unwrap().is_empty());
+    assert_eq!(f.app.get_by_key(&key).unwrap().state, "todo");
+}
+
+#[test]
+fn a_bulk_move_rejects_an_undeclared_destination() {
+    let f = fixture();
+    let key = f.app.add("a").unwrap().key;
+    assert!(f.app.move_tasks(&[key], "nope").is_err());
+}
+
+#[test]
+fn a_bulk_move_of_nothing_leaves_no_commit() {
+    let f = fixture();
+    let key = f.app.add("a").unwrap().key;
+    let before = commit_count(&f.repo_dir, &f.vault_path);
+    assert_eq!(f.app.move_tasks(&[key], "todo").unwrap(), 0);
+    assert_eq!(commit_count(&f.repo_dir, &f.vault_path), before);
+}
+
+#[test]
+fn listing_groups_tasks_by_the_declared_state_order() {
+    let f = fixture();
+    let a = f.app.add("a").unwrap().key;
+    let b = f.app.add("b").unwrap().key;
+    let c = f.app.add("c").unwrap().key;
+    f.app.set_state(&a, "doing").unwrap();
+    f.app.set_state(&c, "doing").unwrap();
+    let _ = b;
+
+    let states: Vec<String> = f
+        .app
+        .list(false)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.state)
+        .collect();
+    assert_eq!(
+        states,
+        vec!["todo", "doing", "doing"],
+        "declared order wins"
+    );
+
+    // Within a group the existing due/priority/key ordering survives.
+    let keys: Vec<String> = f
+        .app
+        .list(false)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.state == "doing")
+        .map(|s| s.key.to_string())
+        .collect();
+    assert_eq!(keys, vec![a.to_string(), c.to_string()]);
+}
+
+#[test]
+fn a_stranded_state_sorts_last() {
+    let f = fixture();
+    let a = f.app.add("a").unwrap().key;
+    let b = f.app.add("b").unwrap().key;
+    f.app.set_state(&a, "doing").unwrap();
+    std::fs::write(
+        f.vault_path.join("project.toml"),
+        CFG.replace(
+            r#"states = ["todo", "doing", "done"]"#,
+            r#"states = ["todo", "done"]"#,
+        ),
+    )
+    .unwrap();
+
+    let keys: Vec<String> = f
+        .app
+        .list(false)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.key.to_string())
+        .collect();
+    assert_eq!(keys, vec![b.to_string(), a.to_string()]);
+}

@@ -63,6 +63,10 @@ pub struct Registry {
     pub projects: Vec<Project>,
     pub default: Option<String>,
     pub project_root: Option<PathBuf>,
+    /// The workflow new projects are created with. `None` — the state of
+    /// every registry written before this key existed — means the built-in
+    /// template, so an untouched registry behaves exactly as it did.
+    pub workflow: Option<cadet_core::Workflow>,
     // The document `load_from` parsed, kept around so `save` can mutate it
     // in place instead of building a fresh one from scratch — that's what
     // lets unknown top-level keys, and unknown keys inside a `[projects.x]`
@@ -170,6 +174,7 @@ impl Registry {
             projects: vec![],
             default: None,
             project_root: None,
+            workflow: None,
             doc: None,
         };
         let Ok(src) = std::fs::read_to_string(&path) else {
@@ -194,6 +199,18 @@ impl Registry {
             .get("project_root")
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
+        // Validated on load, loudly, for the same reason a malformed registry
+        // is: a default workflow that is quietly ignored gets discovered when
+        // a project created from it turns out to have the built-in states
+        // instead, long after the typo.
+        if let Some(item) = doc.get("workflow") {
+            reg.workflow = Some(cadet_core::Workflow::from_toml_item(item).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("[workflow] in {}: {e}", path.display()),
+                )
+            })?);
+        }
         if let Some(tbl) = doc.get("projects").and_then(|p| p.as_table_like()) {
             for (id, item) in tbl.iter() {
                 if let Some(p) = item.get("path").and_then(|v| v.as_str()) {
@@ -283,6 +300,21 @@ impl Registry {
             Some(pr) => doc["project_root"] = toml_edit::value(pr.to_string_lossy().as_ref()),
             None => {
                 doc.remove("project_root");
+            }
+        }
+        match &self.workflow {
+            Some(wf) => {
+                if !matches!(doc.get("workflow"), Some(item) if item.is_table()) {
+                    doc["workflow"] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                wf.write_into(
+                    doc["workflow"]
+                        .as_table_mut()
+                        .expect("just ensured this is a table"),
+                );
+            }
+            None => {
+                doc.remove("workflow");
             }
         }
 
@@ -415,6 +447,7 @@ mod tests {
             projects,
             default: default.map(str::to_string),
             project_root: None,
+            workflow: None,
             doc: None,
         }
     }
@@ -746,6 +779,53 @@ mod tests {
 
         let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
         assert_eq!(again.projects[0].backend, BackendKind::LocalDb);
+    }
+
+    #[test]
+    fn a_registry_with_no_workflow_key_never_grows_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "default = \"a\"\n\n[projects.a]\npath = \"/tmp/a\"\n",
+        )
+        .unwrap();
+        let reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert!(reg.workflow.is_none());
+        reg.save().unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(!raw.contains("workflow"), "{raw}");
+    }
+
+    #[test]
+    fn a_default_workflow_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        let wf = cadet_core::Workflow {
+            states: vec!["todo".into(), "blocked".into(), "done".into()],
+            initial: "todo".into(),
+            terminal: vec!["done".into()],
+            transitions: Default::default(),
+        };
+        reg.workflow = Some(wf.clone());
+        reg.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains("[workflow]"), "{raw}");
+
+        let again = Registry::load_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(again.workflow, Some(wf));
+    }
+
+    #[test]
+    fn a_malformed_default_workflow_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[workflow]\nstates = [\"todo\"]\ninitial = \"nope\"\n",
+        )
+        .unwrap();
+        let err = Registry::load_from(dir.path().to_path_buf()).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
     }
 
     #[test]

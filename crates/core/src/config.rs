@@ -50,6 +50,102 @@ pub struct Workflow {
     pub transitions: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+impl Workflow {
+    /// Parse and validate a `[workflow]` table. The registry and every
+    /// `project.toml` share this one implementation: two copies of the state
+    /// rules is exactly the divergence this codebase keeps producing.
+    pub fn from_toml_item(item: &toml_edit::Item) -> Result<Self, CoreError> {
+        let wf = Workflow {
+            states: str_vec(item, "states"),
+            initial: item
+                .get("initial")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            terminal: str_vec(item, "terminal"),
+            transitions: item
+                .get("transitions")
+                .and_then(|t| t.as_table_like())
+                .map(|t| {
+                    t.iter()
+                        .map(|(k, v)| {
+                            let allowed = v
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (k.to_string(), allowed)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        wf.validate()?;
+        Ok(wf)
+    }
+
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.states.is_empty() {
+            return Err(CoreError::EmptyWorkflow);
+        }
+        if !self.states.contains(&self.initial) {
+            return Err(CoreError::UnknownState(self.initial.clone()));
+        }
+        for state in &self.terminal {
+            if !self.states.contains(state) {
+                return Err(CoreError::UnknownState(state.clone()));
+            }
+        }
+        for (from, allowed) in &self.transitions {
+            if !self.states.contains(from) {
+                return Err(CoreError::UnknownState(from.clone()));
+            }
+            for to in allowed {
+                if !self.states.contains(to) {
+                    return Err(CoreError::UnknownState(to.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write into an existing table, leaving every key this type does not own
+    /// (comments, unknown keys) exactly where it was.
+    pub fn write_into(&self, tbl: &mut toml_edit::Table) {
+        tbl["states"] = toml_edit::value(to_array(&self.states));
+        tbl["initial"] = toml_edit::value(self.initial.as_str());
+        tbl["terminal"] = toml_edit::value(to_array(&self.terminal));
+        if self.transitions.is_empty() {
+            tbl.remove("transitions");
+        } else {
+            let mut t = toml_edit::Table::new();
+            for (from, allowed) in &self.transitions {
+                t[from.as_str()] = toml_edit::value(to_array(allowed));
+            }
+            t.set_implicit(false);
+            tbl["transitions"] = toml_edit::Item::Table(t);
+        }
+    }
+}
+
+fn to_array(v: &[String]) -> toml_edit::Array {
+    v.iter().map(String::as_str).collect()
+}
+
+fn str_vec(item: &toml_edit::Item, k: &str) -> Vec<String> {
+    item.get(k)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectConfig {
     pub id: String,
@@ -80,63 +176,7 @@ impl ProjectConfig {
             .get("workflow")
             .ok_or_else(|| CoreError::ConfigParse("missing [workflow] table".into()))?;
 
-        let str_vec = |item: &toml_edit::Item, k: &str| -> Vec<String> {
-            item.get(k)
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        let workflow = Workflow {
-            states: str_vec(wf_item, "states"),
-            initial: get(wf_item, "initial"),
-            terminal: str_vec(wf_item, "terminal"),
-            transitions: wf_item
-                .get("transitions")
-                .and_then(|t| t.as_table_like())
-                .map(|t| {
-                    t.iter()
-                        .map(|(k, v)| {
-                            let allowed = v
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|x| x.as_str().map(str::to_string))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            (k.to_string(), allowed)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-
-        if workflow.states.is_empty() {
-            return Err(CoreError::EmptyWorkflow);
-        }
-        if !workflow.states.contains(&workflow.initial) {
-            return Err(CoreError::UnknownState(workflow.initial));
-        }
-        for state in &workflow.terminal {
-            if !workflow.states.contains(state) {
-                return Err(CoreError::UnknownState(state.clone()));
-            }
-        }
-        for (from, allowed) in &workflow.transitions {
-            if !workflow.states.contains(from) {
-                return Err(CoreError::UnknownState(from.clone()));
-            }
-            for to in allowed {
-                if !workflow.states.contains(to) {
-                    return Err(CoreError::UnknownState(to.clone()));
-                }
-            }
-        }
+        let workflow = Workflow::from_toml_item(wf_item)?;
 
         // Trimmed before the check, and stored trimmed: a whitespace-only
         // prefix passes `is_empty` and then renders keys as `" -1"`, and the
@@ -375,5 +415,92 @@ values = ["shopping", "admin"]
         let src = SAMPLE.replace("states = [\"todo\", \"doing\", \"done\"]", "states = []");
         let err = ProjectConfig::parse(&src).unwrap_err();
         assert!(matches!(err, CoreError::EmptyWorkflow));
+    }
+
+    fn workflow_of(src: &str) -> Result<Workflow, CoreError> {
+        let doc: toml_edit::DocumentMut = src.parse().unwrap();
+        Workflow::from_toml_item(doc.get("workflow").unwrap())
+    }
+
+    #[test]
+    fn a_standalone_workflow_table_parses_like_a_project_one() {
+        let wf = workflow_of(
+            r#"
+[workflow]
+states = ["todo", "doing", "done"]
+initial = "todo"
+terminal = ["done"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(wf, ProjectConfig::parse(SAMPLE).unwrap().workflow);
+    }
+
+    #[test]
+    fn a_standalone_workflow_table_is_validated() {
+        let err = workflow_of("[workflow]\nstates = []\ninitial = \"todo\"\n").unwrap_err();
+        assert!(matches!(err, CoreError::EmptyWorkflow));
+        let err = workflow_of("[workflow]\nstates = [\"todo\"]\ninitial = \"nope\"\n").unwrap_err();
+        assert!(
+            matches!(err, CoreError::UnknownState(ref s) if s == "nope"),
+            "{err:?}"
+        );
+        let err = workflow_of(
+            "[workflow]\nstates = [\"todo\"]\ninitial = \"todo\"\nterminal = [\"x\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::UnknownState(ref s) if s == "x"),
+            "{err:?}"
+        );
+    }
+
+    const WITH_TRANSITIONS: &str = r#"
+[workflow]
+states = ["todo", "doing", "done"]
+initial = "todo"
+terminal = ["done"]
+
+[workflow.transitions]
+todo = ["doing"]
+doing = ["done"]
+"#;
+
+    #[test]
+    fn write_into_round_trips_through_the_parser() {
+        let wf = workflow_of(WITH_TRANSITIONS).unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["workflow"] = toml_edit::Item::Table(toml_edit::Table::new());
+        wf.write_into(doc["workflow"].as_table_mut().unwrap());
+        assert_eq!(workflow_of(&doc.to_string()).unwrap(), wf);
+    }
+
+    #[test]
+    fn write_into_drops_an_emptied_transitions_table() {
+        let mut wf = workflow_of(WITH_TRANSITIONS).unwrap();
+        wf.transitions.clear();
+        let mut doc: toml_edit::DocumentMut = WITH_TRANSITIONS.parse().unwrap();
+        wf.write_into(doc["workflow"].as_table_mut().unwrap());
+        let out = doc.to_string();
+        assert!(!out.contains("transitions"), "{out}");
+        assert_eq!(workflow_of(&out).unwrap(), wf);
+    }
+
+    #[test]
+    fn write_into_leaves_unrelated_keys_and_comments_alone() {
+        let src = "# keep me\n[workflow]\n# and me\nstates = [\"todo\"]\ninitial = \"todo\"\nmystery = 7\n";
+        let mut doc: toml_edit::DocumentMut = src.parse().unwrap();
+        let wf = Workflow {
+            states: vec!["todo".into(), "done".into()],
+            initial: "todo".into(),
+            terminal: vec!["done".into()],
+            transitions: Default::default(),
+        };
+        wf.write_into(doc["workflow"].as_table_mut().unwrap());
+        let out = doc.to_string();
+        assert!(out.contains("# keep me"), "{out}");
+        assert!(out.contains("# and me"), "{out}");
+        assert!(out.contains("mystery = 7"), "{out}");
+        assert_eq!(workflow_of(&out).unwrap(), wf);
     }
 }

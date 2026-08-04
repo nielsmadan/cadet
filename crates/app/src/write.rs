@@ -297,6 +297,58 @@ impl App {
         Ok(task)
     }
 
+    /// Move many tasks into one state as a single administrative operation:
+    /// one git commit and one cache refresh for the whole batch, not one per
+    /// task. `cadet project state rm --move-to`, `state rename` and
+    /// `doctor repair-state` are all this function.
+    ///
+    /// Only the destination is validated. The transition graph is skipped on
+    /// purpose — the source state is typically one being removed, or one no
+    /// longer declared at all, and both callers exist precisely to rescue
+    /// tasks the ordinary write path refuses to touch. For the same reason
+    /// the merged task is not revalidated: a task stranded by a hand edit may
+    /// carry other pre-existing problems, and none of them are this call's to
+    /// fix or to block on.
+    pub fn move_tasks(&self, keys: &[TaskKey], to_state: &str) -> Result<usize, AppError> {
+        let cfg = self.backend.load_project()?;
+        if !cfg.workflow.states.iter().any(|s| s == to_state) {
+            return Err(CoreError::UnknownState(to_state.to_string()).into());
+        }
+        let now = Self::now();
+        let mut paths = Vec::new();
+        let mut moved = 0;
+        for key in keys {
+            let mut task = self.get_by_key(key)?;
+            if task.state == to_state {
+                continue;
+            }
+            let expected = revision(&task);
+            task.state = to_state.to_string();
+            task.updated = now;
+            self.backend.put(task.clone(), Some(expected))?;
+            paths.extend(self.location(&task.uid));
+            moved += 1;
+        }
+        if moved > 0 {
+            self.refresh_cache_or_warn();
+            self.commit_or_warn(&format!("move {moved} task(s) -> {to_state}"), &paths);
+        }
+        Ok(moved)
+    }
+
+    /// Every task whose state is not declared in the project's workflow —
+    /// stranded by a hand edit, a pull, or another machine. The ordinary
+    /// write path refuses all of them, so `doctor` reports them and
+    /// `move_tasks` is the way out.
+    pub fn stranded(&self) -> Result<Vec<TaskSummary>, AppError> {
+        let cfg = self.backend.load_project()?;
+        Ok(self
+            .list_filtered(true, &TaskFilter::default())?
+            .into_iter()
+            .filter(|s| !cfg.workflow.states.contains(&s.state))
+            .collect())
+    }
+
     pub fn delete(&self, key: &TaskKey) -> Result<(), AppError> {
         let task = self.get_by_key(key)?;
         let expected = revision(&task);
@@ -338,15 +390,11 @@ impl App {
         // be silently emptied by the same hiding that `--all` exists to
         // override. Without a state filter, the exclusion still applies.
         let include_terminal = all || !filter.states.is_empty();
-        let rows =
+        let mut rows =
             self.index
                 .list_tasks(&self.project, include_terminal, &cfg.workflow.terminal)?;
-        if filter.is_empty() {
-            return Ok(rows);
-        }
-        Ok(rows
-            .into_iter()
-            .filter(|s| {
+        if !filter.is_empty() {
+            rows.retain(|s| {
                 filter.matches(&FilterTarget {
                     state: &s.state,
                     due: s.due.as_deref(),
@@ -354,8 +402,21 @@ impl App {
                     tags: &s.tags,
                     fields: &s.fields,
                 })
-            })
-            .collect())
+            });
+        }
+        // The declared state order is the column order, Trello-style. The
+        // sort is stable, so SQL's due/priority/key ordering survives inside
+        // each group; a state the workflow no longer declares sorts last,
+        // where `doctor` tells you to go looking for it. The store stays
+        // workflow-agnostic — it has no idea states are ordered.
+        rows.sort_by_key(|s| {
+            cfg.workflow
+                .states
+                .iter()
+                .position(|st| st == &s.state)
+                .unwrap_or(cfg.workflow.states.len())
+        });
+        Ok(rows)
     }
 
     /// Unlike the write paths above, a failed undo must fail loudly: undo is
