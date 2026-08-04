@@ -67,6 +67,11 @@ pub struct Registry {
     /// every registry written before this key existed — means the built-in
     /// template, so an untouched registry behaves exactly as it did.
     pub workflow: Option<cadet_core::Workflow>,
+    /// Defaults for new tasks in every project. A project's own `[defaults]`
+    /// wins over this — unlike `[workflow]`, which is copied once at project
+    /// creation, because at creation time there is no project config to
+    /// consult and at task creation time there is.
+    pub defaults: cadet_core::Defaults,
     // The document `load_from` parsed, kept around so `save` can mutate it
     // in place instead of building a fresh one from scratch — that's what
     // lets unknown top-level keys, and unknown keys inside a `[projects.x]`
@@ -175,6 +180,7 @@ impl Registry {
             default: None,
             project_root: None,
             workflow: None,
+            defaults: Default::default(),
             doc: None,
         };
         let Ok(src) = std::fs::read_to_string(&path) else {
@@ -203,6 +209,14 @@ impl Registry {
         // is: a default workflow that is quietly ignored gets discovered when
         // a project created from it turns out to have the built-in states
         // instead, long after the typo.
+        if let Some(item) = doc.get("defaults") {
+            reg.defaults = cadet_core::Defaults::from_toml_item(item).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("[defaults] in {}: {e}", path.display()),
+                )
+            })?;
+        }
         if let Some(item) = doc.get("workflow") {
             reg.workflow = Some(cadet_core::Workflow::from_toml_item(item).map_err(|e| {
                 std::io::Error::new(
@@ -301,6 +315,18 @@ impl Registry {
             None => {
                 doc.remove("project_root");
             }
+        }
+        if self.defaults.is_empty() {
+            doc.remove("defaults");
+        } else {
+            if !matches!(doc.get("defaults"), Some(item) if item.is_table()) {
+                doc["defaults"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            self.defaults.write_into(
+                doc["defaults"]
+                    .as_table_mut()
+                    .expect("just ensured this is a table"),
+            );
         }
         match &self.workflow {
             Some(wf) => {
@@ -448,6 +474,7 @@ mod tests {
             default: default.map(str::to_string),
             project_root: None,
             workflow: None,
+            defaults: Default::default(),
             doc: None,
         }
     }

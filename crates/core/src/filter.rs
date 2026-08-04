@@ -11,6 +11,36 @@ pub struct TaskFilter {
     pub fields: Vec<(String, FieldValue)>,
 }
 
+/// A symbolic answer to "when is it due", resolved against a calendar day the
+/// caller supplies. Produces the same `due_before`/`due_after` bounds a user
+/// could have typed, so there is one comparison rule rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DueBucket {
+    Today,
+    Week,
+    Overdue,
+}
+
+impl DueBucket {
+    /// `(due_after, due_before)`, both exclusive, matching `TaskFilter`.
+    /// `today` is due on exactly this day, `overdue` is strictly before it,
+    /// and `week` is a rolling today-through-six-days-out window.
+    pub fn bounds(
+        self,
+        today: jiff::civil::Date,
+    ) -> Result<(Option<String>, Option<String>), jiff::Error> {
+        let day = |d: jiff::civil::Date| d.to_string();
+        Ok(match self {
+            DueBucket::Today => (Some(day(today.yesterday()?)), Some(day(today.tomorrow()?))),
+            DueBucket::Week => (
+                Some(day(today.yesterday()?)),
+                Some(day(today.checked_add(jiff::Span::new().days(7))?)),
+            ),
+            DueBucket::Overdue => (None, Some(day(today))),
+        })
+    }
+}
+
 pub struct FilterTarget<'a> {
     pub state: &'a str,
     pub due: Option<&'a str>,
@@ -182,5 +212,94 @@ mod tests {
         };
         assert!(f.matches(&target("todo", None, &tags_v, &fields)));
         assert!(!f.matches(&target("doing", None, &tags_v, &fields)));
+    }
+}
+
+#[cfg(test)]
+mod due_bucket_tests {
+    use super::*;
+
+    fn d(s: &str) -> jiff::civil::Date {
+        s.parse().unwrap()
+    }
+
+    fn matches(bucket: DueBucket, today: &str, due: &str) -> bool {
+        let (after, before) = bucket.bounds(d(today)).unwrap();
+        let f = TaskFilter {
+            due_after: after,
+            due_before: before,
+            ..Default::default()
+        };
+        f.matches(&FilterTarget {
+            state: "todo",
+            due: Some(due),
+            priority: Priority::default(),
+            tags: &[],
+            fields: &BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn today_is_exactly_that_day() {
+        assert!(matches(DueBucket::Today, "2026-08-05", "2026-08-05"));
+        assert!(!matches(DueBucket::Today, "2026-08-05", "2026-08-04"));
+        assert!(!matches(DueBucket::Today, "2026-08-05", "2026-08-06"));
+    }
+
+    #[test]
+    fn overdue_is_strictly_before_today() {
+        assert!(matches(DueBucket::Overdue, "2026-08-05", "2026-08-04"));
+        assert!(!matches(DueBucket::Overdue, "2026-08-05", "2026-08-05"));
+        assert!(!matches(DueBucket::Overdue, "2026-08-05", "2026-08-06"));
+    }
+
+    #[test]
+    fn week_is_today_through_six_days_out() {
+        assert!(matches(DueBucket::Week, "2026-08-05", "2026-08-05"));
+        assert!(matches(DueBucket::Week, "2026-08-05", "2026-08-11"));
+        assert!(!matches(DueBucket::Week, "2026-08-05", "2026-08-12"));
+        assert!(!matches(DueBucket::Week, "2026-08-05", "2026-08-04"));
+    }
+
+    #[test]
+    fn an_undated_task_is_in_no_bucket() {
+        for b in [DueBucket::Today, DueBucket::Week, DueBucket::Overdue] {
+            let (after, before) = b.bounds(d("2026-08-05")).unwrap();
+            let f = TaskFilter {
+                due_after: after,
+                due_before: before,
+                ..Default::default()
+            };
+            assert!(!f.matches(&FilterTarget {
+                state: "todo",
+                due: None,
+                priority: Priority::default(),
+                tags: &[],
+                fields: &BTreeMap::new(),
+            }));
+        }
+    }
+
+    #[test]
+    fn bounds_stay_fixed_width_across_month_and_year_rollovers() {
+        for (today, bucket) in [
+            ("2026-01-01", DueBucket::Today),
+            ("2026-12-31", DueBucket::Week),
+            ("2024-02-29", DueBucket::Today),
+            ("2026-03-01", DueBucket::Today),
+        ] {
+            let (after, before) = bucket.bounds(d(today)).unwrap();
+            for b in [after, before].into_iter().flatten() {
+                assert_eq!(b.len(), 10, "{b} from {today}");
+                assert!(crate::is_date_like(&b), "{b} from {today}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_leap_day_rolls_over_correctly() {
+        assert!(matches(DueBucket::Week, "2024-02-26", "2024-02-29"));
+        assert!(matches(DueBucket::Today, "2024-02-28", "2024-02-28"));
+        assert!(matches(DueBucket::Overdue, "2024-03-01", "2024-02-29"));
     }
 }

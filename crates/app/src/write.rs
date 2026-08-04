@@ -330,10 +330,88 @@ impl App {
             moved += 1;
         }
         if moved > 0 {
-            self.refresh_cache_or_warn();
-            self.commit_or_warn(&format!("move {moved} task(s) -> {to_state}"), &paths);
+            self.finish_batch(&format!("move {moved} task(s) -> {to_state}"), &paths);
         }
         Ok(moved)
+    }
+
+    /// The tail every batch write shares: refresh the cache once, commit once.
+    /// Pairing these by hand at each call site is how one of them gets left
+    /// out, or run per task and turned into N commits in the user's vault.
+    fn finish_batch(&self, message: &str, paths: &[String]) {
+        self.refresh_cache_or_warn();
+        self.commit_or_warn(message, paths);
+    }
+
+    /// Resolves every key before any of them is written, so a typo in the
+    /// last key of a batch does not leave the first three already applied.
+    /// Deduplicates by uid: naming one task twice must not write it twice.
+    fn resolve_batch(&self, keys: &[TaskKey]) -> Result<Vec<Task>, AppError> {
+        let mut seen = BTreeSet::new();
+        let mut tasks = Vec::new();
+        for key in keys {
+            let task = self.get_by_key(key)?;
+            if seen.insert(task.uid.clone()) {
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// `cadet done`, for any number of keys. Unlike `move_tasks` this honours
+    /// the transition graph — a workflow that forbids todo→done must still
+    /// forbid it here — and like `resolve_batch` it checks every task before
+    /// writing any.
+    pub fn complete_tasks(&self, keys: &[TaskKey]) -> Result<Vec<TaskKey>, AppError> {
+        let cfg = self.backend.load_project()?;
+        let mut tasks = self.resolve_batch(keys)?;
+        for t in &tasks {
+            check_transition(&cfg.workflow, &t.state, "done")?;
+        }
+        let now = Self::now();
+        let mut paths = Vec::new();
+        for task in &mut tasks {
+            let expected = revision(task);
+            task.state = "done".to_string();
+            task.updated = now;
+            self.backend.put(task.clone(), Some(expected))?;
+            paths.extend(self.location(&task.uid));
+        }
+        match tasks.as_slice() {
+            [] => {}
+            [one] => self.finish_batch(&format!("{} -> done", one.key), &paths),
+            many => self.finish_batch(&format!("done {} task(s)", many.len()), &paths),
+        }
+        Ok(tasks.into_iter().map(|t| t.key).collect())
+    }
+
+    /// `cadet rm`, for any number of keys. Ten keys leave one commit.
+    pub fn delete_many(&self, keys: &[TaskKey]) -> Result<Vec<TaskKey>, AppError> {
+        let tasks = self.resolve_batch(keys)?;
+        let mut paths = Vec::new();
+        for task in &tasks {
+            let expected = revision(task);
+            // Resolved before the delete: afterwards there is no file to
+            // locate, and the safety net would never record the removal.
+            paths.extend(self.location(&task.uid));
+            self.backend.delete(task.uid.clone(), Some(expected))?;
+            // An explicit `cadet rm` is certain, not inferred — the file's
+            // absence is never going to be resolved by a sync tool catching
+            // up. Retire the identity outright instead of leaving it in
+            // `entries` for the next `reconcile` to rediscover, which would
+            // look exactly like an ordinary external deletion: routed through
+            // the deletion grace period (and counted in its mass-deletion
+            // `ScanRejected` guard) for no reason, and misreported by
+            // `cadet doctor` as still pending when the user already confirmed
+            // it.
+            self.index.forget(&self.project, &task.uid)?;
+        }
+        match tasks.as_slice() {
+            [] => {}
+            [one] => self.finish_batch(&format!("remove {}", one.key), &paths),
+            many => self.finish_batch(&format!("remove {} task(s)", many.len()), &paths),
+        }
+        Ok(tasks.into_iter().map(|t| t.key).collect())
     }
 
     /// Every task whose state is not declared in the project's workflow —
@@ -349,25 +427,34 @@ impl App {
             .collect())
     }
 
-    pub fn delete(&self, key: &TaskKey) -> Result<(), AppError> {
+    /// The file to open in `$EDITOR`, or an error for a backend that has no
+    /// files. Resolved before anything is spawned, so an unsupported backend
+    /// never launches an editor on nothing.
+    pub fn edit_path(&self, key: &TaskKey) -> Result<String, AppError> {
         let task = self.get_by_key(key)?;
-        let expected = revision(&task);
-        // Resolved before the delete: afterwards there is no file to locate,
-        // and the safety net would never record the removal.
-        let paths = self.location(&task.uid);
-        self.backend.delete(task.uid.clone(), Some(expected))?;
-        // An explicit `cadet rm` is certain, not inferred — the file's
-        // absence is never going to be resolved by a sync tool catching up.
-        // Retire the identity outright instead of leaving it in `entries`
-        // for the next `reconcile` to rediscover, which would look exactly
-        // like an ordinary external deletion: routed through the deletion
-        // grace period (and counted in its mass-deletion `ScanRejected`
-        // guard) for no reason, and misreported by `cadet doctor` as still
-        // pending when the user already confirmed it.
-        self.index.forget(&self.project, &task.uid)?;
-        self.refresh_cache_or_warn();
-        self.commit_or_warn(&format!("remove {key}"), &paths);
-        Ok(())
+        match self.backend.location_of(task.uid)? {
+            Some(p) => Ok(p),
+            None => Err(BackendError::Unsupported {
+                capability: "edit".to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Records a hand edit in the safety net. `GitNet::commit` no-ops on an
+    /// empty diff, so an editor the user quit without saving leaves nothing
+    /// behind.
+    pub fn record_edit(&self, key: &TaskKey, path: &str) {
+        self.commit_or_warn(
+            &format!("edit {key}"),
+            std::slice::from_ref(&path.to_string()),
+        );
+    }
+
+    /// One key is a batch of one — same function, so the single and multi
+    /// paths cannot drift apart.
+    pub fn delete(&self, key: &TaskKey) -> Result<(), AppError> {
+        self.delete_many(std::slice::from_ref(key)).map(|_| ())
     }
 
     /// The list view. One SQL query — never touches the backend (spec §3).

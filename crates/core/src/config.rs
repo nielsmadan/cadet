@@ -131,6 +131,53 @@ impl Workflow {
     }
 }
 
+/// The `[defaults]` table: what a new task gets when the command line says
+/// nothing. Lives in both the registry and every `project.toml`, parsed and
+/// written by this one type so the two spellings cannot drift.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Defaults {
+    /// A due specification, not a date — `+7d` stays correct tomorrow.
+    pub due: Option<String>,
+}
+
+impl Defaults {
+    pub fn from_toml_item(item: &toml_edit::Item) -> Result<Self, CoreError> {
+        let d = Defaults {
+            due: item
+                .get("due")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty()),
+        };
+        d.validate()?;
+        Ok(d)
+    }
+
+    /// A due specification is date-independent, so validating it against any
+    /// day proves it for every day. Checked on load rather than on first use:
+    /// a typo that only surfaces the next time a task is created is a typo
+    /// discovered by a task with the wrong due date.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if let Some(spec) = &self.due {
+            crate::due::resolve_due(spec, jiff::civil::date(2000, 1, 1))?;
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.due.is_none()
+    }
+
+    pub fn write_into(&self, tbl: &mut toml_edit::Table) {
+        match &self.due {
+            Some(d) => tbl["due"] = toml_edit::value(d.as_str()),
+            None => {
+                tbl.remove("due");
+            }
+        }
+    }
+}
+
 fn to_array(v: &[String]) -> toml_edit::Array {
     v.iter().map(String::as_str).collect()
 }
@@ -155,6 +202,7 @@ pub struct ProjectConfig {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub workflow: Workflow,
+    pub defaults: Defaults,
     pub fields: Vec<FieldDef>,
 }
 
@@ -177,6 +225,10 @@ impl ProjectConfig {
             .ok_or_else(|| CoreError::ConfigParse("missing [workflow] table".into()))?;
 
         let workflow = Workflow::from_toml_item(wf_item)?;
+        let defaults = match doc.get("defaults") {
+            Some(item) => Defaults::from_toml_item(item)?,
+            None => Defaults::default(),
+        };
 
         // Trimmed before the check, and stored trimmed: a whitespace-only
         // prefix passes `is_empty` and then renders keys as `" -1"`, and the
@@ -260,6 +312,7 @@ impl ProjectConfig {
             include: tasks.map(|t| str_vec(t, "include")).unwrap_or_default(),
             exclude: tasks.map(|t| str_vec(t, "exclude")).unwrap_or_default(),
             workflow,
+            defaults,
             fields,
         })
     }

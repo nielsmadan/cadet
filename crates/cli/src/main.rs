@@ -6,7 +6,10 @@ mod prompt;
 use cadet_app::{App, GitNet, RejectReason, TaskChanges, TaskDraft};
 use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
-use cadet_core::{Backend, Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like};
+use cadet_core::{
+    Backend, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like,
+    resolve_due_for_new_task,
+};
 use cadet_store_sqlite::SqliteIndex;
 use clap::{Parser, Subcommand};
 use config::{BackendKind, Project, Registry};
@@ -37,6 +40,23 @@ impl From<PriorityArg> for Priority {
     }
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DueArg {
+    Today,
+    Week,
+    Overdue,
+}
+
+impl From<DueArg> for DueBucket {
+    fn from(d: DueArg) -> Self {
+        match d {
+            DueArg::Today => DueBucket::Today,
+            DueArg::Week => DueBucket::Week,
+            DueArg::Overdue => DueBucket::Overdue,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Manage projects
@@ -57,9 +77,12 @@ enum Cmd {
     /// Add a task
     Add {
         title: Vec<String>,
-        /// Due date, e.g. 2026-08-10
+        /// Due date: 2026-08-10, or `today`, `tomorrow`, `+7d`, `+2w`
         #[arg(long)]
         due: Option<String>,
+        /// Create the task with no due date, ignoring any configured default
+        #[arg(long, conflicts_with = "due")]
+        no_due: bool,
         /// Tag to attach, repeatable
         #[arg(long = "tag", value_parser = parse_tag)]
         tags: Vec<String>,
@@ -95,6 +118,9 @@ enum Cmd {
         /// Only tasks at this priority
         #[arg(long, value_enum, ignore_case = true)]
         priority: Option<PriorityArg>,
+        /// Only tasks due today, in the next week, or already overdue
+        #[arg(long, value_enum, ignore_case = true)]
+        due: Option<DueArg>,
         /// Only tasks due before this date
         #[arg(long)]
         due_before: Option<String>,
@@ -107,12 +133,20 @@ enum Cmd {
     },
     /// Show one task
     Show { key: String },
-    /// Mark a task done
-    Done { key: String },
+    /// Open a task in $EDITOR
+    Edit { key: String },
+    /// Mark one or more tasks done
+    Done {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     /// Move a task to a state
     Mv { key: String, state: String },
-    /// Remove a task
-    Rm { key: String },
+    /// Remove one or more tasks
+    Rm {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
     /// Adopt every pending hand-written note immediately
     Adopt,
     /// Report quarantined tasks
@@ -182,6 +216,54 @@ pub(crate) fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::
         BackendKind::LocalDb => (Box::new(LocalDbBackend::open(&p.path)?), None),
     };
     Ok(App::new(backend, index, git, p.id.clone()))
+}
+
+fn report_reconcile(report: &cadet_app::ReconcileReport) {
+    match &report.scan_rejected {
+        Some(RejectReason::SuspectedIncompleteScan) => {
+            eprintln!("⚠ scan rejected: an unexpectedly large number of tasks disappeared.");
+            eprintln!("  Nothing was deleted. Check that your sync tool has finished.");
+        }
+        Some(RejectReason::Incomplete) => {
+            eprintln!("⚠ scan rejected: some files could not be read.");
+            eprintln!(
+                "  Nothing was deleted. Check file permissions, or wait for a cloud-synced folder to finish downloading."
+            );
+        }
+        None => {}
+    }
+    if report.pending_adoption > 0 {
+        eprintln!(
+            "⚠ {} note(s) ready to adopt — run `cadet adopt`",
+            report.pending_adoption
+        );
+    }
+}
+
+/// `$EDITOR`, split on whitespace so `EDITOR="code --wait"` works. Falls back
+/// to `vi`, the same fallback the Justfile's `conf` recipe uses.
+fn spawn_editor(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let editor = match std::env::var("EDITOR") {
+        Ok(e) if !e.trim().is_empty() => e,
+        _ => "vi".to_string(),
+    };
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().ok_or("EDITOR is blank")?;
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .status()
+        .map_err(|e| format!("could not launch editor `{editor}`: {e}"))?;
+    // Advisory: the file on disk is the truth either way, and a commit with
+    // no diff is already a no-op.
+    if !status.success() {
+        eprintln!("⚠ {editor} exited with {status}");
+    }
+    Ok(())
+}
+
+fn resolve_keys(app: &App, raw: &[String]) -> Result<Vec<TaskKey>, Box<dyn std::error::Error>> {
+    raw.iter().map(|k| parse_key(app, k)).collect()
 }
 
 fn parse_key(app: &App, raw: &str) -> Result<TaskKey, Box<dyn std::error::Error>> {
@@ -534,25 +616,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let now = jiff_now_ms();
     let report = app.reconcile(now)?;
-    match &report.scan_rejected {
-        Some(RejectReason::SuspectedIncompleteScan) => {
-            eprintln!("⚠ scan rejected: an unexpectedly large number of tasks disappeared.");
-            eprintln!("  Nothing was deleted. Check that your sync tool has finished.");
-        }
-        Some(RejectReason::Incomplete) => {
-            eprintln!("⚠ scan rejected: some files could not be read.");
-            eprintln!(
-                "  Nothing was deleted. Check file permissions, or wait for a cloud-synced folder to finish downloading."
-            );
-        }
-        None => {}
-    }
-    if report.pending_adoption > 0 {
-        eprintln!(
-            "⚠ {} note(s) ready to adopt — run `cadet adopt`",
-            report.pending_adoption
-        );
-    }
+    report_reconcile(&report);
     // Reconcile runs ahead of every command, reads included, and it is where
     // a duplicate the resolver could not settle gets held back out of the
     // task list. That has to be visible on `cadet ls` too, not only after a
@@ -564,6 +628,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         states: vec![],
         tags: vec![],
         priority: None,
+        due: None,
         due_before: None,
         due_after: None,
         fields: vec![],
@@ -572,14 +637,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Add {
             title,
             due,
+            no_due,
             tags,
             priority,
             state,
             set,
         } => {
-            if let Some(d) = &due {
-                check_date_bound("due", d)?;
-            }
             reject_duplicate_names(&set)?;
             reject_flag_collisions(
                 &set,
@@ -596,6 +659,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for pair in &set {
                 apply_assignment(&cfg, &mut scratch, pair, &config_path)?;
             }
+            // `--set due=` is applied further down and wins on its own terms;
+            // this resolves the flag and the two configured defaults.
+            let due = resolve_due_for_new_task(
+                due.as_deref(),
+                no_due,
+                cfg.defaults.due.as_deref(),
+                reg.defaults.due.as_deref(),
+                today(now)?,
+            )?;
             let mut draft = TaskDraft {
                 // Trimmed, because `--set title=` trims and the two spellings
                 // of one field must not disagree. Untrimmed they also split
@@ -620,7 +692,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Some(d)) => draft.due = Some(d),
                 Some(None) => {
                     return Err(
-                        "cannot clear `due` — there is nothing to clear on a new task".into(),
+                        "cannot clear `due` on a new task — pass --no-due to skip a configured default"
+                            .into(),
                     );
                 }
                 None => {}
@@ -666,6 +739,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             states,
             tags,
             priority,
+            due,
             due_before,
             due_after,
             fields,
@@ -676,6 +750,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(d) = &due_after {
                 check_date_bound("due-after", d)?;
             }
+            let (due_after, due_before) = match due {
+                None => (due_after, due_before),
+                Some(_) if due_before.is_some() || due_after.is_some() => {
+                    return Err(
+                        "`--due` and `--due-before`/`--due-after` say the same thing two ways; use one or the other"
+                            .into(),
+                    );
+                }
+                Some(d) => DueBucket::from(d).bounds(today(now)?)?,
+            };
             reject_duplicate_names(&fields)?;
             // The config is only read when a filter needs it, so a plain
             // `ls` still costs nothing.
@@ -740,6 +824,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Cmd::Edit { key } => {
+            let k = parse_key(&app, &key)?;
+            let path = app.edit_path(&k)?;
+            spawn_editor(&path)?;
+            // A fresh clock read: editing can take minutes, and the grace
+            // periods reconcile applies are measured against it.
+            report_reconcile(&app.reconcile(jiff_now_ms())?);
+            app.record_edit(&k, &path);
+            print_warnings(&app);
+        }
         Cmd::Show { key } => {
             let k = parse_key(&app, &key)?;
             let t = app.get_by_key(&k)?;
@@ -769,10 +863,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\n{}", t.body.trim());
             }
         }
-        Cmd::Done { key } => {
-            let k = parse_key(&app, &key)?;
-            app.set_state(&k, "done")?;
-            println!("{k} done");
+        Cmd::Done { keys } => {
+            for k in app.complete_tasks(&resolve_keys(&app, &keys)?)? {
+                println!("{k} done");
+            }
             print_warnings(&app);
         }
         Cmd::Mv { key, state } => {
@@ -781,10 +875,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{k} -> {state}");
             print_warnings(&app);
         }
-        Cmd::Rm { key } => {
-            let k = parse_key(&app, &key)?;
-            app.delete(&k)?;
-            println!("{k} removed");
+        Cmd::Rm { keys } => {
+            for k in app.delete_many(&resolve_keys(&app, &keys)?)? {
+                println!("{k} removed");
+            }
             print_warnings(&app);
         }
         Cmd::Adopt => {
@@ -874,6 +968,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// The local calendar day for a millisecond timestamp. Local, not UTC:
+/// `due` has never carried a timezone anywhere in cadet, and a user typing
+/// `--due today` means their own day.
+fn today(now_ms: i64) -> Result<jiff::civil::Date, jiff::Error> {
+    Ok(jiff::Timestamp::from_millisecond(now_ms)?
+        .to_zoned(jiff::tz::TimeZone::system())
+        .date())
 }
 
 pub(crate) fn jiff_now_ms() -> i64 {

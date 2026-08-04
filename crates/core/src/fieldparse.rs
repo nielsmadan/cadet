@@ -250,6 +250,7 @@ mod tests {
                 terminal: vec![],
                 transitions: Default::default(),
             },
+            defaults: Default::default(),
             fields: vec![def("note", FieldType::Str)],
         };
         let (k, v) = parse_assignment(&cfg, "note=a=b").unwrap();
@@ -272,6 +273,7 @@ mod tests {
                 terminal: vec![],
                 transitions: Default::default(),
             },
+            defaults: Default::default(),
             fields: vec![],
         };
         assert!(parse_assignment(&cfg, "nope=1").is_err());

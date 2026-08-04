@@ -2381,3 +2381,315 @@ fn ls_groups_tasks_by_the_declared_state_order() {
     let blocked_at = stdout.find("PERS-1").unwrap();
     assert!(todo_at < blocked_at, "todo must precede blocked:\n{stdout}");
 }
+
+fn day(offset: i64) -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::system())
+        .date()
+        .checked_add(jiff::Span::new().days(offset))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn due_buckets_select_the_right_tasks() {
+    let e = env();
+    for (title, offset) in [("past", -3), ("now", 0), ("soon", 3), ("later", 30)] {
+        cadet(&e.home)
+            .args(["add", title, "--due", &day(offset)])
+            .assert()
+            .success();
+    }
+    cadet(&e.home).args(["add", "undated"]).assert().success();
+
+    let out = |bucket: &str| {
+        let a = cadet(&e.home)
+            .args(["ls", "--due", bucket])
+            .assert()
+            .success();
+        String::from_utf8_lossy(&a.get_output().stdout).to_string()
+    };
+
+    let today = out("today");
+    assert!(today.contains("now"), "{today}");
+    assert!(
+        !today.contains("past") && !today.contains("soon"),
+        "{today}"
+    );
+
+    let overdue = out("overdue");
+    assert!(overdue.contains("past"), "{overdue}");
+    assert!(!overdue.contains("now"), "{overdue}");
+
+    let week = out("week");
+    assert!(week.contains("now") && week.contains("soon"), "{week}");
+    assert!(!week.contains("past") && !week.contains("later"), "{week}");
+
+    for b in ["today", "week", "overdue"] {
+        assert!(
+            !out(b).contains("undated"),
+            "bucket {b} matched an undated task"
+        );
+    }
+}
+
+#[test]
+fn due_bucket_and_explicit_bounds_are_refused_together() {
+    let e = env();
+    cadet(&e.home)
+        .args(["ls", "--due", "today", "--due-before", "2030-01-01"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("one or the other"));
+}
+
+#[test]
+fn add_accepts_a_relative_due_date() {
+    let e = env();
+    cadet(&e.home)
+        .args(["add", "soon", "--due", "+7d"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(day(7)));
+}
+
+#[test]
+fn add_rejects_a_due_value_that_is_neither_a_date_nor_an_offset() {
+    let e = env();
+    cadet(&e.home)
+        .args(["add", "x", "--due", "banana"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("tomorrow"));
+}
+
+#[test]
+fn a_default_due_applies_and_the_project_beats_the_global() {
+    let e = env();
+    let registry = e.home.join("config.toml");
+    let mut raw = std::fs::read_to_string(&registry).unwrap();
+    raw.push_str("\n[defaults]\ndue = \"+3d\"\n");
+    std::fs::write(&registry, raw).unwrap();
+
+    cadet(&e.home)
+        .args(["add", "from global"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(day(3)));
+
+    let cfg = e.vault.join("project.toml");
+    let mut raw = std::fs::read_to_string(&cfg).unwrap();
+    raw.push_str("\n[defaults]\ndue = \"tomorrow\"\n");
+    std::fs::write(&cfg, raw).unwrap();
+
+    cadet(&e.home)
+        .args(["add", "from project"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-2"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(day(1)));
+
+    cadet(&e.home)
+        .args(["add", "explicit", "--due", "+10d"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-3"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(day(10)));
+
+    cadet(&e.home)
+        .args(["add", "none", "--no-due"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-4"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("due").not());
+}
+
+#[test]
+fn a_registry_with_no_defaults_table_creates_undated_tasks() {
+    let e = env();
+    cadet(&e.home).args(["add", "plain"]).assert().success();
+    cadet(&e.home)
+        .args(["show", "PERS-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("due").not());
+}
+
+#[test]
+fn a_malformed_default_due_is_a_loud_error() {
+    let e = env();
+    let registry = e.home.join("config.toml");
+    let mut raw = std::fs::read_to_string(&registry).unwrap();
+    raw.push_str("\n[defaults]\ndue = \"next tuesday\"\n");
+    std::fs::write(&registry, raw).unwrap();
+    cadet(&e.home)
+        .args(["add", "x"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("defaults"));
+}
+
+#[test]
+fn done_and_rm_take_many_keys_and_leave_one_commit_each() {
+    let h = project_harness();
+    for t in ["a", "b", "c", "d"] {
+        h.cadet(&["add", t]).assert().success();
+    }
+    let before = commit_count(&h);
+    h.cadet(&["done", "T-1", "T-2"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("T-1 done").and(predicates::str::contains("T-2 done")));
+    assert_eq!(commit_count(&h) - before, 1, "one commit for the batch");
+
+    let before = commit_count(&h);
+    h.cadet(&["rm", "T-3", "T-4"]).assert().success();
+    assert_eq!(commit_count(&h) - before, 1, "one commit for the batch");
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("T-3").not());
+}
+
+#[test]
+fn a_bad_key_anywhere_in_a_batch_leaves_every_task_untouched() {
+    let e = env();
+    for t in ["a", "b"] {
+        cadet(&e.home).args(["add", t]).assert().success();
+    }
+    cadet(&e.home)
+        .args(["done", "PERS-1", "PERS-9"])
+        .assert()
+        .failure();
+    cadet(&e.home)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("done").not());
+
+    cadet(&e.home)
+        .args(["rm", "PERS-1", "PERS-9"])
+        .assert()
+        .failure();
+    cadet(&e.home)
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("PERS-1"));
+}
+
+#[test]
+fn naming_one_task_twice_in_a_batch_writes_it_once() {
+    let h = project_harness();
+    h.cadet(&["add", "only"]).assert().success();
+    let before = commit_count(&h);
+    let out = h.cadet(&["done", "T-1", "T-1"]).assert().success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert_eq!(stdout.matches("T-1 done").count(), 1, "{stdout}");
+    assert_eq!(commit_count(&h) - before, 1);
+}
+
+#[test]
+fn a_single_key_batch_keeps_the_original_commit_messages() {
+    let h = project_harness();
+    h.cadet(&["add", "one"]).assert().success();
+    h.cadet(&["add", "two"]).assert().success();
+    h.cadet(&["done", "T-1"]).assert().success();
+    h.cadet(&["rm", "T-2"]).assert().success();
+
+    let repo_dir = h.home.path().join("repos").join("proj.git");
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo_dir)
+        .arg("--work-tree")
+        .arg(h.vault.path())
+        .args(["log", "--format=%s"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(log.contains("T-1 -> done"), "{log}");
+    assert!(log.contains("remove T-2"), "{log}");
+}
+
+/// A script that records that it ran, so "the editor was never launched" is
+/// an assertion rather than an assumption.
+fn fake_editor(dir: &std::path::Path, body: &str) -> String {
+    let path = dir.join("fake-editor.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ntouch \"{}\"\n{body}\n",
+            dir.join("ran").display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path.to_str().unwrap().to_string()
+}
+
+#[test]
+fn edit_opens_the_task_file_and_records_the_change() {
+    let h = project_harness();
+    h.cadet(&["add", "editable"]).assert().success();
+    let scratch = tempfile::tempdir().unwrap();
+    let editor = fake_editor(
+        scratch.path(),
+        "sed -e 's/^priority: normal/priority: high/' \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"",
+    );
+
+    let before = commit_count(&h);
+    h.cadet(&["edit", "T-1"])
+        .env("EDITOR", &editor)
+        .assert()
+        .success();
+    assert!(scratch.path().join("ran").exists(), "the editor must run");
+    assert_eq!(commit_count(&h) - before, 1);
+    h.cadet(&["show", "T-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("high"));
+}
+
+#[test]
+fn edit_on_a_local_db_project_refuses_without_launching_an_editor() {
+    let h = harness();
+    h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "scratch", "add", "x"])
+        .assert()
+        .success();
+    let scratch = tempfile::tempdir().unwrap();
+    let editor = fake_editor(scratch.path(), "");
+
+    h.cadet(&["--project", "scratch", "edit", "SCRA-1"])
+        .env("EDITOR", &editor)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("edit"));
+    assert!(
+        !scratch.path().join("ran").exists(),
+        "an unsupported backend must not launch an editor"
+    );
+}
