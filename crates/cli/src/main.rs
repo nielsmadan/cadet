@@ -76,7 +76,13 @@ enum Cmd {
     },
     /// Add a task
     Add {
+        /// Task title. Quote the whole value when using shorthand, for example
+        /// `"[bug] fix it"`: edge `[tag]` tokens are removed from the title,
+        /// while middle tokens keep their text.
         title: Vec<String>,
+        /// Treat the positional title literally, disabling all title shorthand
+        #[arg(long)]
+        literal: bool,
         /// Due date: 2026-08-10, or `today`, `tomorrow`, `+7d`, `+2w`
         #[arg(long)]
         due: Option<String>,
@@ -392,6 +398,7 @@ fn unknown_field_error(name: &str, config_path: &std::path::Path) -> String {
 /// than one.
 fn parse_tag(raw: &str) -> Result<String, String> {
     let t = raw.trim();
+    cadet_core::reject_newlines("tags", t).map_err(|e| e.to_string())?;
     if t.contains(',') {
         return Err(format!(
             "tag `{raw}` contains a comma — repeat --tag instead of joining tags with a comma"
@@ -406,6 +413,76 @@ fn parse_tag(raw: &str) -> Result<String, String> {
         return Err("tag is empty — a tag needs a name".to_string());
     }
     Ok(t.to_string())
+}
+
+/// The positional title may carry `[tag]` tokens. Every one becomes a tag the
+/// way `--tag` would (same `parse_tag` validation, so a comma or an empty name
+/// is rejected identically). A run at the very start or very end is dropped
+/// from the title — whitespace between the tags ignored (`[bug] [frontend]` is
+/// two tags) — while one in the middle keeps its text, brackets stripped, as
+/// well as becoming a tag (`this [bug] is …` → `this bug is …`, tagged `bug`).
+fn extract_tags(joined: &str) -> Result<(String, Vec<String>), String> {
+    let s = joined.trim();
+
+    // Byte ranges of every `[content]` group, plus its content, left to right.
+    let mut groups: Vec<(usize, usize, String)> = Vec::new();
+    let mut open = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => open = Some(i),
+            ']' => {
+                if let Some(start) = open.take() {
+                    groups.push((start, i + 1, s[start + 1..i].to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if groups.is_empty() {
+        return Ok((s.to_string(), Vec::new()));
+    }
+
+    // Leading run: consecutive groups from the start, whitespace between them.
+    let mut leading = vec![false; groups.len()];
+    let mut pos = 0usize;
+    for (idx, &(start, end, _)) in groups.iter().enumerate() {
+        if s[pos..start].chars().all(char::is_whitespace) {
+            leading[idx] = true;
+            pos = end;
+        } else {
+            break;
+        }
+    }
+
+    // Trailing run: the mirror from the end.
+    let mut trailing = vec![false; groups.len()];
+    let mut pos = s.len();
+    for idx in (0..groups.len()).rev() {
+        let (start, end, _) = groups[idx];
+        if s[end..pos].chars().all(char::is_whitespace) {
+            trailing[idx] = true;
+            pos = start;
+        } else {
+            break;
+        }
+    }
+
+    let mut tags = Vec::new();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (idx, &(start, end, ref content)) in groups.iter().enumerate() {
+        let tag = parse_tag(content)?;
+        tags.push(tag.clone());
+        out.push_str(&s[cursor..start]);
+        // Dropped from the title when leading/trailing; kept as prose when
+        // middle. The gap before each group is always carried over.
+        if !(leading[idx] || trailing[idx]) {
+            out.push_str(&tag);
+        }
+        cursor = end;
+    }
+    out.push_str(&s[cursor..]);
+    Ok((out.trim().to_string(), tags))
 }
 
 /// `ls --field` on a reserved name would otherwise fall through to
@@ -636,6 +713,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Project { .. } => unreachable!("handled above"),
         Cmd::Add {
             title,
+            literal,
             due,
             no_due,
             tags,
@@ -643,13 +721,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             state,
             set,
         } => {
+            let positional_title_given = !title.is_empty();
+            let joined_title = title.join(" ");
+            let (title, bracket_tags) = if literal {
+                (joined_title.trim().to_string(), Vec::new())
+            } else {
+                extract_tags(&joined_title)?
+            };
             reject_duplicate_names(&set)?;
             reject_flag_collisions(
                 &set,
                 &[
-                    ("title", "the positional title", !title.is_empty()),
+                    ("title", "the positional title", positional_title_given),
                     ("due", "`--due`", due.is_some()),
-                    ("tags", "`--tag`", !tags.is_empty()),
+                    (
+                        "tags",
+                        "`--tag`/`[tag]` shorthand",
+                        !tags.is_empty() || !bracket_tags.is_empty(),
+                    ),
                     ("priority", "`--priority`", priority.is_some()),
                     ("state", "`--state`", state.is_some()),
                 ],
@@ -668,17 +757,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reg.defaults.due.as_deref(),
                 today(now)?,
             )?;
+            let mut draft_tags = bracket_tags;
+            draft_tags.extend(tags);
             let mut draft = TaskDraft {
-                // Trimmed, because `--set title=` trims and the two spellings
-                // of one field must not disagree. Untrimmed they also split
-                // the backends: markdown reads a frontmatter scalar back
-                // trimmed, local-db keeps the padding verbatim, so the same
-                // `cadet add` stored two different titles depending on the
-                // project.
-                title: title.join(" ").trim().to_string(),
+                // Both positional paths trim like `--set title=` and the
+                // backends; without `--literal`, extraction also applies the
+                // title shorthand before the draft is built.
+                title,
                 due,
                 priority: priority.map(Priority::from),
-                tags,
+                tags: draft_tags,
                 state,
                 ..Default::default()
             };
@@ -981,4 +1069,153 @@ fn today(now_ms: i64) -> Result<jiff::civil::Date, jiff::Error> {
 
 pub(crate) fn jiff_now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_tags;
+
+    #[test]
+    fn a_trailing_tag_is_removed_and_added() {
+        assert_eq!(
+            extract_tags("some task [bug]").unwrap(),
+            ("some task".to_string(), vec!["bug".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_leading_tag_is_removed_and_added() {
+        assert_eq!(
+            extract_tags("[bug] some task").unwrap(),
+            ("some task".to_string(), vec!["bug".to_string()])
+        );
+    }
+
+    #[test]
+    fn consecutive_leading_tags_without_spaces() {
+        assert_eq!(
+            extract_tags("[bug][frontend] some task").unwrap(),
+            (
+                "some task".to_string(),
+                vec!["bug".to_string(), "frontend".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn consecutive_leading_tags_ignore_whitespace_between() {
+        assert_eq!(
+            extract_tags("[bug] [frontend] task").unwrap(),
+            (
+                "task".to_string(),
+                vec!["bug".to_string(), "frontend".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn a_middle_tag_keeps_its_text_and_becomes_a_tag() {
+        assert_eq!(
+            extract_tags("this [bug] is about clicking a button").unwrap(),
+            (
+                "this bug is about clicking a button".to_string(),
+                vec!["bug".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn multiple_middle_tags_all_become_tags() {
+        assert_eq!(
+            extract_tags("this [bug] says [frontend] here").unwrap(),
+            (
+                "this bug says frontend here".to_string(),
+                vec!["bug".to_string(), "frontend".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn leading_middle_and_trailing_tags_combine() {
+        assert_eq!(
+            extract_tags("[bug] [x] then [foo]").unwrap(),
+            (
+                "then".to_string(),
+                vec!["bug".to_string(), "x".to_string(), "foo".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn a_leading_trailing_and_middle_mix_drops_edges_keeps_middle() {
+        assert_eq!(
+            extract_tags("[a] [b] mid [c] [d]").unwrap(),
+            (
+                "mid".to_string(),
+                vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "d".to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn a_whole_string_of_tags_strips_to_empty() {
+        assert_eq!(
+            extract_tags("[bug][frontend]").unwrap(),
+            (
+                String::new(),
+                vec!["bug".to_string(), "frontend".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn a_title_without_brackets_passes_through_unchanged() {
+        assert_eq!(
+            extract_tags("plain title").unwrap(),
+            ("plain title".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn bare_brackets_around_whitespace_is_an_empty_tag() {
+        assert!(matches!(extract_tags("[ ] x"), Err(e) if e.contains("empty")));
+        assert!(matches!(extract_tags("[] x"), Err(e) if e.contains("empty")));
+    }
+
+    #[test]
+    fn a_tag_with_a_comma_is_rejected_like_the_flag() {
+        assert!(matches!(extract_tags("[a,b] x"), Err(e) if e.contains("comma")));
+    }
+
+    #[test]
+    fn a_tag_with_a_newline_is_rejected() {
+        assert!(matches!(
+            extract_tags("[bug\nstate: done] task"),
+            Err(e) if e.contains("without newlines")
+        ));
+    }
+
+    #[test]
+    fn an_unclosed_bracket_is_left_as_literal_text() {
+        assert_eq!(
+            extract_tags("an unclosed [tag").unwrap(),
+            ("an unclosed [tag".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_unclosed_bracket_does_not_consume_a_later_tag() {
+        assert_eq!(
+            extract_tags("an unclosed [note then [bug]").unwrap(),
+            (
+                "an unclosed [note then".to_string(),
+                vec!["bug".to_string()]
+            )
+        );
+    }
 }

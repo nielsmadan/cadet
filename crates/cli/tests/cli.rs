@@ -103,7 +103,7 @@ fn add_writes_a_readable_markdown_file() {
     let raw = std::fs::read_to_string(e.vault.join("buy-oat-milk.md")).unwrap();
     assert!(raw.starts_with("---\n"));
     assert!(raw.contains("key: PERS-1"));
-    assert!(raw.contains("title: Buy oat milk"));
+    assert!(raw.contains("title: \"Buy oat milk\""));
     assert!(raw.contains("state: todo"));
 }
 
@@ -688,6 +688,163 @@ fn add_accepts_every_reserved_field() {
     assert!(src.contains("priority: high"), "{src}");
     assert!(src.contains("home"), "{src}");
     assert!(src.contains("urgent"), "{src}");
+}
+
+/// `[bracketed]` text in the positional title is a tag: stripped from the
+/// title and added as a tag, on the `add` path nobody has to think about.
+#[test]
+fn a_bracket_tag_at_the_end_becomes_a_tag_and_is_removed_from_the_title() {
+    let h = project_harness();
+    h.cadet(&["add", "some task [bug]"]).assert().success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(out.contains("some task"), "{out}");
+    assert!(!out.contains("[bug]"), "{out}");
+    assert_eq!(value_of(&out, "tags"), "bug", "{out}");
+    h.cadet(&["ls", "--tag", "bug"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("some task"));
+}
+
+/// Consecutive tags, with no space between, are all extracted.
+#[test]
+fn consecutive_bracket_tags_are_all_extracted() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug][frontend] ship it"])
+        .assert()
+        .success();
+    h.cadet(&["ls", "--tag", "bug", "--tag", "frontend"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ship it"));
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert_eq!(value_of(&out, "tags"), "bug, frontend", "{out}");
+    assert!(
+        !out.contains("[bug]") && !out.contains("[frontend]"),
+        "{out}"
+    );
+}
+
+/// A middle tag keeps its text, brackets stripped, and still becomes a tag.
+#[test]
+fn a_middle_bracket_tag_keeps_its_prose_and_becomes_a_tag() {
+    let h = project_harness();
+    h.cadet(&["add", "this [bug] is about clicking a button"])
+        .assert()
+        .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(out.contains("this bug is about clicking a button"), "{out}");
+    assert_eq!(value_of(&out, "tags"), "bug", "{out}");
+    h.cadet(&["ls", "--tag", "bug"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("this bug"));
+}
+
+/// Leading, middle and trailing tags combine: edges are dropped, middle text
+/// kept, every one a tag.
+#[test]
+fn leading_middle_and_trailing_bracket_tags_combine() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug] [x] then [frontend]"])
+        .assert()
+        .success();
+    assert_eq!(
+        value_of(&stdout_of(h.cadet(&["show", "T-1"])), "tags"),
+        "bug, x, frontend"
+    );
+    h.cadet(&["ls", "--tag", "bug", "--tag", "frontend"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("then"));
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(out.contains("T-1  then"), "{out}");
+}
+
+/// Bracket tags add to `--tag`, they don't cancel it.
+#[test]
+fn bracket_tags_combine_with_the_tag_flag() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug] fix it", "--tag", "frontend"])
+        .assert()
+        .success();
+    assert_eq!(
+        value_of(&stdout_of(h.cadet(&["show", "T-1"])), "tags"),
+        "bug, frontend"
+    );
+}
+
+#[test]
+fn bracket_tags_conflict_with_set_tags() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug] fix it", "--set", "tags=frontend"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("tags"));
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
+}
+
+#[test]
+fn literal_disables_all_title_shorthand() {
+    let h = project_harness();
+    h.cadet(&[
+        "add",
+        "[bug] fix array[index]",
+        "--literal",
+        "--set",
+        "tags=frontend",
+    ])
+    .assert()
+    .success();
+    let out = stdout_of(h.cadet(&["show", "T-1"]));
+    assert!(out.contains("T-1  [bug] fix array[index]"), "{out}");
+    assert_eq!(value_of(&out, "tags"), "frontend", "{out}");
+}
+
+#[test]
+fn add_help_documents_title_shorthand_and_literal_mode() {
+    let h = project_harness();
+    h.cadet(&["add", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"[bug] fix it\""))
+        .stdout(predicates::str::contains("--literal"));
+}
+
+#[test]
+fn a_bracket_tag_with_a_newline_is_rejected() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug\nstate: done] task"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("without newlines"));
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
+}
+
+/// A title that strips down to nothing (a task made up entirely of end tags,
+/// or whitespace) is rejected by the same guard a newline is checked against
+/// in core — `validate_task`'s empty-title rule. Nothing is created.
+#[test]
+fn a_title_that_strips_to_empty_is_rejected() {
+    let h = project_harness();
+    h.cadet(&["add", "[bug][frontend]"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("title must not be empty"));
+    h.cadet(&["add", "   "])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("title must not be empty"));
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
 }
 
 #[test]

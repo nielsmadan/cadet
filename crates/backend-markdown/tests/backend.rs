@@ -83,6 +83,57 @@ fn put_then_get_round_trips() {
 }
 
 #[test]
+fn yaml_sensitive_strings_are_escaped_and_round_trip() {
+    let (d, b) = setup();
+    let mut t = task(r#"bug: press "global" at C:\hotkeys"#);
+    t.fields.insert(
+        "owner".into(),
+        FieldValue::Str(r#"team: "core" at C:\desk"#.into()),
+    );
+    b.put(t.clone(), None).unwrap();
+
+    let path = d
+        .path()
+        .join(b.location_of(t.uid.clone()).unwrap().unwrap());
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(
+        raw.contains(r#"title: "bug: press \"global\" at C:\\hotkeys""#),
+        "{raw}"
+    );
+    assert!(
+        raw.contains(r#"owner: "team: \"core\" at C:\\desk""#),
+        "{raw}"
+    );
+    let got = b.get(t.uid.clone()).unwrap().unwrap();
+    assert_eq!(got.title, t.title);
+    assert_eq!(got.fields.get("owner"), t.fields.get("owner"));
+}
+
+#[test]
+fn an_existing_unquoted_colon_title_is_normalized_on_write() {
+    let (d, b) = setup();
+    let t = task("bug: broken frontmatter");
+    b.put(t.clone(), None).unwrap();
+    let path = d
+        .path()
+        .join(b.location_of(t.uid.clone()).unwrap().unwrap());
+    let raw = std::fs::read_to_string(&path).unwrap().replace(
+        "title: \"bug: broken frontmatter\"",
+        "title: bug: broken frontmatter",
+    );
+    std::fs::write(&path, raw).unwrap();
+
+    let loaded = b.get(t.uid.clone()).unwrap().unwrap();
+    assert_eq!(loaded.title, t.title);
+    b.put(loaded, None).unwrap();
+    let normalized = std::fs::read_to_string(path).unwrap();
+    assert!(
+        normalized.contains("title: \"bug: broken frontmatter\""),
+        "{normalized}"
+    );
+}
+
+#[test]
 fn put_writes_a_readable_slug_filename() {
     let (d, b) = setup();
     b.put(task("Buy Oat Milk"), None).unwrap();
@@ -356,14 +407,22 @@ fn list_items_containing_commas_round_trip_intact() {
     let mut t = task("commas");
     t.fields.insert(
         "labels".into(),
-        FieldValue::List(vec!["has,comma".into(), "plain".into()]),
+        FieldValue::List(vec![
+            "has,comma".into(),
+            "plain".into(),
+            r#"C:\tmp,"quoted""#.into(),
+        ]),
     );
     b.put(t.clone(), None).unwrap();
 
     let got = b.get(t.uid.clone()).unwrap().unwrap();
     assert_eq!(
         got.fields.get("labels"),
-        Some(&FieldValue::List(vec!["has,comma".into(), "plain".into()]))
+        Some(&FieldValue::List(vec![
+            "has,comma".into(),
+            "plain".into(),
+            r#"C:\tmp,"quoted""#.into(),
+        ]))
     );
 }
 
@@ -376,6 +435,30 @@ fn tags_containing_commas_round_trip_intact() {
 
     let got = b.get(t.uid.clone()).unwrap().unwrap();
     assert_eq!(got.tags, vec!["has,comma".to_string(), "plain".to_string()]);
+}
+
+#[test]
+fn yaml_sensitive_tags_are_quoted_and_round_trip() {
+    let (d, b) = setup();
+    let mut t = task("yaml tags");
+    t.tags = vec![
+        "plain".into(),
+        "bug: urgent".into(),
+        "[nested]".into(),
+        "#hash".into(),
+        "true".into(),
+    ];
+    b.put(t.clone(), None).unwrap();
+
+    let path = d
+        .path()
+        .join(b.location_of(t.uid.clone()).unwrap().unwrap());
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(
+        raw.contains(r##"tags: ["plain", "bug: urgent", "[nested]", "#hash", "true"]"##),
+        "{raw}"
+    );
+    assert_eq!(b.get(t.uid.clone()).unwrap().unwrap().tags, t.tags);
 }
 
 #[test]
@@ -423,7 +506,7 @@ fn removing_a_custom_field_removes_it_from_the_file() {
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
-            .contains("owner: alice")
+            .contains("owner: \"alice\"")
     );
 
     let mut t2 = t.clone();
@@ -509,7 +592,7 @@ fn changing_a_title_does_not_rename_the_file() {
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
-            .contains("title: Renamed Title"),
+            .contains("title: \"Renamed Title\""),
         "the new title must be spliced in place"
     );
 }

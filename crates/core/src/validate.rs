@@ -1,5 +1,6 @@
 use crate::config::{FieldType, ProjectConfig, Workflow};
 use crate::error::CoreError;
+use crate::fieldparse::reject_newlines;
 use crate::model::{FieldValue, Task};
 
 pub fn validate_task(task: &Task, cfg: &ProjectConfig) -> Result<(), CoreError> {
@@ -14,6 +15,9 @@ pub fn validate_task(task: &Task, cfg: &ProjectConfig) -> Result<(), CoreError> 
     }
     if !cfg.workflow.states.contains(&task.state) {
         return Err(CoreError::UnknownState(task.state.clone()));
+    }
+    for tag in &task.tags {
+        reject_newlines("tags", tag)?;
     }
     for def in &cfg.fields {
         if def.required && !task.fields.contains_key(&def.name) {
@@ -165,6 +169,16 @@ required = true
     fn rejects_unknown_state() {
         let err = validate_task(&task("banana"), &cfg()).unwrap_err();
         assert!(matches!(err, CoreError::UnknownState(_)));
+    }
+
+    #[test]
+    fn rejects_a_newline_in_a_tag() {
+        let mut t = task("todo");
+        t.tags = vec!["bug\nstate: done".into()];
+        assert!(matches!(
+            validate_task(&t, &cfg()).unwrap_err(),
+            CoreError::FieldType { ref field, .. } if field == "tags"
+        ));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::frontmatter::{parse_frontmatter, render_list, splice};
+use crate::frontmatter::{parse_frontmatter, render_list, render_string, splice};
 use crate::probe::{Probe, probe};
 use crate::slug::slugify;
 use cadet_core::{
@@ -14,13 +14,11 @@ pub struct MarkdownBackend {
     config: OnceLock<ProjectConfig>,
 }
 
-/// Renders a `FieldValue` to its frontmatter text form. Mirrors how `tags`
-/// is written: a list becomes an inline `[a, b, c]` array, via the same
-/// `render_list` that quotes an item containing a comma so it round-trips
-/// through `Frontmatter::list` as one item, not two.
+/// Renders a `FieldValue` to its frontmatter text form.
 fn render_field_value(v: &FieldValue) -> String {
     match v {
-        FieldValue::Str(s) | FieldValue::Date(s) => s.clone(),
+        FieldValue::Str(s) => render_string(s),
+        FieldValue::Date(s) => s.clone(),
         FieldValue::Int(i) => i.to_string(),
         FieldValue::Float(f) => f.to_string(),
         FieldValue::Bool(b) => b.to_string(),
@@ -273,7 +271,7 @@ impl Backend for MarkdownBackend {
         let mut edits: Vec<(String, Option<String>)> = vec![
             ("uid".to_string(), Some(task.uid.as_str().to_string())),
             ("key".to_string(), Some(task.key.to_string())),
-            ("title".to_string(), Some(task.title.clone())),
+            ("title".to_string(), Some(render_string(&task.title))),
             ("state".to_string(), Some(task.state.clone())),
             ("created".to_string(), Some(task.created.to_string())),
             ("updated".to_string(), Some(task.updated.to_string())),

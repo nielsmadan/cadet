@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
     /// A flat scalar, e.g. `state: todo` or `tags: [home, errands]`.
-    Scalar(String),
+    Scalar { raw: String, decoded: String },
     /// A block list, e.g. `tags:` followed by indented `- item` lines.
     List(Vec<String>),
     /// Anything else indented under a key (a nested map, or an
@@ -25,7 +25,7 @@ impl Frontmatter {
     /// scalar — callers must use [`Frontmatter::list`] for those.
     pub fn get(&self, key: &str) -> Option<&str> {
         match self.values.get(key)? {
-            Value::Scalar(s) => Some(s.as_str()),
+            Value::Scalar { decoded, .. } => Some(decoded.as_str()),
             Value::List(_) | Value::Nested => None,
         }
     }
@@ -35,14 +35,12 @@ impl Frontmatter {
     /// scalar. Empty if the key is absent, an empty scalar, or a nested
     /// map.
     ///
-    /// A scalar item wrapped in double quotes is unquoted, with `\"`
-    /// unescaped back to `"` — the counterpart of [`render_list`], which
-    /// quotes an item containing a comma so it cannot be mistaken for a
-    /// separator. Splitting itself ignores commas inside a quoted item.
+    /// A scalar item wrapped in double quotes is decoded as a YAML string.
+    /// Splitting itself ignores commas inside a quoted item.
     pub fn list(&self, key: &str) -> Vec<String> {
         match self.values.get(key) {
             Some(Value::List(items)) => items.clone(),
-            Some(Value::Scalar(raw)) => {
+            Some(Value::Scalar { raw, .. }) => {
                 let trimmed = raw.trim();
                 let inner = trimmed
                     .strip_prefix('[')
@@ -96,35 +94,100 @@ fn split_respecting_quotes(s: &str) -> Vec<String> {
 /// leading/trailing `'` stripped too.
 fn unquote_list_item(token: &str) -> String {
     let trimmed = token.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed[1..trimmed.len() - 1].replace("\\\"", "\"")
-    } else {
-        trimmed.trim_matches(['"', '\'']).to_string()
-    }
+    decode_quoted_string(trimmed).unwrap_or_else(|| trimmed.trim_matches(['"', '\'']).to_string())
 }
 
-/// Quotes a list item if it contains a comma or a double quote, or has
-/// leading/trailing whitespace — anything [`Frontmatter::list`] could not
-/// otherwise split or trim back to the original value unambiguously. An
-/// embedded `"` is escaped as `\"`.
-fn quote_list_item(item: &str) -> String {
-    if item.contains(',') || item.contains('"') || item.trim() != item {
-        format!("\"{}\"", item.replace('"', "\\\""))
-    } else {
-        item.to_string()
+fn decode_hex(chars: &mut std::str::Chars<'_>, width: usize) -> Option<char> {
+    let digits: String = chars.by_ref().take(width).collect();
+    if digits.len() != width {
+        return None;
     }
+    char::from_u32(u32::from_str_radix(&digits, 16).ok()?)
 }
 
-/// Renders a list of strings to the inline `[a, b, c]` frontmatter form
-/// `splice` can write. The counterpart of [`Frontmatter::list`]: an item
-/// that `list` could not otherwise round-trip unambiguously (one containing
-/// a comma, for instance) is quoted.
+fn decode_quoted_string(raw: &str) -> Option<String> {
+    if raw.len() < 2 {
+        return None;
+    }
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            out.push(match chars.next()? {
+                '0' => '\0',
+                'a' => '\u{7}',
+                'b' => '\u{8}',
+                't' => '\t',
+                'n' => '\n',
+                'v' => '\u{b}',
+                'f' => '\u{c}',
+                'r' => '\r',
+                'e' => '\u{1b}',
+                ' ' => ' ',
+                '"' => '"',
+                '/' => '/',
+                '\\' => '\\',
+                'N' => '\u{85}',
+                '_' => '\u{a0}',
+                'L' => '\u{2028}',
+                'P' => '\u{2029}',
+                'x' => decode_hex(&mut chars, 2)?,
+                'u' => decode_hex(&mut chars, 4)?,
+                'U' => decode_hex(&mut chars, 8)?,
+                _ => return None,
+            });
+        }
+        return Some(out);
+    }
+
+    let inner = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))?;
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+        } else if chars.next_if_eq(&'\'').is_some() {
+            out.push('\'');
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+pub fn render_string(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\0' => out.push_str("\\0"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => write!(&mut out, "\\u{:04X}", c as u32).unwrap(),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn render_list(items: &[String]) -> String {
     format!(
         "[{}]",
         items
             .iter()
-            .map(|i| quote_list_item(i))
+            .map(|i| render_string(i))
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -231,10 +294,16 @@ fn parse_entries<S: AsRef<str>>(block: &[(S, S)]) -> Vec<Entry> {
 /// lines that aren't, or an empty scalar if there are none.
 fn compute_value(header_value: &str, continuation: &[(&str, &str)]) -> Value {
     if !header_value.is_empty() {
-        return Value::Scalar(header_value.to_string());
+        return Value::Scalar {
+            raw: header_value.to_string(),
+            decoded: decode_quoted_string(header_value).unwrap_or_else(|| header_value.to_string()),
+        };
     }
     if continuation.is_empty() {
-        return Value::Scalar(String::new());
+        return Value::Scalar {
+            raw: String::new(),
+            decoded: String::new(),
+        };
     }
     let all_list_items = continuation
         .iter()
@@ -365,6 +434,36 @@ Body text here.\n";
             vec!["home".to_string(), "errands".to_string()]
         );
         assert_eq!(fm.body, "\nBody text here.\n");
+    }
+
+    #[test]
+    fn yaml_quoted_strings_round_trip() {
+        let title = r#"bug: press "global" at C:\hotkeys"#;
+        let rendered = render_string(title);
+        assert_eq!(rendered, r#""bug: press \"global\" at C:\\hotkeys""#);
+        let doc = format!("---\ntitle: {rendered}\nowner: 'Niels''s desk'\n---\n");
+        let fm = parse_frontmatter(&doc).unwrap();
+        assert_eq!(fm.get("title"), Some(title));
+        assert_eq!(fm.get("owner"), Some("Niels's desk"));
+    }
+
+    #[test]
+    fn yaml_list_strings_are_always_quoted() {
+        let items = vec![
+            "plain".to_string(),
+            "bug: urgent".to_string(),
+            "[nested]".to_string(),
+            "#hash".to_string(),
+            "true".to_string(),
+            "line\nbreak".to_string(),
+        ];
+        let rendered = render_list(&items);
+        assert_eq!(
+            rendered,
+            r##"["plain", "bug: urgent", "[nested]", "#hash", "true", "line\nbreak"]"##
+        );
+        let fm = parse_frontmatter(&format!("---\ntags: {rendered}\n---\n")).unwrap();
+        assert_eq!(fm.list("tags"), items);
     }
 
     #[test]
