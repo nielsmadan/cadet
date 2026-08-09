@@ -1,7 +1,14 @@
 use std::io::{BufRead, IsTerminal, Write};
 
 pub fn is_interactive() -> bool {
-    std::io::stdin().is_terminal()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptInput {
+    DefaultAccepted,
+    Value(String),
+    Eof,
 }
 
 pub fn ask(label: &str, default: Option<&str>) -> std::io::Result<String> {
@@ -31,6 +38,29 @@ pub fn ask_with<R: BufRead, W: Write>(
         default.unwrap_or("").to_string()
     } else {
         typed.to_string()
+    })
+}
+
+pub fn ask_cancelable_with<R: BufRead, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    label: &str,
+    default: Option<&str>,
+) -> std::io::Result<PromptInput> {
+    match default {
+        Some(d) => write!(w, "  {label}  [{d}] › ")?,
+        None => write!(w, "  {label} › ")?,
+    }
+    w.flush()?;
+    let mut line = String::new();
+    if r.read_line(&mut line)? == 0 {
+        return Ok(PromptInput::Eof);
+    }
+    let typed = line.trim();
+    Ok(if typed.is_empty() {
+        PromptInput::DefaultAccepted
+    } else {
+        PromptInput::Value(typed.to_string())
     })
 }
 
@@ -124,5 +154,40 @@ mod tests {
     fn eof_with_a_default_takes_the_default() {
         let (got, _) = run("", "path", Some("/tmp/x"));
         assert_eq!(got, "/tmp/x");
+    }
+
+    #[test]
+    fn cancelable_prompt_distinguishes_enter_value_and_eof() {
+        let mut output = Vec::new();
+        assert_eq!(
+            ask_cancelable_with(
+                &mut Cursor::new("\n".as_bytes()),
+                &mut output,
+                "title",
+                Some("default")
+            )
+            .unwrap(),
+            PromptInput::DefaultAccepted
+        );
+        assert_eq!(
+            ask_cancelable_with(
+                &mut Cursor::new("typed\n".as_bytes()),
+                &mut output,
+                "title",
+                Some("default")
+            )
+            .unwrap(),
+            PromptInput::Value("typed".into())
+        );
+        assert_eq!(
+            ask_cancelable_with(
+                &mut Cursor::new(Vec::<u8>::new()),
+                &mut output,
+                "title",
+                Some("default")
+            )
+            .unwrap(),
+            PromptInput::Eof
+        );
     }
 }

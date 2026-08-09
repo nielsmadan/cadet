@@ -15,6 +15,7 @@ pub struct TaskDraft {
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
     pub fields: BTreeMap<String, FieldValue>,
+    pub body: String,
 }
 
 /// Everything `update` can change on an existing task. Every field is a
@@ -35,13 +36,12 @@ pub struct TaskChanges {
 /// `due` is read straight off frontmatter with no validation and compared as
 /// a plain string by `TaskFilter`, which is calendar-correct only when the
 /// format is fixed-width — a task written with `due: 2026-8-10` sorts and
-/// filters wrong forever after. `is_date_like` is the same gate
-/// `parse_field_value` applies to every declared `Date`/`DateTime` field;
-/// `add_with` and `update` are the only two places Cadet ever writes `due`,
-/// so this is the one place that has to call it.
+/// filters wrong forever after. `add_with` and `update` are the only two places
+/// Cadet ever writes `due`, so this is the one place that has to parse it as a
+/// real calendar date.
 fn validate_due(due: &Option<String>) -> Result<(), CoreError> {
     if let Some(d) = due
-        && !is_date_like(d)
+        && !matches!(canonical_due_date(d), Ok(canonical) if canonical == *d)
     {
         return Err(CoreError::FieldType {
             field: "due".to_string(),
@@ -176,7 +176,7 @@ impl App {
             renumbered_from: None,
             possible_duplicate_of: None,
             fields: draft.fields,
-            body: String::new(),
+            body: draft.body,
         };
         validate_due(&task.due)?;
         validate_task(&task, &cfg)?;

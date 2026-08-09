@@ -1,15 +1,13 @@
+mod add;
 mod config;
 mod dirmatch;
 mod project;
 mod prompt;
 
-use cadet_app::{App, GitNet, RejectReason, TaskChanges, TaskDraft};
+use cadet_app::{App, GitNet, RejectReason, TaskChanges};
 use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
-use cadet_core::{
-    Backend, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey, is_date_like,
-    resolve_due_for_new_task,
-};
+use cadet_core::{Backend, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey};
 use cadet_store_sqlite::SqliteIndex;
 use clap::{Parser, Subcommand};
 use config::{BackendKind, Project, Registry};
@@ -76,14 +74,17 @@ enum Cmd {
     },
     /// Add a task
     Add {
-        /// Task title. Quote the whole value when using shorthand, for example
-        /// `"[bug] fix it"`: edge `[tag]` tokens are removed from the title,
-        /// while middle tokens keep their text.
+        /// Task title. Quote shorthand such as `"[bug] fix it | what it does"`:
+        /// `[tag]` adds tags, `\[text]` keeps brackets literal, and the first
+        /// ` | ` starts the description.
         title: Vec<String>,
-        /// Treat the positional title literally, disabling all title shorthand
+        /// Treat title and description literally, disabling all shorthand
         #[arg(long)]
         literal: bool,
-        /// Due date: 2026-08-10, or `today`, `tomorrow`, `+7d`, `+2w`
+        /// Walk through task creation in a terminal
+        #[arg(long)]
+        interactive: bool,
+        /// Due date: 2026-08-10, `today`, `tomorrow`, `10d`, `+10d`, `1w`, or `aug10`
         #[arg(long)]
         due: Option<String>,
         /// Create the task with no due date, ignoring any configured default
@@ -353,6 +354,12 @@ fn priority_label(p: Priority) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AssignmentMode {
+    NewTask,
+    ExistingTask { today: jiff::civil::Date },
+}
+
 /// A value the user typed, read back the way they typed it. `List` reads
 /// like the `tags` line rather than as `List(["a", "b"])` — `show` is the
 /// only way to see a custom field at all, so debug formatting there is not
@@ -415,23 +422,45 @@ fn parse_tag(raw: &str) -> Result<String, String> {
     Ok(t.to_string())
 }
 
-/// The positional title may carry `[tag]` tokens. Every one becomes a tag the
+/// The positional title may carry `[tag]` tokens. Each token becomes a tag the
 /// way `--tag` would (same `parse_tag` validation, so a comma or an empty name
 /// is rejected identically). A run at the very start or very end is dropped
 /// from the title — whitespace between the tags ignored (`[bug] [frontend]` is
 /// two tags) — while one in the middle keeps its text, brackets stripped, as
 /// well as becoming a tag (`this [bug] is …` → `this bug is …`, tagged `bug`).
+/// Markdown links are left unchanged.
 fn extract_tags(joined: &str) -> Result<(String, Vec<String>), String> {
+    extract_tags_with_mode(joined, false)
+}
+
+fn extract_description_tags(joined: &str) -> Result<(String, Vec<String>), String> {
+    extract_tags_with_mode(joined, true)
+}
+
+fn extract_tags_with_mode(
+    joined: &str,
+    preserve_adjacent_brackets: bool,
+) -> Result<(String, Vec<String>), String> {
     let s = joined.trim();
 
     // Byte ranges of every `[content]` group, plus its content, left to right.
     let mut groups: Vec<(usize, usize, String)> = Vec::new();
     let mut open = None;
+    let mut in_code = false;
     for (i, c) in s.char_indices() {
+        if c == '`' && !escaped_at(s, i) {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
         match c {
-            '[' => open = Some(i),
+            '[' if !escaped_at(s, i) => open = Some(i),
             ']' => {
-                if let Some(start) = open.take() {
+                if let Some(start) = open.take()
+                    && !markdown_bracket_group(s, start, i, preserve_adjacent_brackets)
+                {
                     groups.push((start, i + 1, s[start + 1..i].to_string()));
                 }
             }
@@ -439,7 +468,7 @@ fn extract_tags(joined: &str) -> Result<(String, Vec<String>), String> {
         }
     }
     if groups.is_empty() {
-        return Ok((s.to_string(), Vec::new()));
+        return Ok((unescape_tag_brackets(s), Vec::new()));
     }
 
     // Leading run: consecutive groups from the start, whitespace between them.
@@ -482,7 +511,53 @@ fn extract_tags(joined: &str) -> Result<(String, Vec<String>), String> {
         cursor = end;
     }
     out.push_str(&s[cursor..]);
-    Ok((out.trim().to_string(), tags))
+    Ok((unescape_tag_brackets(out.trim()), tags))
+}
+
+fn escaped_at(s: &str, index: usize) -> bool {
+    s[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn markdown_bracket_group(
+    s: &str,
+    start: usize,
+    close: usize,
+    preserve_adjacent_brackets: bool,
+) -> bool {
+    let content = &s[start + 1..close];
+    let before = start
+        .checked_sub(1)
+        .and_then(|index| s.as_bytes().get(index));
+    let after = s.as_bytes().get(close + 1);
+    let checkbox = (!content.is_empty() && content.trim().is_empty())
+        || (matches!(content, "x" | "X")
+            && (start == 0 || s[..start].ends_with("- "))
+            && after.is_some_and(u8::is_ascii_whitespace));
+    checkbox
+        || content.starts_with('^')
+        || matches!(after, Some(b'(' | b':'))
+        || (preserve_adjacent_brackets
+            && (matches!(before, Some(b'[' | b']')) || matches!(after, Some(b'[' | b']'))))
+}
+
+fn unescape_tag_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'[') {
+            chars.next();
+            out.push('[');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `ls --field` on a reserved name would otherwise fall through to
@@ -569,14 +644,9 @@ fn declared_assignment(
 /// 'b'` in ASCII means `--due-before banana` matches nearly everything and
 /// `--due-after banana` matches nothing. Reject it up front instead, naming
 /// the flag.
-fn check_date_bound(flag: &str, raw: &str) -> Result<(), String> {
-    if is_date_like(raw) {
-        Ok(())
-    } else {
-        Err(format!(
-            "`--{flag} {raw}` is not a date — expected a date such as 2026-08-10"
-        ))
-    }
+fn check_date_bound(flag: &str, raw: &str) -> Result<String, String> {
+    cadet_core::canonical_due_date(raw)
+        .map_err(|_| format!("`--{flag} {raw}` is not a date — expected a date such as 2026-08-10"))
 }
 
 /// A title lands in the same line-oriented frontmatter block a custom field
@@ -603,6 +673,7 @@ fn apply_assignment(
     changes: &mut TaskChanges,
     pair: &str,
     config_path: &std::path::Path,
+    mode: AssignmentMode,
 ) -> Result<(), String> {
     let (name, raw) = pair
         .split_once('=')
@@ -619,8 +690,16 @@ fn apply_assignment(
             if raw.is_empty() {
                 changes.due = Some(None);
             } else {
-                check_date_bound("due", raw)?;
-                changes.due = Some(Some(raw.to_string()));
+                let due = match mode {
+                    AssignmentMode::NewTask => {
+                        cadet_core::reject_newlines("due", raw).map_err(|e| e.to_string())?;
+                        raw.to_string()
+                    }
+                    AssignmentMode::ExistingTask { today } => {
+                        cadet_core::resolve_due(raw, today).map_err(|e| e.to_string())?
+                    }
+                };
+                changes.due = Some(Some(due));
             }
         }
         "tags" => {
@@ -689,18 +768,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let project = selection.project;
-    let app = open_app(&reg, &project)?;
-
-    let now = jiff_now_ms();
-    let report = app.reconcile(now)?;
-    report_reconcile(&report);
-    // Reconcile runs ahead of every command, reads included, and it is where
-    // a duplicate the resolver could not settle gets held back out of the
-    // task list. That has to be visible on `cadet ls` too, not only after a
-    // write — a silently shorter list is how the user finds out otherwise.
-    print_warnings(&app);
-
-    match cli.cmd.unwrap_or(Cmd::Ls {
+    let started_at = jiff_now_ms();
+    let command = cli.cmd.unwrap_or(Cmd::Ls {
         all: false,
         states: vec![],
         tags: vec![],
@@ -709,10 +778,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         due_before: None,
         due_after: None,
         fields: vec![],
-    }) {
-        Cmd::Project { .. } => unreachable!("handled above"),
+    });
+    enum Prepared {
+        Add(cadet_app::TaskDraft),
+        AddError(Box<dyn std::error::Error>),
+        Other(Cmd),
+    }
+    let prepared = match command {
         Cmd::Add {
             title,
+            interactive,
             literal,
             due,
             no_due,
@@ -721,102 +796,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             state,
             set,
         } => {
-            let positional_title_given = !title.is_empty();
-            let joined_title = title.join(" ");
-            let (title, bracket_tags) = if literal {
-                (joined_title.trim().to_string(), Vec::new())
-            } else {
-                extract_tags(&joined_title)?
-            };
-            reject_duplicate_names(&set)?;
-            reject_flag_collisions(
-                &set,
-                &[
-                    ("title", "the positional title", positional_title_given),
-                    ("due", "`--due`", due.is_some()),
-                    (
-                        "tags",
-                        "`--tag`/`[tag]` shorthand",
-                        !tags.is_empty() || !bracket_tags.is_empty(),
-                    ),
-                    ("priority", "`--priority`", priority.is_some()),
-                    ("state", "`--state`", state.is_some()),
-                ],
-            )?;
-            let (cfg, config_path) = load_config(&project)?;
-            let mut scratch = TaskChanges::default();
-            for pair in &set {
-                apply_assignment(&cfg, &mut scratch, pair, &config_path)?;
-            }
-            // `--set due=` is applied further down and wins on its own terms;
-            // this resolves the flag and the two configured defaults.
-            let due = resolve_due_for_new_task(
-                due.as_deref(),
-                no_due,
-                cfg.defaults.due.as_deref(),
-                reg.defaults.due.as_deref(),
-                today(now)?,
-            )?;
-            let mut draft_tags = bracket_tags;
-            draft_tags.extend(tags);
-            let mut draft = TaskDraft {
-                // Both positional paths trim like `--set title=` and the
-                // backends; without `--literal`, extraction also applies the
-                // title shorthand before the draft is built.
+            let options = add::Options {
                 title,
+                interactive,
+                literal,
                 due,
+                no_due,
+                tags,
                 priority: priority.map(Priority::from),
-                tags: draft_tags,
                 state,
-                ..Default::default()
+                set,
             };
-            if let Some(t) = scratch.title {
-                draft.title = t;
+            match add::prepare(options, &reg, &project, today(started_at)?) {
+                Ok(Some(draft)) => Prepared::Add(draft),
+                Ok(None) => return Ok(()),
+                Err(error) => Prepared::AddError(error),
             }
-            if let Some(s) = scratch.state {
-                draft.state = Some(s);
-            }
-            match scratch.due {
-                Some(Some(d)) => draft.due = Some(d),
-                Some(None) => {
-                    return Err(
-                        "cannot clear `due` on a new task — pass --no-due to skip a configured default"
-                            .into(),
-                    );
-                }
-                None => {}
-            }
-            if let Some(p) = scratch.priority {
-                draft.priority = Some(p);
-            }
-            if let Some(t) = scratch.tags {
-                draft.tags = t;
-            }
-            check_title(&draft.title)?;
-            for (name, value) in scratch.fields {
-                match value {
-                    Some(v) => {
-                        draft.fields.insert(name, v);
-                    }
-                    None => {
-                        return Err(format!(
-                            "cannot clear `{name}` — there is nothing to clear on a new task"
-                        )
-                        .into());
-                    }
-                }
-            }
+        }
+        command => Prepared::Other(command),
+    };
+
+    let now = jiff_now_ms();
+    let app = open_app(&reg, &project)?;
+    let report = app.reconcile(now)?;
+    report_reconcile(&report);
+    // Reconcile runs ahead of every command, reads included, and it is where
+    // a duplicate the resolver could not settle gets held back out of the
+    // task list. That has to be visible on `cadet ls` too, not only after a
+    // write — a silently shorter list is how the user finds out otherwise.
+    print_warnings(&app);
+
+    let command = match prepared {
+        Prepared::Add(draft) => {
             let t = app.add_with(draft)?;
             println!("{}  {}", t.key, t.title);
             print_warnings(&app);
+            return Ok(());
         }
+        Prepared::AddError(error) => return Err(error),
+        Prepared::Other(command) => command,
+    };
+
+    match command {
+        Cmd::Project { .. } => unreachable!("handled above"),
+        Cmd::Add { .. } => unreachable!("prepared before opening the app"),
         Cmd::Set { key, assignments } => {
             let k = parse_key(&app, &key)?;
             reject_duplicate_names(&assignments)?;
             let (cfg, config_path) = load_config(&project)?;
             let mut changes = TaskChanges::default();
             for pair in &assignments {
-                apply_assignment(&cfg, &mut changes, pair, &config_path)?;
+                apply_assignment(
+                    &cfg,
+                    &mut changes,
+                    pair,
+                    &config_path,
+                    AssignmentMode::ExistingTask { today: today(now)? },
+                )?;
             }
             let t = app.update(&k, changes)?;
             println!("{}  {}", t.key, t.title);
@@ -832,12 +868,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             due_after,
             fields,
         } => {
-            if let Some(d) = &due_before {
-                check_date_bound("due-before", d)?;
-            }
-            if let Some(d) = &due_after {
-                check_date_bound("due-after", d)?;
-            }
+            let due_before = due_before
+                .map(|due| check_date_bound("due-before", &due))
+                .transpose()?;
+            let due_after = due_after
+                .map(|due| check_date_bound("due-after", &due))
+                .transpose()?;
             let (due_after, due_before) = match due {
                 None => (due_after, due_before),
                 Some(_) if due_before.is_some() || due_after.is_some() => {
@@ -1073,7 +1109,7 @@ pub(crate) fn jiff_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_tags;
+    use super::{extract_description_tags, extract_tags};
 
     #[test]
     fn a_trailing_tag_is_removed_and_added() {
@@ -1182,8 +1218,48 @@ mod tests {
     }
 
     #[test]
+    fn a_markdown_link_is_left_unchanged() {
+        assert_eq!(
+            extract_tags("read [the docs](https://example.com)").unwrap(),
+            (
+                "read [the docs](https://example.com)".to_string(),
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn other_markdown_brackets_are_left_unchanged() {
+        for input in [
+            "read [the docs][guide]",
+            "open [[Project notes]]",
+            "run `array[index]`",
+            "- [ ] unfinished",
+            "- [x] finished",
+            "cite [^source]",
+            "[guide]: https://example.com",
+        ] {
+            assert_eq!(
+                extract_description_tags(input).unwrap(),
+                (input.to_string(), Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn an_escaped_tag_bracket_becomes_literal_text() {
+        assert_eq!(
+            extract_tags(r"keep \[backend]").unwrap(),
+            ("keep [backend]".to_string(), Vec::new())
+        );
+    }
+
+    #[test]
     fn bare_brackets_around_whitespace_is_an_empty_tag() {
-        assert!(matches!(extract_tags("[ ] x"), Err(e) if e.contains("empty")));
+        assert_eq!(
+            extract_tags("[ ] x").unwrap(),
+            ("[ ] x".to_string(), Vec::new())
+        );
         assert!(matches!(extract_tags("[] x"), Err(e) if e.contains("empty")));
     }
 

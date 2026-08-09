@@ -792,7 +792,7 @@ fn literal_disables_all_title_shorthand() {
     let h = project_harness();
     h.cadet(&[
         "add",
-        "[bug] fix array[index]",
+        "[bug] fix array[index] | actual description",
         "--literal",
         "--set",
         "tags=frontend",
@@ -800,8 +800,89 @@ fn literal_disables_all_title_shorthand() {
     .assert()
     .success();
     let out = stdout_of(h.cadet(&["show", "T-1"]));
-    assert!(out.contains("T-1  [bug] fix array[index]"), "{out}");
+    assert!(
+        out.contains("T-1  [bug] fix array[index] | actual description"),
+        "{out}"
+    );
     assert_eq!(value_of(&out, "tags"), "frontend", "{out}");
+}
+
+#[test]
+fn message_shorthand_persists_description_and_tags() {
+    let h = project_harness();
+    h.cadet(&[
+        "add",
+        r"[bug] fix it | Read [docs][guide] and \[backend] [urgent]",
+        "--tag",
+        "frontend",
+    ])
+    .assert()
+    .success();
+
+    let src = h.read_task("fix-it.md");
+    assert!(
+        src.ends_with("\nRead [docs][guide] and [backend]\n"),
+        "{src}"
+    );
+    assert_eq!(
+        value_of(&stdout_of(h.cadet(&["show", "T-1"])), "tags"),
+        "bug, urgent, frontend"
+    );
+}
+
+#[test]
+fn interactive_add_requires_a_terminal_before_creating_a_task() {
+    let h = project_harness();
+    h.cadet(&["add", "seed", "--interactive"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("requires a terminal"));
+    h.cadet(&["ls", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no tasks"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn interactive_add_persists_a_task_through_a_real_pty() {
+    let h = project_harness();
+    let bin = assert_cmd::cargo::cargo_bin("cadet");
+    let output = std::process::Command::new("/usr/bin/expect")
+        .env("CADET_HOME", h.home.path())
+        .env("CADET_BIN", bin)
+        .args([
+            "-c",
+            r#"
+set timeout 5
+spawn $env(CADET_BIN) add seed --interactive
+expect "Title"
+send "Final title\r"
+expect "Description"
+send "Description\r"
+expect "Due"
+send "none\r"
+expect "Priority"
+send "high\r"
+expect "Tags"
+send "backend\r"
+expect eof
+set result [wait]
+exit [lindex $result 3]
+"#,
+        ])
+        .output()
+        .unwrap();
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{transcript}");
+    assert!(transcript.contains("T-1"), "{transcript}");
+
+    let src = h.read_task("final-title.md");
+    assert!(src.ends_with("\nDescription\n"), "{src}");
+    assert_eq!(
+        value_of(&stdout_of(h.cadet(&["show", "T-1"])), "tags"),
+        "backend"
+    );
 }
 
 #[test]
@@ -810,8 +891,11 @@ fn add_help_documents_title_shorthand_and_literal_mode() {
     h.cadet(&["add", "--help"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("\"[bug] fix it\""))
-        .stdout(predicates::str::contains("--literal"));
+        .stdout(predicates::str::contains("\"[bug] fix it | what it does\""))
+        .stdout(predicates::str::contains("--interactive"))
+        .stdout(predicates::str::contains("--literal"))
+        .stdout(predicates::str::contains("tomorrow"))
+        .stdout(predicates::str::contains("aug10"));
 }
 
 #[test]
@@ -827,20 +911,17 @@ fn a_bracket_tag_with_a_newline_is_rejected() {
         .stdout(predicates::str::contains("no tasks"));
 }
 
-/// A title that strips down to nothing (a task made up entirely of end tags,
-/// or whitespace) is rejected by the same guard a newline is checked against
-/// in core — `validate_task`'s empty-title rule. Nothing is created.
 #[test]
 fn a_title_that_strips_to_empty_is_rejected() {
     let h = project_harness();
     h.cadet(&["add", "[bug][frontend]"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("title must not be empty"));
+        .stderr(predicates::str::contains("task title is required"));
     h.cadet(&["add", "   "])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("title must not be empty"));
+        .stderr(predicates::str::contains("task title is required"));
     h.cadet(&["ls", "--all"])
         .assert()
         .success()
@@ -1143,15 +1224,16 @@ fn a_newline_in_a_title_is_rejected_on_a_local_db_project_too() {
         .stderr(predicates::str::contains("title").and(predicates::str::contains("newline")));
 }
 
-/// Also-do: `add --set due=` with a bad value should give the CLI's date
-/// message, the same one `add --due` gives, not the core validator's.
 #[test]
 fn add_set_due_with_a_bad_value_gives_the_cli_date_message() {
     let h = project_harness();
     h.cadet(&["add", "x", "--set", "due=banana"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("is not a date"));
+        .stderr(
+            predicates::str::contains("expects a date")
+                .and(predicates::str::contains("tomorrow").and(predicates::str::contains("aug10"))),
+        );
 }
 
 #[test]
@@ -2615,6 +2697,35 @@ fn add_accepts_a_relative_due_date() {
 }
 
 #[test]
+fn set_accepts_and_resolves_the_same_due_shorthand_as_add() {
+    let e = env();
+    cadet(&e.home).args(["add", "soon"]).assert().success();
+    cadet(&e.home)
+        .args(["set", "PERS-1", "due=tomorrow"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["show", "PERS-1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(day(1)));
+}
+
+#[test]
+fn due_bounds_normalize_calendar_valid_input_before_filtering() {
+    let e = env();
+    cadet(&e.home)
+        .args(["add", "bounded", "--due", "2026-08-10"])
+        .assert()
+        .success();
+    cadet(&e.home)
+        .args(["ls", "--due-before", "20260811"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("bounded"));
+}
+
+#[test]
 fn add_rejects_a_due_value_that_is_neither_a_date_nor_an_offset() {
     let e = env();
     cadet(&e.home)
@@ -2622,6 +2733,24 @@ fn add_rejects_a_due_value_that_is_neither_a_date_nor_an_offset() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("tomorrow"));
+}
+
+#[test]
+fn a_failed_add_still_runs_reconciliation() {
+    let e = env();
+    std::fs::write(
+        e.vault.join("note.md"),
+        "---\nstate: todo\ntitle: Hand made\n---\nbody\n",
+    )
+    .unwrap();
+
+    cadet(&e.home)
+        .args(["add", "invalid", "--due", "banana"])
+        .assert()
+        .failure()
+        .stderr(
+            predicates::str::contains("ready to adopt").and(predicates::str::contains("tomorrow")),
+        );
 }
 
 #[test]

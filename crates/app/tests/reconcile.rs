@@ -1432,12 +1432,14 @@ fn add_with_writes_every_field_to_the_file() {
             priority: Some(cadet_core::Priority::High),
             tags: vec!["home".into(), "urgent".into()],
             fields,
+            body: "\nOne-line description.\n".into(),
         })
         .unwrap();
 
     assert_eq!(t.state, "doing");
     assert_eq!(t.due.as_deref(), Some("2026-08-10"));
     assert_eq!(t.tags, vec!["home".to_string(), "urgent".to_string()]);
+    assert_eq!(t.body, "\nOne-line description.\n");
 
     let src = std::fs::read_to_string(f.vault_path.join("full-task.md")).unwrap();
     assert!(src.contains("due: 2026-08-10"), "{src}");
@@ -1512,15 +1514,17 @@ fn set_state_still_works_and_is_now_an_update() {
 #[test]
 fn add_with_rejects_a_badly_formatted_due_date_and_writes_no_file() {
     let f = fixture();
-    let err = f
-        .app
-        .add_with(cadet_app::TaskDraft {
-            title: "bad due".into(),
-            due: Some("2026-8-10".into()),
-            ..Default::default()
-        })
-        .unwrap_err();
-    assert!(err.to_string().contains("due"), "{err}");
+    for due in ["2026-02-31", "20260810", "+002026-08-10"] {
+        let err = f
+            .app
+            .add_with(cadet_app::TaskDraft {
+                title: "bad due".into(),
+                due: Some(due.into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("due"), "{due}: {err}");
+    }
     assert!(!f.vault_path.join("bad-due.md").exists());
 }
 
@@ -1768,6 +1772,25 @@ fn local_db_fixture() -> LocalDbFixture {
         app: App::new(Box::new(backend), index, None, "p".into()),
         _dir: dir,
     }
+}
+
+#[test]
+fn local_db_add_with_preserves_the_body() {
+    let f = local_db_fixture();
+    let added = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "described task".into(),
+            body: "\nOne-line description.\n".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(added.body, "\nOne-line description.\n");
+    assert_eq!(
+        f.app.get_by_key(&added.key).unwrap().body,
+        "\nOne-line description.\n"
+    );
 }
 
 #[test]
