@@ -55,6 +55,16 @@ pub enum Priority {
     Low,
 }
 
+impl Priority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Normal => "normal",
+            Self::Low => "low",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     Str(String),

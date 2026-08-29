@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
+use serde_json::Value;
 
 fn cadet(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("cadet").unwrap();
@@ -91,6 +92,185 @@ fn add_then_ls_shows_the_task() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Buy oat milk"));
+}
+
+#[test]
+fn ls_json_has_a_stable_typed_contract() {
+    let e = env();
+    let mut project = std::fs::read_to_string(e.vault.join("project.toml")).unwrap();
+    project.push_str(
+        r#"
+[[fields]]
+name = "automation"
+type = "enum"
+values = ["draft", "ready"]
+
+[[fields]]
+name = "estimate"
+type = "int"
+
+[[fields]]
+name = "reviewers"
+type = "list<string>"
+
+[[fields]]
+name = "confidence"
+type = "float"
+
+[[fields]]
+name = "approved"
+type = "bool"
+
+[[fields]]
+name = "review_date"
+type = "date"
+
+[[fields]]
+name = "notes"
+type = "string"
+"#,
+    );
+    std::fs::write(e.vault.join("project.toml"), project).unwrap();
+
+    cadet(&e.home)
+        .args([
+            "add",
+            "Automate intake",
+            "--priority",
+            "high",
+            "--tag",
+            "orchestration",
+            "--set",
+            "automation=ready",
+            "--set",
+            "estimate=3",
+            "--set",
+            "reviewers=claude,codex",
+            "--set",
+            "confidence=0.75",
+            "--set",
+            "approved=true",
+            "--set",
+            "review_date=2026-08-15",
+            "--set",
+            "notes=quoted \"text\" ✓",
+        ])
+        .assert()
+        .success();
+
+    let output = cadet(&e.home).args(["ls", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    let tasks = json["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task["project"], "personal");
+    assert!(task["uid"].as_str().is_some_and(|uid| !uid.is_empty()));
+    assert_eq!(task["key"], "PERS-1");
+    assert_eq!(task["title"], "Automate intake");
+    assert_eq!(task["state"], "todo");
+    assert_eq!(task["priority"], "high");
+    assert_eq!(task["due"], Value::Null);
+    assert_eq!(task["tags"], serde_json::json!(["orchestration"]));
+    assert_eq!(task["fields"]["automation"], "ready");
+    assert_eq!(task["fields"]["estimate"], 3);
+    assert_eq!(
+        task["fields"]["reviewers"],
+        serde_json::json!(["claude", "codex"])
+    );
+    assert_eq!(task["fields"]["confidence"], 0.75);
+    assert_eq!(task["fields"]["approved"], true);
+    assert_eq!(task["fields"]["review_date"], "2026-08-15");
+    assert_eq!(task["fields"]["notes"], "quoted \"text\" ✓");
+}
+
+#[test]
+fn ls_json_uses_an_empty_array_instead_of_human_output() {
+    let e = env();
+    cadet(&e.home)
+        .args(["ls", "--json"])
+        .assert()
+        .success()
+        .stdout("{\"schema_version\":1,\"tasks\":[]}\n");
+}
+
+#[test]
+fn ls_json_keeps_reconcile_warnings_on_stderr() {
+    let e = env();
+    cadet(&e.home).args(["add", "Original"]).assert().success();
+    std::fs::copy(
+        e.vault.join("original.md"),
+        e.vault.join("duplicate-identity.md"),
+    )
+    .unwrap();
+
+    let output = cadet(&e.home).args(["ls", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tasks"].as_array().unwrap().len(), 1);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ready to adopt"), "stderr was: {stderr:?}");
+}
+
+#[test]
+fn ls_all_projects_json_flattens_tasks_with_project_identity() {
+    let h = harness();
+    for (id, prefix) in [("alpha", "ALP"), ("beta", "BET")] {
+        h.cadet(&[
+            "project",
+            "add",
+            id,
+            "--path",
+            &h.vault(id),
+            "--prefix",
+            prefix,
+        ])
+        .assert()
+        .success();
+        h.cadet(&["--project", id, "add", &format!("{id} task")])
+            .assert()
+            .success();
+    }
+
+    let output = h
+        .cadet(&["ls", "--all-projects", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let projects: Vec<_> = json["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["project"].as_str().unwrap())
+        .collect();
+    assert_eq!(projects, ["alpha", "beta"]);
+}
+
+#[test]
+fn show_json_includes_the_full_task() {
+    let e = env();
+    cadet(&e.home)
+        .args(["add", "Explain the workflow", "|", "Full requirement body."])
+        .assert()
+        .success();
+
+    let output = cadet(&e.home)
+        .args(["show", "PERS-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    let task = &json["task"];
+    assert_eq!(task["project"], "personal");
+    assert_eq!(task["key"], "PERS-1");
+    assert_eq!(task["body"], "\nFull requirement body.\n");
+    assert!(task["created"].as_str().is_some());
+    assert!(task["updated"].as_str().is_some());
+    assert_eq!(task["renumbered_from"], Value::Null);
+    assert_eq!(task["possible_duplicate_of"], Value::Null);
 }
 
 #[test]

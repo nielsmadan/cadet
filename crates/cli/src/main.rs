@@ -1,6 +1,7 @@
 mod add;
 mod config;
 mod dirmatch;
+mod json;
 mod project;
 mod prompt;
 
@@ -140,9 +141,17 @@ enum Cmd {
         /// name=value against a declared field, repeatable (AND'd)
         #[arg(long = "field")]
         fields: Vec<String>,
+        /// Emit stable machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show one task
-    Show { key: String },
+    Show {
+        key: String,
+        /// Emit stable machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Open a task in $EDITOR
     Edit { key: String },
     /// Mark one or more tasks done
@@ -346,14 +355,8 @@ fn parse_priority(s: &str) -> Result<Priority, String> {
     }
 }
 
-/// Kept next to `parse_priority`: they are the two halves of one spelling,
-/// and this codebase's signature defect is a symmetric pair drifting apart.
 fn priority_label(p: Priority) -> &'static str {
-    match p {
-        Priority::High => "high",
-        Priority::Normal => "normal",
-        Priority::Low => "low",
-    }
+    p.as_str()
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +487,7 @@ fn list_all_projects(
     reg: &Registry,
     options: &ListOptions,
     now: i64,
+    json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let today = today(now)?;
     let mut groups = Vec::new();
@@ -494,6 +498,18 @@ fn list_all_projects(
         let filter = list_filter(project, options, today)
             .map_err(|error| format!("project `{}`: {error}", project.id))?;
         groups.push((project.id.clone(), app.list_filtered(options.all, &filter)?));
+    }
+    if json {
+        let tasks = groups
+            .iter()
+            .flat_map(|(project, tasks)| {
+                tasks
+                    .iter()
+                    .map(|task| json::TaskSummaryOutput::from_summary(project, task))
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&json::ListOutput::new(tasks))?);
+        return Ok(());
     }
     let mut printed = false;
     for (project, tasks) in groups.into_iter().filter(|(_, tasks)| !tasks.is_empty()) {
@@ -898,6 +914,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         due_before: None,
         due_after: None,
         fields: vec![],
+        json: false,
     });
     let command = match command {
         Cmd::Ls {
@@ -910,6 +927,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             due_before,
             due_after,
             fields,
+            json,
         } => {
             return list_all_projects(
                 &reg,
@@ -924,6 +942,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     fields,
                 },
                 jiff_now_ms(),
+                json,
             );
         }
         command => command,
@@ -1027,6 +1046,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             due_before,
             due_after,
             fields,
+            json,
         } => {
             let options = ListOptions {
                 all,
@@ -1040,10 +1060,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let filter = list_filter(&project, &options, today(now)?)?;
             let tasks = app.list_filtered(all, &filter)?;
-            if tasks.is_empty() {
-                println!("no tasks");
+            if json {
+                let tasks = tasks
+                    .iter()
+                    .map(|task| json::TaskSummaryOutput::from_summary(&project.id, task))
+                    .collect();
+                println!("{}", serde_json::to_string(&json::ListOutput::new(tasks))?);
+            } else {
+                if tasks.is_empty() {
+                    println!("no tasks");
+                }
+                print_task_rows(&tasks);
             }
-            print_task_rows(&tasks);
         }
         Cmd::Edit { key } => {
             let k = parse_key(&app, &key)?;
@@ -1055,9 +1083,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.record_edit(&k, &path);
             print_warnings(&app);
         }
-        Cmd::Show { key } => {
+        Cmd::Show { key, json } => {
             let k = parse_key(&app, &key)?;
             let t = app.get_by_key(&k)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json::ShowOutput::new(json::TaskOutput::from_task(
+                        &project.id,
+                        &t,
+                    )))?
+                );
+                return Ok(());
+            }
             println!("{}  {}", t.key, t.title);
             let mut rows = vec![("state".to_string(), t.state.clone())];
             // `normal` is every task's default, so a line for it would appear
