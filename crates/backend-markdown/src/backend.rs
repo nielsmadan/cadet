@@ -14,6 +14,46 @@ pub struct MarkdownBackend {
     config: OnceLock<ProjectConfig>,
 }
 
+/// Every `.md` under `root`, dot entries skipped, in unspecified order —
+/// `MarkdownBackend::markdown_files` sorts on top of this; this does not.
+///
+/// `stop_after` is a trip-wire, not a cap: the walk stops once it has pushed
+/// one path *past* it, so `Some(n)` returns up to `n + 1` paths and a caller
+/// asks `len() > n` to mean "more than n exist". A result of `n` or fewer
+/// means the trip-wire never fired, so the walk ran exactly as a `None` walk
+/// would have and raised the same errors — which is what lets `project add`
+/// read a small bounded count as proof the root is readable. `None` walks
+/// everything.
+pub fn markdown_files_under(
+    root: &Path,
+    stop_after: Option<usize>,
+) -> Result<Vec<PathBuf>, BackendError> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| BackendError::Io(format!("`{}` could not be read: {e}", dir.display())))?
+        {
+            let entry = entry.map_err(|e| {
+                BackendError::Io(format!("`{}` could not be read: {e}", dir.display()))
+            })?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+                if stop_after.is_some_and(|stop_after| out.len() > stop_after) {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Renders a `FieldValue` to its frontmatter text form.
 fn render_field_value(v: &FieldValue) -> String {
     match v {
@@ -77,24 +117,8 @@ impl MarkdownBackend {
         Ok(self.config.get_or_init(|| cfg))
     }
 
-    fn markdown_files(&self) -> Result<Vec<PathBuf>, BackendError> {
-        let mut out = Vec::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).map_err(Self::io)? {
-                let entry = entry.map_err(Self::io)?;
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "md") {
-                    out.push(path);
-                }
-            }
-        }
+    pub fn markdown_files(&self) -> Result<Vec<PathBuf>, BackendError> {
+        let mut out = markdown_files_under(&self.root, None)?;
         out.sort();
         Ok(out)
     }
@@ -434,7 +458,6 @@ impl Backend for MarkdownBackend {
             }
             // A task-shaped file whose uid is missing is not an error here — it
             // is a candidate for adoption, so record it with `uid: None`.
-            // Project config errors use a different variant and abort instead.
             match self.read_task(&p) {
                 Ok(Some(t)) => {
                     observed.push(Observed {

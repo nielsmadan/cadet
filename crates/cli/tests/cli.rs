@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn cadet(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("cadet").unwrap();
@@ -2187,6 +2189,287 @@ fn fill_with_notes(dir: &std::path::Path, n: usize) {
     }
 }
 
+#[cfg(unix)]
+struct LockedDir {
+    root: std::path::PathBuf,
+    locked: std::path::PathBuf,
+    _tmp: Option<tempfile::TempDir>,
+}
+
+#[cfg(unix)]
+impl LockedDir {
+    fn new() -> Option<Self> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        Self::lock(root, Some(tmp))
+    }
+
+    fn inside(root: &std::path::Path) -> Option<Self> {
+        Self::lock(root.to_path_buf(), None)
+    }
+
+    fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    fn locked(&self) -> &std::path::Path {
+        &self.locked
+    }
+
+    fn lock(root: std::path::PathBuf, tmp: Option<tempfile::TempDir>) -> Option<Self> {
+        std::fs::create_dir_all(&root).unwrap();
+        let locked = root.join("sub");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("hidden.md"), "hidden\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        match std::fs::read_dir(&locked) {
+            Ok(_) => {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+                eprintln!(
+                    "skipped: this user reads a 0o000 directory, so the unreadable-directory guard was never exercised"
+                );
+                None
+            }
+            Err(_) => Some(Self {
+                root,
+                locked,
+                _tmp: tmp,
+            }),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+struct LockedFile {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl LockedFile {
+    fn new(path: &std::path::Path) -> Option<Self> {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        match std::fs::read_to_string(path) {
+            Ok(_) => {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+                eprintln!(
+                    "skipped: this user reads a 0o000 file, so the unreadable-config path was never exercised"
+                );
+                None
+            }
+            Err(_) => Some(Self {
+                path: path.to_path_buf(),
+            }),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+#[cfg(unix)]
+fn assert_unscannable(stderr: &[u8], locked: &std::path::Path) {
+    let stderr = String::from_utf8_lossy(stderr);
+    let locked = locked.display().to_string();
+    assert!(stderr.contains(&locked), "{stderr}");
+    assert!(stderr.contains("cannot scan"), "{stderr}");
+    assert!(stderr.contains("Check file permissions"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_refuses_a_fresh_root_with_an_unreadable_subdirectory() {
+    let h = harness();
+    let Some(locked) = LockedDir::new() else {
+        return;
+    };
+    let mut cmd = h.cadet(&[
+        "project",
+        "add",
+        "locked",
+        "--path",
+        locked.root().to_str().unwrap(),
+    ]);
+    // assert_cmd never attaches a TTY, so this is also the non-interactive
+    // path: the timeout is what holds it to refusing rather than blocking on
+    // a prompt that can never be answered.
+    cmd.timeout(std::time::Duration::from_secs(2));
+    let output = cmd.assert().failure().get_output().clone();
+    assert_unscannable(&output.stderr, locked.locked());
+    assert!(
+        !locked.root().join("project.toml").exists(),
+        "nothing may be written"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_yes_does_not_override_an_unreadable_subdirectory() {
+    let h = harness();
+    let Some(locked) = LockedDir::new() else {
+        return;
+    };
+    let output = h
+        .cadet(&[
+            "project",
+            "add",
+            "locked",
+            "--path",
+            locked.root().to_str().unwrap(),
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_unscannable(&output.stderr, locked.locked());
+    assert!(
+        !locked.root().join("project.toml").exists(),
+        "nothing may be written"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_force_refuses_an_unreadable_existing_root_without_overwriting() {
+    let h = harness();
+    let dir = h.root.path().join("existing");
+    let project_toml = dir.join("project.toml");
+    h.cadet(&[
+        "project",
+        "add",
+        "existing",
+        "--path",
+        dir.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "existing",
+        "--path",
+        dir.to_str().unwrap(),
+        "--force",
+    ])
+    .assert()
+    .success();
+    let baseline = std::fs::read(&project_toml).unwrap();
+
+    let Some(locked) = LockedDir::inside(&dir) else {
+        return;
+    };
+    let output = h
+        .cadet(&[
+            "project",
+            "add",
+            "existing",
+            "--path",
+            dir.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_unscannable(&output.stderr, locked.locked());
+    let after = std::fs::read(&project_toml).unwrap();
+    assert_eq!(after, baseline, "nothing may be written");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_force_with_an_unreadable_project_toml_skips_the_many_notes_prompt() {
+    let h = harness();
+    let dir = h.root.path().join("unreadable-config");
+    let project_toml = dir.join("project.toml");
+    fill_with_notes(&dir, 60);
+    h.cadet(&[
+        "project",
+        "add",
+        "existing",
+        "--path",
+        dir.to_str().unwrap(),
+        "--yes",
+    ])
+    .assert()
+    .success();
+    let baseline = std::fs::read(&project_toml).unwrap();
+
+    let Some(locked_file) = LockedFile::new(&project_toml) else {
+        return;
+    };
+    h.cadet(&[
+        "project",
+        "add",
+        "existing",
+        "--path",
+        dir.to_str().unwrap(),
+        "--force",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("Permission denied"))
+    .stderr(predicates::str::contains("markdown files").not());
+    drop(locked_file);
+    let after = std::fs::read(&project_toml).unwrap();
+    assert_eq!(after, baseline, "nothing may be written");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_yes_refuses_a_large_root_with_an_unreadable_subdirectory() {
+    let h = harness();
+    let dir = h.root.path().join("large");
+    fill_with_notes(&dir, 51);
+    let Some(locked) = LockedDir::inside(&dir) else {
+        return;
+    };
+    let output = h
+        .cadet(&[
+            "project",
+            "add",
+            "large",
+            "--path",
+            dir.to_str().unwrap(),
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_unscannable(&output.stderr, locked.locked());
+    assert!(!dir.join("project.toml").exists(), "nothing may be written");
+}
+
+#[cfg(unix)]
+#[test]
+fn project_add_without_yes_refuses_large_unreadable_roots_before_readability_walk() {
+    let h = harness();
+    let dir = h.root.path().join("large-unapproved");
+    // Load-bearing: all 51 notes sit directly in `dir`, so the bounded walk
+    // trips its limit inside the same `read_dir` that only *queues* `sub`.
+    // Move them into a subdirectory and the scan error wins the race instead.
+    fill_with_notes(&dir, 51);
+    let Some(_locked) = LockedDir::inside(&dir) else {
+        return;
+    };
+    h.cadet(&["project", "add", "large", "--path", dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("more than 50 markdown files"))
+        .stderr(predicates::str::contains("--yes"))
+        .stderr(predicates::str::contains("cannot scan").not());
+    assert!(!dir.join("project.toml").exists(), "nothing may be written");
+}
+
 /// `--path '~'` expands correctly and then makes every `.md` in the user's
 /// home directory a task. The expansion is fine; the consequence needs a
 /// gate. Refuses outside a TTY rather than prompting into a pipe.
@@ -2226,9 +2509,13 @@ fn project_add_ignores_a_handful_of_notes() {
     let h = harness();
     let dir = h.root.path().join("smallnotes");
     fill_with_notes(&dir, 3);
-    h.cadet(&["project", "add", "small", "--path", dir.to_str().unwrap()])
+    let output = h
+        .cadet(&["project", "add", "small", "--path", dir.to_str().unwrap()])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .clone();
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 /// A project's own task files must never make it un-re-registerable.

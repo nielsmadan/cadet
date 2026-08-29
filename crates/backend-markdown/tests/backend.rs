@@ -1,8 +1,8 @@
-use cadet_backend_markdown::MarkdownBackend;
+use cadet_backend_markdown::{MarkdownBackend, markdown_files_under};
 use cadet_core::conformance::*;
 use cadet_core::*;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const CFG: &str = r#"
 [project]
@@ -59,6 +59,62 @@ fn write_malformed_task_file(root: &Path, name: &str) {
     .unwrap();
 }
 
+#[cfg(unix)]
+struct LockedDir {
+    root: PathBuf,
+    locked: PathBuf,
+    _tmp: Option<tempfile::TempDir>,
+}
+
+#[cfg(unix)]
+impl LockedDir {
+    fn new() -> Option<Self> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut locked = Self::inside(tmp.path())?;
+        locked._tmp = Some(tmp);
+        Some(locked)
+    }
+
+    fn inside(root: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = root.join("sub");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("note.md"), "note\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+            eprintln!(
+                "skipped: this user reads a 0o000 directory, so the unreadable-directory guard was never exercised"
+            );
+            return None;
+        }
+
+        Some(Self {
+            root: root.to_path_buf(),
+            locked,
+            _tmp: None,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn locked(&self) -> &Path {
+        &self.locked
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockedDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 fn assert_malformed_project_config(err: BackendError, root: &Path) {
     let expected_path = root.join("project.toml").display().to_string();
     let rendered = err.to_string();
@@ -106,6 +162,76 @@ fn rich(title: &str) -> Task {
         FieldValue::List(vec!["a".into(), "b".into()]),
     );
     t
+}
+
+#[test]
+fn markdown_files_returns_paths_in_sorted_order() {
+    let (d, b) = setup();
+    let b_path = d.path().join("b.md");
+    let a_path = d.path().join("a.md");
+    let c_path = d.path().join("c.md");
+    std::fs::write(&b_path, "b\n").unwrap();
+    std::fs::write(&a_path, "a\n").unwrap();
+    std::fs::write(&c_path, "c\n").unwrap();
+
+    assert_eq!(b.markdown_files().unwrap(), vec![a_path, b_path, c_path]);
+}
+
+#[test]
+fn markdown_files_skips_dot_entries() {
+    let (d, b) = setup();
+    let keep = d.path().join("keep.md");
+    let hidden = d.path().join(".hidden");
+    std::fs::create_dir(&hidden).unwrap();
+    std::fs::write(hidden.join("inside.md"), "inside\n").unwrap();
+    std::fs::write(d.path().join(".foo.md"), "foo\n").unwrap();
+    std::fs::write(&keep, "keep\n").unwrap();
+
+    assert_eq!(b.markdown_files().unwrap(), vec![keep]);
+}
+
+#[cfg(unix)]
+#[test]
+fn markdown_files_errors_on_unreadable_subdirectory() {
+    let Some(locked) = LockedDir::new() else {
+        return;
+    };
+    let b = backend_at(locked.root());
+
+    assert!(b.markdown_files().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn markdown_files_unreadable_subdirectory_error_names_the_directory() {
+    let Some(locked) = LockedDir::new() else {
+        return;
+    };
+    let b = backend_at(locked.root());
+
+    let rendered = b.markdown_files().unwrap_err().to_string();
+
+    assert!(
+        rendered.contains(&locked.locked().display().to_string()),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn markdown_files_under_returns_limit_plus_one_paths() {
+    let d = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        std::fs::write(d.path().join(format!("{i}.md")), "note\n").unwrap();
+    }
+
+    let found = markdown_files_under(d.path(), Some(3)).unwrap();
+
+    assert_eq!(found.len(), 4);
+    assert!(
+        found
+            .iter()
+            .all(|path| path.extension().is_some_and(|ext| ext == "md"))
+    );
 }
 
 #[test]

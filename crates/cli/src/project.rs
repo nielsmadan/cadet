@@ -2,9 +2,10 @@ use crate::TEMPLATE;
 use crate::config::{BackendKind, Project, Registry};
 use crate::prompt;
 use cadet_backend_local_db::LocalDbBackend;
-use cadet_core::{ProjectConfig, TaskFilter, TaskKey, Workflow};
+use cadet_backend_markdown::markdown_files_under;
+use cadet_core::{BackendError, ProjectConfig, TaskFilter, TaskKey, Workflow};
 use clap::Subcommand;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The `--backend` flag's own type, kept separate from `config::BackendKind`
 /// the same way `PriorityArg` is kept separate from `cadet_core::Priority` in
@@ -174,36 +175,36 @@ pub fn resolve_path(raw: &str) -> Result<PathBuf, String> {
 /// whole document collection rather than an empty place for tasks.
 const MANY_NOTES: usize = 50;
 
-/// Counts markdown files under `root`, stopping as soon as `limit` is
-/// exceeded — the folder this guard exists to catch is `$HOME`, and a full
-/// walk of it is not something to do before printing a warning.
-///
-/// Mirrors `MarkdownBackend::markdown_files` exactly, dot-entry skip included: a
-/// count that disagreed with what adoption actually sees would be worse
-/// than no count at all.
-fn count_markdown(root: &std::path::Path, limit: usize) -> usize {
-    let mut found = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "md") {
-                found += 1;
-                if found > limit {
-                    return found;
-                }
-            }
-        }
+/// Counts markdown files with the same walk `MarkdownBackend::markdown_files`
+/// uses, so adoption's count cannot silently disagree with adoption's scan.
+/// A missing root still counts as zero because that is the ordinary
+/// `project add` case before the tasks directory exists.
+fn count_markdown(root: &Path, limit: Option<usize>) -> Result<usize, String> {
+    if !root.is_dir() {
+        return Ok(0);
     }
-    found
+    markdown_files_under(root, limit)
+        .map(|v| v.len())
+        .map_err(|e| unscannable(root, e))
+}
+
+/// Walks `root` to completion for its errors alone — a directory the scan
+/// cannot read is the whole point here, not the count it returns.
+fn ensure_scannable(root: &Path) -> Result<(), String> {
+    count_markdown(root, None).map(|_| ())
+}
+
+fn unscannable(root: &Path, e: BackendError) -> String {
+    let detail = match e {
+        BackendError::Io(m) => m,
+        other => other.to_string(),
+    };
+    format!(
+        "cannot scan {}: {detail} — every `.md` under a project root becomes a task, \
+         so a folder that cannot be counted cannot be adopted. \
+         Check file permissions, or point --path elsewhere.",
+        root.display()
+    )
 }
 
 /// The `project.toml` body to write for `id`/`name`/`prefix`.
@@ -792,6 +793,10 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
     }
     .config_path();
 
+    // Bound once: `project.toml` appearing or vanishing between here and the
+    // adoption guard below would otherwise let a fresh root skip the gate.
+    let is_readd = project_toml.exists();
+
     // Read the config being overwritten (if any) before it's gone, so a
     // `--force` re-add without explicit --prefix/--name re-derives from the
     // id's default rather than silently swapping the project's real prefix
@@ -801,7 +806,7 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
     // into "silently re-derive", which splits one project's tasks across two
     // key namespaces (`ALFA-*` and `ALPH-*`) that `doctor` has no way to see
     // are the same project.
-    let existing_src = if project_toml.exists() {
+    let existing_src = if is_readd {
         if !force {
             return Err(format!(
                 "{} already exists — pass --force to overwrite it",
@@ -821,31 +826,38 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
     // `--path '~'` expands correctly and then roots a project at the user's
     // home directory, where every `.md` underneath becomes an adoption
     // candidate. `~` and `~/` are plausible things to type, so the
-    // consequence gets a gate. Skipped when the folder is already a cadet
-    // project: its own task files are exactly what we would be counting.
-    // Also skipped outright for `local-db`: `root` there is a single
-    // database file, not a folder of notes, so there is nothing for this
-    // guard to count.
-    if backend == BackendKind::Markdown && existing_src.is_none() {
-        let found = count_markdown(&root, MANY_NOTES);
-        if found > MANY_NOTES {
-            let question = format!(
-                "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Use it anyway?",
-                root.display()
-            );
-            let approved = if yes {
-                true
-            } else if interactive {
-                prompt::confirm(&question).map_err(|e| e.to_string())?
-            } else {
-                false
-            };
-            if !approved {
-                return Err(format!(
-                    "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Point --path at a subfolder, or pass --yes to use it anyway.",
+    // consequence gets a gate. A re-add skips the gate — a project's own
+    // task files are exactly what would be counted — but no path adopts a
+    // root on a walk that stopped early, so a folder that cannot be read
+    // is refused rather than adopted on an undercount. `local-db` skips
+    // this outright: `root` there is a single database file, not a folder
+    // of notes.
+    if backend == BackendKind::Markdown {
+        if is_readd {
+            ensure_scannable(&root)?;
+        } else {
+            let found = count_markdown(&root, Some(MANY_NOTES))?;
+            if found > MANY_NOTES {
+                let question = format!(
+                    "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Use it anyway?",
                     root.display()
-                ));
+                );
+                let approved = if yes {
+                    true
+                } else if interactive {
+                    prompt::confirm(&question).map_err(|e| e.to_string())?
+                } else {
+                    false
+                };
+                if !approved {
+                    return Err(format!(
+                        "{} already holds more than {MANY_NOTES} markdown files — every `.md` under a project root becomes a task. Point --path at a subfolder, or pass --yes to use it anyway.",
+                        root.display()
+                    ));
+                }
+                ensure_scannable(&root)?;
             }
+            // At or under the limit the wire never tripped — see `markdown_files_under`.
         }
     }
 
@@ -937,6 +949,64 @@ fn add(reg: &mut Registry, new: NewProject) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use cadet_backend_markdown::MarkdownBackend;
+
+    #[cfg(unix)]
+    struct LockedDir {
+        root: std::path::PathBuf,
+        locked: std::path::PathBuf,
+        _tmp: Option<tempfile::TempDir>,
+    }
+
+    #[cfg(unix)]
+    impl LockedDir {
+        fn new() -> Option<Self> {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut locked = Self::inside(tmp.path())?;
+            locked._tmp = Some(tmp);
+            Some(locked)
+        }
+
+        fn inside(root: &std::path::Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let locked = root.join("sub");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("hidden.md"), "x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+                eprintln!(
+                    "skipped: this user reads a 0o000 directory, so the unreadable-directory guard was never exercised"
+                );
+                return None;
+            }
+            Some(Self {
+                root: root.to_path_buf(),
+                locked,
+                _tmp: None,
+            })
+        }
+
+        fn root(&self) -> &std::path::Path {
+            &self.root
+        }
+
+        fn locked(&self) -> &std::path::Path {
+            &self.locked
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LockedDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = std::fs::set_permissions(&self.locked, std::fs::Permissions::from_mode(0o755));
+        }
+    }
 
     #[test]
     fn derive_prefix_uppercases_and_truncates_to_four() {
@@ -1052,8 +1122,8 @@ type = "int"
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("n{i}.md")), "x").unwrap();
         }
-        assert_eq!(count_markdown(dir.path(), 3), 4);
-        assert_eq!(count_markdown(dir.path(), 100), 10);
+        assert_eq!(count_markdown(dir.path(), Some(3)).unwrap(), 4);
+        assert_eq!(count_markdown(dir.path(), Some(100)).unwrap(), 10);
     }
 
     #[test]
@@ -1066,13 +1136,40 @@ type = "int"
         std::fs::write(dir.path().join("sub/c.txt"), "x").unwrap();
         std::fs::write(dir.path().join(".hidden/d.md"), "x").unwrap();
         std::fs::write(dir.path().join(".e.md"), "x").unwrap();
-        assert_eq!(count_markdown(dir.path(), 100), 2);
+        assert_eq!(count_markdown(dir.path(), Some(100)).unwrap(), 2);
     }
 
     #[test]
     fn count_markdown_of_a_missing_folder_is_zero() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(count_markdown(&dir.path().join("nope"), 100), 0);
+        assert_eq!(
+            count_markdown(&dir.path().join("nope"), Some(100)).unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn count_markdown_and_markdown_files_agree_on_unreadable_directories() {
+        let Some(locked) = LockedDir::new() else {
+            return;
+        };
+        let want = locked.locked().display().to_string();
+
+        let count_err = count_markdown(locked.root(), Some(100)).unwrap_err();
+        let backend_err = MarkdownBackend::new(locked.root().to_path_buf())
+            .markdown_files()
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            count_err.contains(&want),
+            "count_markdown said: {count_err}"
+        );
+        assert!(
+            backend_err.contains(&want),
+            "markdown_files said: {backend_err}"
+        );
     }
 
     #[test]
