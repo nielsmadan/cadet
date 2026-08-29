@@ -13,6 +13,8 @@
 .claude/skills/.gc-skill-ownership.json
 .claude/skills/core.gc-*
 .claude/skills/gascity.*
+docs/superpowers/
+.codex/hooks.json
 .codex/skills/.gc-skill-ownership.json
 .codex/skills/core.gc-*
 .codex/skills/gascity.*
