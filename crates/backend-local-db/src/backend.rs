@@ -355,10 +355,8 @@ fn parse_cursor(c: &Cursor) -> Option<i64> {
 impl Backend for LocalDbBackend {
     fn load_project(&self) -> Result<ProjectConfig, BackendError> {
         let src = std::fs::read_to_string(&self.config_path).map_err(Self::io)?;
-        ProjectConfig::parse(&src).map_err(|e| BackendError::Malformed {
-            path: self.config_path.display().to_string(),
-            reason: e.to_string(),
-        })
+        ProjectConfig::parse(&src)
+            .map_err(|e| BackendError::malformed_project_config(&self.config_path, e))
     }
 
     /// Not implemented: a from-scratch renderer would overwrite the sibling
@@ -606,6 +604,12 @@ impl Backend for LocalDbBackend {
     }
 
     fn scan(&self, since: Option<Cursor>) -> Result<ChangeSet, BackendError> {
+        // A broken or unreadable `project.toml` is a genuine failure and
+        // must error out — unlike an individual task row below, there is no
+        // meaningful way to "skip" the project config. Loading it here also
+        // warms the cache once, up front, so no task read below can
+        // independently fail on it.
+        self.config()?;
         let Some(cursor) = since else {
             return self.full_snapshot();
         };

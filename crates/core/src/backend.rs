@@ -2,6 +2,7 @@ use crate::canonical::Revision;
 use crate::config::ProjectConfig;
 use crate::identity::Snapshot;
 use crate::model::{Task, TaskKey, TaskUid};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor(pub Vec<u8>);
@@ -41,8 +42,25 @@ pub enum BackendError {
     NotFound,
     #[error("malformed task file at {path}: {reason}")]
     Malformed { path: String, reason: String },
+    #[error("malformed project config at {path}: {reason}")]
+    MalformedProjectConfig { path: String, reason: String },
     #[error("this backend does not support {capability}")]
     Unsupported { capability: String },
+}
+
+impl BackendError {
+    pub fn malformed_project_config(path: &Path, reason: impl std::fmt::Display) -> Self {
+        match std::path::absolute(path) {
+            Ok(abs) => Self::MalformedProjectConfig {
+                path: abs.display().to_string(),
+                reason: reason.to_string(),
+            },
+            Err(e) => Self::Io(format!(
+                "could not resolve the project config path `{}`: {e}",
+                path.display()
+            )),
+        }
+    }
 }
 
 /// All parameters are by value: UniFFI cannot express references in foreign
@@ -78,5 +96,57 @@ pub trait Backend {
     /// default returns `None`, and such a backend gets no safety net at all.
     fn location_of(&self, _uid: TaskUid) -> Result<Option<String>, BackendError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendError;
+    use std::path::Path;
+
+    #[test]
+    fn display_distinguishes_task_file_from_project_config() {
+        let task_file = BackendError::Malformed {
+            path: "task.md".to_string(),
+            reason: "missing or invalid uid".to_string(),
+        };
+        let project_config = BackendError::MalformedProjectConfig {
+            path: "/tmp/project.toml".to_string(),
+            reason: "config parse error".to_string(),
+        };
+
+        assert_eq!(
+            task_file.to_string(),
+            "malformed task file at task.md: missing or invalid uid"
+        );
+        assert_eq!(
+            project_config.to_string(),
+            "malformed project config at /tmp/project.toml: config parse error"
+        );
+    }
+
+    #[test]
+    fn malformed_project_config_makes_relative_path_absolute() {
+        let err = BackendError::malformed_project_config("project.toml".as_ref(), "invalid toml");
+
+        let BackendError::MalformedProjectConfig { path, reason } = err else {
+            panic!("expected malformed project config error");
+        };
+
+        let path = Path::new(&path);
+        assert!(path.is_absolute());
+        assert!(path.ends_with("project.toml"));
+        assert_eq!(reason, "invalid toml");
+    }
+
+    #[test]
+    fn malformed_project_config_reports_absolute_resolution_failure_as_io() {
+        let err = BackendError::malformed_project_config(Path::new(""), "invalid toml");
+
+        let BackendError::Io(message) = err else {
+            panic!("expected io error for an unresolvable config path");
+        };
+
+        assert!(message.starts_with("could not resolve the project config path ``: "));
     }
 }

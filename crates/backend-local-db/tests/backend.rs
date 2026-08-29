@@ -4,6 +4,7 @@ use cadet_core::{
     conformance,
 };
 use std::collections::BTreeMap;
+use std::path::Path;
 
 const CONFIG: &str = r#"
 [project]
@@ -52,6 +53,20 @@ fn task(n: u32, title: &str) -> Task {
     }
 }
 
+fn assert_malformed_project_config(err: BackendError, config_path: &Path) {
+    let message = err.to_string();
+    match &err {
+        BackendError::MalformedProjectConfig { path, .. } => {
+            let path = Path::new(path);
+            assert!(path.is_absolute(), "config path must be absolute: {path:?}");
+            assert_eq!(path, config_path);
+        }
+        other => panic!("expected malformed project config, got {other:?}"),
+    }
+    assert!(message.contains("project config"), "{message}");
+    assert!(!message.contains("task file"), "{message}");
+}
+
 #[test]
 fn local_db_satisfies_the_conformance_suite() {
     let (_d, b) = backend();
@@ -85,6 +100,52 @@ fn the_project_config_comes_from_the_sibling_toml() {
     let cfg = b.load_project().unwrap();
     assert_eq!(cfg.prefix, "T");
     assert_eq!(cfg.fields.len(), 1, "the declared field must be read");
+}
+
+#[test]
+fn malformed_project_config_reports_config_path_for_load_and_snapshot_scan() {
+    let (dir, _uid) = {
+        let (dir, b) = backend();
+        let t = task(1, "stored before config broke");
+        b.put(t.clone(), None).unwrap();
+        (dir, t.uid)
+    };
+    let config_path = dir.path().join("t.toml");
+    std::fs::write(&config_path, "not [ valid toml").unwrap();
+
+    let b = LocalDbBackend::open(&dir.path().join("t.db")).unwrap();
+    assert_malformed_project_config(b.load_project().unwrap_err(), &config_path);
+    assert_malformed_project_config(b.scan(None).unwrap_err(), &config_path);
+}
+
+#[test]
+fn scan_rejects_malformed_project_config_for_an_empty_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("t.toml");
+    std::fs::write(&config_path, "not [ valid toml").unwrap();
+    let b = LocalDbBackend::open(&dir.path().join("t.db")).unwrap();
+
+    assert_malformed_project_config(b.scan(None).unwrap_err(), &config_path);
+}
+
+#[test]
+fn scan_rejects_malformed_project_config_for_an_empty_delta() {
+    let (dir, cursor) = {
+        let (dir, b) = backend();
+        let ChangeSet::Snapshot {
+            cursor: Some(cursor),
+            ..
+        } = b.scan(None).unwrap()
+        else {
+            panic!("scan(None) must return a snapshot cursor");
+        };
+        (dir, cursor)
+    };
+    let config_path = dir.path().join("t.toml");
+    std::fs::write(&config_path, "not [ valid toml").unwrap();
+
+    let b = LocalDbBackend::open(&dir.path().join("t.db")).unwrap();
+    assert_malformed_project_config(b.scan(Some(cursor)).unwrap_err(), &config_path);
 }
 
 /// A from-scratch renderer would overwrite the sibling `.toml` wholesale —

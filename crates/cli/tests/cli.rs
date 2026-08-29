@@ -72,6 +72,31 @@ impl Harness {
     }
 }
 
+fn break_project_config(vault: &std::path::Path) -> std::path::PathBuf {
+    break_config_file(vault.join("project.toml"))
+}
+
+fn break_local_db_config(home: &std::path::Path, id: &str) -> std::path::PathBuf {
+    break_config_file(home.join("projects").join(format!("{id}.toml")))
+}
+
+fn break_config_file(path: std::path::PathBuf) -> std::path::PathBuf {
+    std::fs::write(&path, "not [ valid toml").unwrap();
+    path
+}
+
+fn assert_malformed_project_config(output: std::process::Output, path: &std::path::Path) {
+    assert!(
+        !output.status.success(),
+        "command should fail with malformed project config"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let path = path.to_str().unwrap();
+    assert!(stderr.contains(path), "stderr was: {stderr:?}");
+    assert!(stderr.contains("project config"), "stderr was: {stderr:?}");
+    assert!(!stderr.contains("task file"), "stderr was: {stderr:?}");
+}
+
 #[test]
 fn init_creates_project_toml_and_nothing_else() {
     let e = env();
@@ -414,6 +439,75 @@ fn a_malformed_registry_is_a_hard_error_not_an_empty_one() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("config.toml"));
+}
+
+#[test]
+fn commands_that_read_tasks_fail_loudly_on_malformed_project_config() {
+    let e = env();
+    cadet(&e.home)
+        .args(["add", "Existing task"])
+        .assert()
+        .success();
+    let config_path = break_project_config(&e.vault);
+
+    for args in [
+        &["ls"][..],
+        &["show", "PERS-1"][..],
+        &["add", "New task"][..],
+    ] {
+        let output = cadet(&e.home).args(args).output().unwrap();
+        assert_malformed_project_config(output, &config_path);
+    }
+}
+
+#[test]
+fn ls_all_projects_fails_loudly_on_a_malformed_project_config() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "healthy",
+        "--path",
+        &h.vault("healthy"),
+        "--prefix",
+        "HEA",
+    ])
+    .assert()
+    .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "broken",
+        "--path",
+        &h.vault("broken"),
+        "--prefix",
+        "BRO",
+    ])
+    .assert()
+    .success();
+    let broken_config = break_project_config(std::path::Path::new(&h.vault("broken")));
+
+    let output = h.cadet(&["ls", "--all-projects"]).output().unwrap();
+
+    assert_malformed_project_config(output, &broken_config);
+}
+
+#[test]
+fn a_malformed_task_file_still_reports_as_ready_to_adopt() {
+    let e = env();
+    std::fs::write(
+        e.vault.join("note.md"),
+        "---\nstate: todo\ntitle: Hand made\n---\nbody\n",
+    )
+    .unwrap();
+
+    cadet(&e.home)
+        .arg("ls")
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "⚠ 1 note(s) ready to adopt — run `cadet adopt`",
+        ));
 }
 
 #[test]
@@ -2293,6 +2387,34 @@ fn tasks_round_trip_through_a_local_db_project() {
 }
 
 #[test]
+fn local_db_commands_that_read_tasks_fail_loudly_on_malformed_project_config() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "scratch",
+        "--backend",
+        "local-db",
+        "--prefix",
+        "SCR",
+    ])
+    .assert()
+    .success();
+    h.cadet(&["--project", "scratch", "add", "try an idea"])
+        .assert()
+        .success();
+    let config_path = break_local_db_config(h.home(), "scratch");
+
+    for args in [
+        &["--project", "scratch", "ls"][..],
+        &["--project", "scratch", "show", "SCR-1"][..],
+    ] {
+        let output = h.cadet(args).output().unwrap();
+        assert_malformed_project_config(output, &config_path);
+    }
+}
+
+#[test]
 fn ls_all_projects_groups_tasks_from_every_backend() {
     let h = harness();
     h.cadet(&[
@@ -2342,6 +2464,38 @@ fn ls_all_projects_groups_tasks_from_every_backend() {
         .stdout(predicates::str::contains("scratch:"))
         .stdout(predicates::str::contains("SCR-1"))
         .stdout(predicates::str::contains("try an idea"));
+}
+
+#[test]
+fn ls_all_projects_fails_loudly_on_a_malformed_local_db_project_config() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "notes",
+        "--path",
+        &h.vault("notes"),
+        "--prefix",
+        "NOTE",
+    ])
+    .assert()
+    .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "scratch",
+        "--backend",
+        "local-db",
+        "--prefix",
+        "SCR",
+    ])
+    .assert()
+    .success();
+    let config_path = break_local_db_config(h.home(), "scratch");
+
+    let output = h.cadet(&["ls", "--all-projects"]).output().unwrap();
+
+    assert_malformed_project_config(output, &config_path);
 }
 
 #[test]

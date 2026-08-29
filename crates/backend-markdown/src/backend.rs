@@ -174,7 +174,10 @@ impl MarkdownBackend {
     /// there — but that file could not have been written to either, and the
     /// alternative is that a single unreadable note locks the user out of
     /// their own project.
+    /// Project config errors use a different variant and abort before this
+    /// loop instead of being skipped as task-file errors.
     fn path_for(&self, uid: &TaskUid) -> Result<Option<PathBuf>, BackendError> {
+        self.config()?;
         for p in self.markdown_files()? {
             match self.read_task(&p) {
                 Ok(Some(t)) if &t.uid == uid => return Ok(Some(p)),
@@ -197,11 +200,9 @@ impl MarkdownBackend {
 
 impl Backend for MarkdownBackend {
     fn load_project(&self) -> Result<ProjectConfig, BackendError> {
-        let src = std::fs::read_to_string(self.root.join("project.toml")).map_err(Self::io)?;
-        ProjectConfig::parse(&src).map_err(|e| BackendError::Malformed {
-            path: "project.toml".into(),
-            reason: e.to_string(),
-        })
+        let path = self.root.join("project.toml");
+        let src = std::fs::read_to_string(&path).map_err(Self::io)?;
+        ProjectConfig::parse(&src).map_err(|e| BackendError::malformed_project_config(&path, e))
     }
 
     /// Declined for exactly the reason `LocalDbBackend::save_project` gives,
@@ -433,6 +434,7 @@ impl Backend for MarkdownBackend {
             }
             // A task-shaped file whose uid is missing is not an error here — it
             // is a candidate for adoption, so record it with `uid: None`.
+            // Project config errors use a different variant and abort instead.
             match self.read_task(&p) {
                 Ok(Some(t)) => {
                     observed.push(Observed {
@@ -470,5 +472,36 @@ impl Backend for MarkdownBackend {
             // full scan.
             cursor: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MarkdownBackend;
+    use cadet_core::BackendError;
+
+    #[test]
+    fn malformed_task_file_error_names_task_file_with_absolute_path() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("bad.md");
+        std::fs::write(
+            &path,
+            "---\nuid: not-a-ulid\nstate: todo\ntitle: Bad\n---\nbody\n",
+        )
+        .unwrap();
+        let backend = MarkdownBackend::new(d.path().to_path_buf());
+
+        let err = backend.read_task(&path).unwrap_err();
+
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "malformed task file at {}: missing or invalid uid",
+                path.display()
+            )
+        );
+        assert!(!rendered.contains("project config"), "{rendered}");
+        assert!(matches!(err, BackendError::Malformed { .. }));
     }
 }

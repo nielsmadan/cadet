@@ -2,6 +2,7 @@ use cadet_backend_markdown::MarkdownBackend;
 use cadet_core::conformance::*;
 use cadet_core::*;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 const CFG: &str = r#"
 [project]
@@ -24,10 +25,52 @@ type = "list<string>"
 "#;
 
 fn setup() -> (tempfile::TempDir, MarkdownBackend) {
-    let d = tempfile::tempdir().unwrap();
-    std::fs::write(d.path().join("project.toml"), CFG).unwrap();
+    let d = setup_with_config(CFG);
     let b = MarkdownBackend::new(d.path().to_path_buf());
     (d, b)
+}
+
+fn setup_with_config(config: &str) -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("project.toml"), config).unwrap();
+    d
+}
+
+fn backend_at(root: &Path) -> MarkdownBackend {
+    MarkdownBackend::new(root.to_path_buf())
+}
+
+fn write_task_file(root: &Path, name: &str, uid: &TaskUid, title: &str) {
+    std::fs::write(
+        root.join(name),
+        format!(
+            "---\nuid: {}\nkey: P-1\ntitle: {title}\nstate: todo\ncreated: 1970-01-01T00:00:00Z\nupdated: 1970-01-01T00:00:00Z\n---\nbody\n",
+            uid.as_str()
+        ),
+    )
+    .unwrap();
+}
+
+fn write_malformed_task_file(root: &Path, name: &str) {
+    std::fs::write(
+        root.join(name),
+        "---\nuid: not-a-ulid\nkey: P-1\ntitle: Broken\nstate: todo\n---\nbody\n",
+    )
+    .unwrap();
+}
+
+fn assert_malformed_project_config(err: BackendError, root: &Path) {
+    let expected_path = root.join("project.toml").display().to_string();
+    let rendered = err.to_string();
+    assert!(rendered.contains(&expected_path), "{rendered}");
+    assert!(rendered.contains("project config"), "{rendered}");
+    assert!(!rendered.contains("task file"), "{rendered}");
+
+    let BackendError::MalformedProjectConfig { path, .. } = err else {
+        panic!("expected malformed project config, got {rendered}");
+    };
+    assert_eq!(path, expected_path);
+    assert!(Path::new(&path).is_absolute());
 }
 
 fn task(title: &str) -> Task {
@@ -69,6 +112,73 @@ fn rich(title: &str) -> Task {
 fn loads_project_config() {
     let (_d, b) = setup();
     assert_eq!(b.load_project().unwrap().prefix, "P");
+}
+
+#[test]
+fn malformed_project_config_errors_name_the_config_with_an_absolute_path() {
+    let d = setup_with_config("not [ valid toml");
+    let uid = TaskUid::generate();
+    write_task_file(d.path(), "task.md", &uid, "Task");
+
+    assert_malformed_project_config(backend_at(d.path()).load_project().unwrap_err(), d.path());
+    assert_malformed_project_config(backend_at(d.path()).scan(None).unwrap_err(), d.path());
+    assert_malformed_project_config(backend_at(d.path()).get(uid).unwrap_err(), d.path());
+}
+
+#[test]
+fn empty_vault_lookups_fail_on_malformed_project_config() {
+    let d = setup_with_config("not [ valid toml");
+    let uid = TaskUid::generate();
+
+    assert_malformed_project_config(backend_at(d.path()).get(uid.clone()).unwrap_err(), d.path());
+    assert_malformed_project_config(backend_at(d.path()).location_of(uid).unwrap_err(), d.path());
+}
+
+#[test]
+fn uidless_vault_lookups_fail_on_malformed_project_config() {
+    let d = setup_with_config("not [ valid toml");
+    std::fs::write(
+        d.path().join("uidless.md"),
+        "---\nstate: todo\ntitle: Missing uid\n---\nbody\n",
+    )
+    .unwrap();
+    let uid = TaskUid::generate();
+
+    assert_malformed_project_config(backend_at(d.path()).get(uid.clone()).unwrap_err(), d.path());
+    assert_malformed_project_config(backend_at(d.path()).location_of(uid).unwrap_err(), d.path());
+}
+
+#[test]
+fn path_for_still_skips_malformed_task_files_before_the_target() {
+    let (d, b) = setup();
+    write_malformed_task_file(d.path(), "aaa-broken.md");
+    let target = task("Target");
+    b.put(target.clone(), None).unwrap();
+
+    let got = b.get(target.uid.clone()).unwrap().unwrap();
+
+    assert_eq!(got.uid, target.uid);
+    assert_eq!(got.title, "Target");
+}
+
+#[test]
+fn scan_observes_malformed_task_files_as_adoption_candidates() {
+    let (d, b) = setup();
+    write_malformed_task_file(d.path(), "broken.md");
+
+    match b.scan(None).unwrap() {
+        ChangeSet::Snapshot {
+            snapshot, tasks, ..
+        } => {
+            assert!(snapshot.complete);
+            assert!(tasks.is_empty());
+            assert_eq!(snapshot.observed.len(), 1);
+            let observed = &snapshot.observed[0];
+            assert_eq!(observed.uid, None);
+            assert_eq!(observed.path, "broken.md");
+        }
+        _ => panic!("fs backend must return a Snapshot"),
+    }
 }
 
 #[test]

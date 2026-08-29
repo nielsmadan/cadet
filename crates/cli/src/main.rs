@@ -8,7 +8,7 @@ mod prompt;
 use cadet_app::{App, GitNet, RejectReason, TaskChanges};
 use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
-use cadet_core::{Backend, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey};
+use cadet_core::{Backend, BackendError, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey};
 use cadet_store_sqlite::{SqliteIndex, TaskSummary};
 use clap::{Parser, Subcommand};
 use config::{BackendKind, Project, Registry};
@@ -340,8 +340,15 @@ fn load_config(
 ) -> Result<(ProjectConfig, std::path::PathBuf), Box<dyn std::error::Error>> {
     let config_path = project.config_path();
     let src = std::fs::read_to_string(&config_path)?;
-    let cfg = ProjectConfig::parse(&src)?;
+    let cfg = parse_project_config(&src, &config_path)?;
     Ok((cfg, config_path))
+}
+
+fn parse_project_config(
+    src: &str,
+    config_path: &std::path::Path,
+) -> Result<ProjectConfig, BackendError> {
+    ProjectConfig::parse(src).map_err(|e| BackendError::malformed_project_config(config_path, e))
 }
 
 fn parse_priority(s: &str) -> Result<Priority, String> {
@@ -1244,7 +1251,26 @@ pub(crate) fn jiff_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_description_tags, extract_tags};
+    use super::{extract_description_tags, extract_tags, parse_project_config};
+    use cadet_core::BackendError;
+    use std::path::Path;
+
+    #[test]
+    fn parse_project_config_names_a_relative_config_path() {
+        let err = parse_project_config("not [ valid toml", Path::new("project.toml")).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("malformed project config at "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("project.toml"), "{rendered}");
+        assert!(!rendered.contains("task file"), "{rendered}");
+
+        let BackendError::MalformedProjectConfig { path, .. } = err else {
+            panic!("expected malformed project config error, got {err:?}");
+        };
+        assert!(Path::new(&path).is_absolute(), "{path}");
+    }
 
     #[test]
     fn a_trailing_tag_is_removed_and_added() {
