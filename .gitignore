@@ -6,3 +6,14 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+/.gc/
+.beads/formulas/
+.beads/routes.jsonl
+.claude/skills/.gc-skill-ownership.json
+.claude/skills/core.gc-*
+.claude/skills/gascity.*
+.codex/skills/.gc-skill-ownership.json
+.codex/skills/core.gc-*
+.codex/skills/gascity.*
+.beads/interactions.jsonl

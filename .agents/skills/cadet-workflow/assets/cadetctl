@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+AUTOMATION_HOME="${CADET_AUTOMATION_HOME:-$HOME/wrksp/cadet-automation}"
+if [ ! -x "$AUTOMATION_HOME/cadetctl" ]; then
+  echo "Cadet automation is unavailable at $AUTOMATION_HOME" >&2
+  exit 1
+fi
+cd "$AUTOMATION_HOME"
+exec mise exec -- ./cadetctl "$@"
