@@ -136,6 +136,10 @@ impl GitNet {
     /// and `undo` then reverts their work along with cadet's. Cadet knows
     /// exactly which file it wrote, so it says so.
     pub fn commit(&self, message: &str, paths: &[String]) -> Result<(), GitError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.ensure_init()?;
         // `git add -- <path>` is a hard error when the pathspec matches
         // nothing and git does not already track it, so a path that was never
         // committed — because an earlier commit failed and was only warned
@@ -210,6 +214,7 @@ impl GitNet {
     /// that destroys unsaved work — it stays reachable in the repository's
     /// history and reflog even after the reset.
     pub fn undo(&self) -> Result<(), GitError> {
+        self.ensure_init()?;
         if !self.head_exists()? {
             return Err(GitError::NothingToUndo);
         }

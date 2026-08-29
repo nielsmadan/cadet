@@ -21,6 +21,58 @@ pub struct ReconcileReport {
 
 pub const GRACE_MS: i64 = 60_000;
 
+fn snapshot_matches_index(snapshot: &Snapshot, view: &IndexView) -> bool {
+    if !snapshot.complete || snapshot.observed.len() != view.entries.len() {
+        return false;
+    }
+    let mut observed_set = std::collections::BTreeSet::new();
+    for observed in &snapshot.observed {
+        let Some(uid) = &observed.uid else {
+            return false;
+        };
+        if !observed_set.insert((uid, observed.path.as_str(), &observed.revision)) {
+            return false;
+        }
+    }
+    let indexed: std::collections::BTreeSet<_> = view
+        .entries
+        .iter()
+        .map(|entry| (&entry.uid, entry.path.as_str(), &entry.revision))
+        .collect();
+    observed_set == indexed
+}
+
+fn entries_match(current: &[IndexEntry], next: &[IndexEntry]) -> bool {
+    if current.len() != next.len() {
+        return false;
+    }
+    fn identity(entry: &IndexEntry) -> (&TaskUid, &str, &Revision) {
+        (&entry.uid, entry.path.as_str(), &entry.revision)
+    }
+    let current: std::collections::BTreeSet<_> = current.iter().map(identity).collect();
+    let next: std::collections::BTreeSet<_> = next.iter().map(identity).collect();
+    current == next
+}
+
+fn cache_matches<'a>(
+    task_count: usize,
+    tasks: impl Iterator<Item = &'a Task>,
+    cached: &std::collections::BTreeMap<String, TaskSummary>,
+) -> bool {
+    task_count == cached.len()
+        && tasks.into_iter().all(|task| {
+            cached.get(task.uid.as_str()).is_some_and(|summary| {
+                summary.key == task.key
+                    && summary.title == task.title
+                    && summary.state == task.state
+                    && summary.due == task.due
+                    && summary.priority == task.priority
+                    && summary.tags == task.tags
+                    && summary.fields == task.fields
+            })
+        })
+}
+
 /// What `cadet doctor` reports about renumbering. Both figures are standing
 /// state read fresh, not a tally of what one reconcile pass did.
 #[derive(Debug, Default, PartialEq)]
@@ -184,16 +236,30 @@ impl App {
         // keys that are already on disk. Must run before the outcomes loop:
         // `adopt` mints from this mark.
         let prefix = self.backend.load_project()?.prefix;
-        if let Some(max) = parsed
+        let max_key = parsed
             .values()
             .filter(|t| t.key.prefix == prefix)
             .map(|t| t.key.number)
-            .max()
-        {
+            .max();
+        if let Some(max) = max_key {
             self.index.bump_high_water(&self.project, max)?;
         }
 
         let view = self.index.view(&self.project)?;
+        let cached_by_uid: std::collections::BTreeMap<String, TaskSummary> = self
+            .index
+            .list_tasks(&self.project, true, &[])?
+            .into_iter()
+            .map(|summary| (summary.uid.clone(), summary))
+            .collect();
+        if snapshot_matches_index(&snap, &view)
+            && view.pending.is_empty()
+            && view.pending_deletions.is_empty()
+            && self.index.pending_renumbers(&self.project)?.is_empty()
+            && cache_matches(parsed.len(), parsed.values(), &cached_by_uid)
+        {
+            return Ok(ReconcileReport::default());
+        }
         let clock = ScanClock {
             now_ms,
             grace_ms: GRACE_MS,
@@ -233,13 +299,6 @@ impl App {
         // leave a known uid off disk this cycle) still have to survive the
         // `cache_tasks` replace below, or a task in its grace period would
         // vanish from `list()` a full deletion cycle early.
-        let cached_by_uid: std::collections::BTreeMap<String, TaskSummary> = self
-            .index
-            .list_tasks(&self.project, true, &[])?
-            .into_iter()
-            .map(|s| (s.uid.clone(), s))
-            .collect();
-
         for outcome in &outcomes {
             match outcome {
                 Outcome::PendingAdoption { path } => {
@@ -285,7 +344,9 @@ impl App {
                     // older than the grace period, so guard 3 never fires.
                     // `resolve_identity` cannot do this itself — it is pure and holds
                     // only an immutable `&IndexView`.
-                    self.index.clear_pending_deletion(&self.project, uid)?;
+                    if view.pending_deletions.contains_key(uid) {
+                        self.index.clear_pending_deletion(&self.project, uid)?;
+                    }
                     if let Some(o) = observed_by_path(path) {
                         entries.push(IndexEntry {
                             uid: uid.clone(),
@@ -297,7 +358,9 @@ impl App {
                 }
                 Outcome::Rename { uid, to } => {
                     report.renamed += 1;
-                    self.index.clear_pending_deletion(&self.project, uid)?;
+                    if view.pending_deletions.contains_key(uid) {
+                        self.index.clear_pending_deletion(&self.project, uid)?;
+                    }
                     if let Some(o) = observed_by_path(to) {
                         entries.push(IndexEntry {
                             uid: uid.clone(),
@@ -367,7 +430,9 @@ impl App {
             &mut report,
         )?;
 
-        self.index.apply(&self.project, &entries)?;
+        if !entries_match(&view.entries, &entries) {
+            self.index.apply(&self.project, &entries)?;
+        }
         // `apply` replaces `entries` wholesale, so any uid it just dropped
         // leaves its pending-deletion row behind with nothing left to reap
         // it. Read AFTER `apply` for exactly that reason.
@@ -395,7 +460,9 @@ impl App {
             &observed_uids,
             cached_by_uid.values(),
         )?;
-        self.index.cache_tasks(&self.project, &cached)?;
+        if !cache_matches(cached.len(), cached.iter(), &cached_by_uid) {
+            self.index.cache_tasks(&self.project, &cached)?;
+        }
         // A backend that can resume incrementally hands back a cursor even
         // on the snapshot path (a stale or lost cursor falling back to a
         // full resync, or a first-ever scan) — store it, or every reconcile
@@ -708,13 +775,15 @@ impl App {
         entries: &mut [IndexEntry],
         report: &mut ReconcileReport,
     ) -> Result<(), AppError> {
+        let waiting = self.index.pending_renumbers(&self.project)?;
         for path in &resolved.settled {
-            self.index.clear_pending_renumber(&self.project, path)?;
+            if waiting.contains_key(path) {
+                self.index.clear_pending_renumber(&self.project, path)?;
+            }
         }
         if resolved.changes.is_empty() {
             return Ok(());
         }
-        let waiting = self.index.pending_renumbers(&self.project)?;
         for change in &resolved.changes {
             let Some(task) = parsed.get(&change.path) else {
                 continue;
@@ -941,6 +1010,7 @@ fn task_from_summary(s: &TaskSummary) -> Task {
 mod tests {
     use super::*;
     use cadet_backend_local_db::LocalDbBackend;
+    use cadet_backend_markdown::MarkdownBackend;
 
     const CFG: &str = r#"
 [project]
@@ -959,6 +1029,28 @@ terminal = ["done"]
         let backend = LocalDbBackend::open_in_memory(dir.path().join("p.toml")).unwrap();
         let index = SqliteIndex::open_in_memory().unwrap();
         (dir, App::new(Box::new(backend), index, None, "p".into()))
+    }
+
+    #[test]
+    fn an_unchanged_markdown_snapshot_preserves_its_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project.toml"), CFG).unwrap();
+        let app = App::new(
+            Box::new(MarkdownBackend::new(dir.path().to_path_buf())),
+            SqliteIndex::open_in_memory().unwrap(),
+            None,
+            "p".into(),
+        );
+        app.add("stable").unwrap();
+        app.reconcile(1_000).unwrap();
+        let first_seen = app.index.view("p").unwrap().entries[0].first_seen_ms;
+
+        app.reconcile(2_000).unwrap();
+
+        assert_eq!(
+            app.index.view("p").unwrap().entries[0].first_seen_ms,
+            first_seen
+        );
     }
 
     /// A task written by something other than `App` — the second writer the

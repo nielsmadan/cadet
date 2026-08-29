@@ -982,12 +982,9 @@ fn a_failed_commit_does_not_fail_the_write() {
     std::fs::write(vault.path().join("project.toml"), CFG).unwrap();
     let backend = MarkdownBackend::new(vault.path().to_path_buf());
     let index = SqliteIndex::open_in_memory().unwrap();
-    // Deliberately never initialised: every `git.commit` call fails with no
-    // repository to write to, independent of the backend and the index.
-    let git = GitNet::new(
-        repo.path().join("never-initialised.git"),
-        vault.path().to_path_buf(),
-    );
+    let broken_repo = repo.path().join("not-a-directory.git");
+    std::fs::write(&broken_repo, "occupied").unwrap();
+    let git = GitNet::new(broken_repo, vault.path().to_path_buf());
     let app = App::new(Box::new(backend), index, Some(git), "p".into());
 
     let task = app.add("resilient").unwrap();

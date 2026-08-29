@@ -8,7 +8,7 @@ use cadet_app::{App, GitNet, RejectReason, TaskChanges};
 use cadet_backend_local_db::LocalDbBackend;
 use cadet_backend_markdown::MarkdownBackend;
 use cadet_core::{Backend, DueBucket, Priority, ProjectConfig, TaskFilter, TaskKey};
-use cadet_store_sqlite::SqliteIndex;
+use cadet_store_sqlite::{SqliteIndex, TaskSummary};
 use clap::{Parser, Subcommand};
 use config::{BackendKind, Project, Registry};
 
@@ -113,6 +113,9 @@ enum Cmd {
     },
     /// List tasks
     Ls {
+        /// List tasks from every configured project
+        #[arg(long, conflicts_with = "project")]
+        all_projects: bool,
         /// Include terminal states (e.g. done)
         #[arg(long)]
         all: bool,
@@ -216,7 +219,6 @@ pub(crate) fn open_app(reg: &Registry, p: &Project) -> Result<App, Box<dyn std::
     let (backend, git): (Box<dyn Backend>, Option<GitNet>) = match p.backend {
         BackendKind::Markdown => {
             let git = GitNet::new(reg.repo_dir(&p.id), p.path.clone());
-            git.ensure_init()?;
             (Box::new(MarkdownBackend::new(p.path.clone())), Some(git))
         }
         // No work tree, so nothing for git to hold.
@@ -384,6 +386,128 @@ fn print_labelled(rows: &[(String, String)]) {
     for (label, value) in rows {
         println!("{:<width$}{value}", format!("{label}:"));
     }
+}
+
+struct ListOptions {
+    all: bool,
+    states: Vec<String>,
+    tags: Vec<String>,
+    priority: Option<PriorityArg>,
+    due: Option<DueArg>,
+    due_before: Option<String>,
+    due_after: Option<String>,
+    fields: Vec<String>,
+}
+
+fn list_filter(
+    project: &Project,
+    options: &ListOptions,
+    today: jiff::civil::Date,
+) -> Result<TaskFilter, Box<dyn std::error::Error>> {
+    let due_before = options
+        .due_before
+        .as_ref()
+        .map(|due| check_date_bound("due-before", due))
+        .transpose()?;
+    let due_after = options
+        .due_after
+        .as_ref()
+        .map(|due| check_date_bound("due-after", due))
+        .transpose()?;
+    let (due_after, due_before) = match options.due {
+        None => (due_after, due_before),
+        Some(_) if due_before.is_some() || due_after.is_some() => {
+            return Err(
+                "`--due` and `--due-before`/`--due-after` say the same thing two ways; use one or the other"
+                    .into(),
+            );
+        }
+        Some(d) => DueBucket::from(d).bounds(today)?,
+    };
+    reject_duplicate_names(&options.fields)?;
+    let cfg = if options.states.is_empty() && options.fields.is_empty() {
+        None
+    } else {
+        Some(load_config(project)?)
+    };
+    if let Some((cfg, _)) = &cfg {
+        for state in &options.states {
+            if !cfg.workflow.states.contains(state) {
+                return Err(format!(
+                    "unknown state `{state}` — declared state(s): {}",
+                    cfg.workflow.states.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+    let mut filter = TaskFilter {
+        states: options.states.clone(),
+        tags: options.tags.clone(),
+        priority: options.priority.map(Priority::from),
+        due_before,
+        due_after,
+        fields: Vec::new(),
+    };
+    if let Some((cfg, config_path)) = &cfg {
+        for pair in &options.fields {
+            let name = assignment_name(pair)?;
+            if let Some(msg) = reserved_field_redirect(&name) {
+                return Err(msg.into());
+            }
+            filter
+                .fields
+                .push(declared_assignment(cfg, pair, config_path)?);
+        }
+    }
+    Ok(filter)
+}
+
+fn print_task_rows(tasks: &[TaskSummary]) {
+    let show_priority = tasks.iter().any(|t| t.priority != Priority::Normal);
+    for t in tasks {
+        let key = t.key.to_string();
+        if show_priority {
+            let priority = if t.priority == Priority::Normal {
+                ""
+            } else {
+                priority_label(t.priority)
+            };
+            println!("{:<10} {:<8} {:<5} {}", key, t.state, priority, t.title);
+        } else {
+            println!("{:<10} {:<8} {}", key, t.state, t.title);
+        }
+    }
+}
+
+fn list_all_projects(
+    reg: &Registry,
+    options: &ListOptions,
+    now: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let today = today(now)?;
+    let mut groups = Vec::new();
+    for project in &reg.projects {
+        let app = open_app(reg, project)?;
+        report_reconcile(&app.reconcile(now)?);
+        print_warnings(&app);
+        let filter = list_filter(project, options, today)
+            .map_err(|error| format!("project `{}`: {error}", project.id))?;
+        groups.push((project.id.clone(), app.list_filtered(options.all, &filter)?));
+    }
+    let mut printed = false;
+    for (project, tasks) in groups.into_iter().filter(|(_, tasks)| !tasks.is_empty()) {
+        if printed {
+            println!();
+        }
+        println!("{project}:");
+        print_task_rows(&tasks);
+        printed = true;
+    }
+    if !printed {
+        println!("no tasks");
+    }
+    Ok(())
 }
 
 /// Shared by `apply_assignment`'s undeclared-field branch and `ls --field`,
@@ -753,23 +877,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return project::run(cmd, reg).map_err(Into::into);
     }
 
-    // One resolver, shared with `cadet project which`, so the precedence
-    // rule exists once. `--project` and `CADET_PROJECT` are one selector and
-    // get one error: the env spelling used to fall through to "no default
-    // project set", which is false whenever a default *is* set and sends the
-    // user to fix the wrong thing.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let selection = dirmatch::resolve(&reg, cli.project.as_deref(), &cwd)?;
-    if let dirmatch::Source::Dir(pattern) = &selection.source {
-        eprintln!(
-            "note: selected `{}` — cwd matches `{}`",
-            selection.project.id,
-            pattern.display()
-        );
-    }
-    let project = selection.project;
-    let started_at = jiff_now_ms();
     let command = cli.cmd.unwrap_or(Cmd::Ls {
+        all_projects: false,
         all: false,
         states: vec![],
         tags: vec![],
@@ -779,6 +888,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         due_after: None,
         fields: vec![],
     });
+    let command = match command {
+        Cmd::Ls {
+            all_projects: true,
+            all,
+            states,
+            tags,
+            priority,
+            due,
+            due_before,
+            due_after,
+            fields,
+        } => {
+            return list_all_projects(
+                &reg,
+                &ListOptions {
+                    all,
+                    states,
+                    tags,
+                    priority,
+                    due,
+                    due_before,
+                    due_after,
+                    fields,
+                },
+                jiff_now_ms(),
+            );
+        }
+        command => command,
+    };
+
+    // One resolver, shared with `cadet project which`, so the precedence
+    // rule exists once. `--project` and `CADET_PROJECT` are one selector and
+    // get one error: the env spelling used to fall through to "no default
+    // project set", which is false whenever a default *is* set and sends the
+    // user to fix the wrong thing.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let selection = dirmatch::resolve(&reg, cli.project.as_deref(), &cwd)?;
+    let project = selection.project;
+    let started_at = jiff_now_ms();
     enum Prepared {
         Add(cadet_app::TaskDraft),
         AddError(Box<dyn std::error::Error>),
@@ -859,6 +1007,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_warnings(&app);
         }
         Cmd::Ls {
+            all_projects: _,
             all,
             states,
             tags,
@@ -868,85 +1017,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             due_after,
             fields,
         } => {
-            let due_before = due_before
-                .map(|due| check_date_bound("due-before", &due))
-                .transpose()?;
-            let due_after = due_after
-                .map(|due| check_date_bound("due-after", &due))
-                .transpose()?;
-            let (due_after, due_before) = match due {
-                None => (due_after, due_before),
-                Some(_) if due_before.is_some() || due_after.is_some() => {
-                    return Err(
-                        "`--due` and `--due-before`/`--due-after` say the same thing two ways; use one or the other"
-                            .into(),
-                    );
-                }
-                Some(d) => DueBucket::from(d).bounds(today(now)?)?,
-            };
-            reject_duplicate_names(&fields)?;
-            // The config is only read when a filter needs it, so a plain
-            // `ls` still costs nothing.
-            let cfg = if states.is_empty() && fields.is_empty() {
-                None
-            } else {
-                Some(load_config(&project)?)
-            };
-            // The write path already refuses an undeclared state — `mv` and
-            // `add --state` both do. Without this, a typo here answers "no
-            // tasks", which is a wrong answer rather than an error.
-            if let Some((cfg, _)) = &cfg {
-                for s in &states {
-                    if !cfg.workflow.states.contains(s) {
-                        return Err(format!(
-                            "unknown state `{s}` — declared state(s): {}",
-                            cfg.workflow.states.join(", ")
-                        )
-                        .into());
-                    }
-                }
-            }
-            let mut filter = TaskFilter {
+            let options = ListOptions {
+                all,
                 states,
                 tags,
-                priority: priority.map(Priority::from),
+                priority,
+                due,
                 due_before,
                 due_after,
-                fields: Vec::new(),
+                fields,
             };
-            if let Some((cfg, config_path)) = &cfg {
-                for pair in &fields {
-                    let name = assignment_name(pair)?;
-                    if let Some(msg) = reserved_field_redirect(&name) {
-                        return Err(msg.into());
-                    }
-                    filter
-                        .fields
-                        .push(declared_assignment(cfg, pair, config_path)?);
-                }
-            }
+            let filter = list_filter(&project, &options, today(now)?)?;
             let tasks = app.list_filtered(all, &filter)?;
             if tasks.is_empty() {
                 println!("no tasks");
             }
-            // A list that can be sorted and filtered by priority but never
-            // shows it is the same read/write asymmetry as `show`. The column
-            // only appears when some task in the list has one, so an ordinary
-            // list keeps the row it always had.
-            let show_priority = tasks.iter().any(|t| t.priority != Priority::Normal);
-            for t in tasks {
-                let key = t.key.to_string();
-                if show_priority {
-                    let p = if t.priority == Priority::Normal {
-                        ""
-                    } else {
-                        priority_label(t.priority)
-                    };
-                    println!("{:<10} {:<8} {:<5} {}", key, t.state, p, t.title);
-                } else {
-                    println!("{:<10} {:<8} {}", key, t.state, t.title);
-                }
-            }
+            print_task_rows(&tasks);
         }
         Cmd::Edit { key } => {
             let k = parse_key(&app, &key)?;

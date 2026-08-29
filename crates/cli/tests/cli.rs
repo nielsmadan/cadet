@@ -2067,6 +2067,92 @@ fn tasks_round_trip_through_a_local_db_project() {
 }
 
 #[test]
+fn ls_all_projects_groups_tasks_from_every_backend() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "notes",
+        "--path",
+        &h.vault("notes"),
+        "--prefix",
+        "NOTE",
+    ])
+    .assert()
+    .success();
+    h.cadet(&[
+        "project",
+        "add",
+        "scratch",
+        "--backend",
+        "local-db",
+        "--prefix",
+        "SCR",
+    ])
+    .assert()
+    .success();
+    h.cadet(&["--project", "notes", "add", "write it down"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "scratch", "add", "try an idea"])
+        .assert()
+        .success();
+    h.cadet(&["--project", "scratch", "done", "SCR-1"])
+        .assert()
+        .success();
+
+    h.cadet(&["ls", "--all-projects"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes:"))
+        .stdout(predicates::str::contains("NOTE-1"))
+        .stdout(predicates::str::contains("write it down"));
+
+    h.cadet(&["ls", "--all-projects", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes:"))
+        .stdout(predicates::str::contains("NOTE-1"))
+        .stdout(predicates::str::contains("scratch:"))
+        .stdout(predicates::str::contains("SCR-1"))
+        .stdout(predicates::str::contains("try an idea"));
+}
+
+#[test]
+fn ls_all_projects_conflicts_with_selecting_one_project() {
+    let h = harness();
+    h.cadet(&["ls", "--all-projects", "--project", "notes"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn listing_does_not_initialize_git_but_the_first_write_does() {
+    let h = harness();
+    h.cadet(&[
+        "project",
+        "add",
+        "notes",
+        "--path",
+        &h.vault("notes"),
+        "--prefix",
+        "N",
+    ])
+    .assert()
+    .success();
+    let repo = h.home().join("repos").join("notes.git");
+
+    h.cadet(&["--project", "notes", "ls"]).assert().success();
+    assert!(!repo.exists(), "a read must not initialize the safety net");
+
+    h.cadet(&["--project", "notes", "add", "first"])
+        .assert()
+        .success();
+    assert!(repo.join("HEAD").exists(), "a write must initialize it");
+}
+
+#[test]
 fn undo_reports_that_a_local_db_project_has_none() {
     let h = harness();
     h.cadet(&["project", "add", "scratch", "--backend", "local-db"])
@@ -2195,8 +2281,7 @@ fn a_configured_directory_selects_its_project() {
     from_repo
         .assert()
         .success()
-        .stdout(predicates::str::contains("CAD-1"))
-        .stderr(predicates::str::contains("cwd matches"));
+        .stdout(predicates::str::contains("CAD-1"));
 
     // A subdirectory counts: configuring a repo root covers everything in it.
     let mut nested = h.cadet(&["add", "nested"]);
@@ -2212,8 +2297,7 @@ fn a_configured_directory_selects_its_project() {
     outside
         .assert()
         .success()
-        .stdout(predicates::str::contains("GEN-1"))
-        .stderr(predicates::str::contains("cwd matches").not());
+        .stdout(predicates::str::contains("GEN-1"));
 }
 
 /// An explicit selector always beats a directory the user merely happens to
@@ -2326,10 +2410,8 @@ fn project_dirs_round_trips_and_which_reports_the_source() {
         .stdout(predicates::str::contains("(none)"));
 }
 
-/// A registry that configures no directories must behave exactly as before —
-/// no note, no change in selection.
 #[test]
-fn a_registry_with_no_directories_behaves_as_it_always_did() {
+fn a_registry_with_no_directories_preserves_its_shape() {
     let h = harness();
     h.cadet(&["project", "root", h.root.path().to_str().unwrap()])
         .assert()
@@ -2341,8 +2423,7 @@ fn a_registry_with_no_directories_behaves_as_it_always_did() {
     add.current_dir(h.root.path());
     add.assert()
         .success()
-        .stdout(predicates::str::contains("ONL-1"))
-        .stderr(predicates::str::contains("cwd matches").not());
+        .stdout(predicates::str::contains("ONL-1"));
     // And the stored registry gains no `dirs` key at all.
     let raw = std::fs::read_to_string(h.home.path().join("config.toml")).unwrap();
     assert!(!raw.contains("dirs"), "{raw}");

@@ -157,11 +157,12 @@ impl SqliteIndex {
     /// Replaces the project's entries wholesale — the index is disposable and
     /// always rebuilt from a complete snapshot.
     pub fn apply(&self, project: &str, entries: &[IndexEntry]) -> Result<(), IndexError> {
-        self.conn
-            .execute("DELETE FROM entries WHERE project = ?1", params![project])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM entries WHERE project = ?1", params![project])?;
         for e in entries {
-            self.upsert_entry_row(project, e)?;
+            Self::upsert_entry_row(&tx, project, e)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -172,14 +173,20 @@ impl SqliteIndex {
     /// ones from a delta batch too small to say anything about them (an
     /// empty batch would wipe the table outright).
     pub fn apply_upsert(&self, project: &str, entries: &[IndexEntry]) -> Result<(), IndexError> {
+        let tx = self.conn.unchecked_transaction()?;
         for e in entries {
-            self.upsert_entry_row(project, e)?;
+            Self::upsert_entry_row(&tx, project, e)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
-    fn upsert_entry_row(&self, project: &str, e: &IndexEntry) -> Result<(), IndexError> {
-        self.conn.execute(
+    fn upsert_entry_row(
+        conn: &Connection,
+        project: &str,
+        e: &IndexEntry,
+    ) -> Result<(), IndexError> {
+        conn.execute(
             "INSERT OR REPLACE INTO entries (project, uid, path, revision, first_seen_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -382,7 +389,8 @@ impl SqliteIndex {
     pub fn bump_high_water(&self, project: &str, value: u32) -> Result<(), IndexError> {
         self.conn.execute(
             "INSERT INTO high_water (project, value) VALUES (?1, ?2)
-             ON CONFLICT(project) DO UPDATE SET value = MAX(value, excluded.value)",
+             ON CONFLICT(project) DO UPDATE SET value = excluded.value
+             WHERE high_water.value < excluded.value",
             params![project, value as i64],
         )?;
         Ok(())
@@ -393,12 +401,12 @@ impl SqliteIndex {
     /// deletes just this uid first). Clears this uid's `task_tags` and
     /// `task_fields` before re-inserting them — without that, a task that
     /// loses a tag or a field keeps it in the cache forever.
-    fn insert_one(&self, project: &str, t: &Task) -> Result<(), IndexError> {
-        self.conn.execute(
+    fn insert_one(conn: &Connection, project: &str, t: &Task) -> Result<(), IndexError> {
+        conn.execute(
             "DELETE FROM task_tags WHERE project = ?1 AND uid = ?2",
             params![project, t.uid.as_str()],
         )?;
-        self.conn.execute(
+        conn.execute(
             "DELETE FROM task_fields WHERE project = ?1 AND uid = ?2",
             params![project, t.uid.as_str()],
         )?;
@@ -407,7 +415,7 @@ impl SqliteIndex {
         // already held the key and put the duplicate in its place. Keys
         // are never reused, so a conflict here is a bug in the caller and
         // must surface as one.
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO tasks
              (project, uid, key_num, key_prefix, title, state, due, priority)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -427,14 +435,14 @@ impl SqliteIndex {
             ],
         )?;
         for (i, tag) in t.tags.iter().enumerate() {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO task_tags (project, uid, ord, tag) VALUES (?1, ?2, ?3, ?4)",
                 params![project, t.uid.as_str(), i as i64, tag],
             )?;
         }
         for (name, value) in &t.fields {
             let (kind, encoded) = encode_field(value);
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO task_fields (project, uid, name, kind, value) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![project, t.uid.as_str(), name, kind, encoded],
             )?;
@@ -445,17 +453,17 @@ impl SqliteIndex {
     /// Replaces the cached display data for a project. Called by reconcile with
     /// the tasks the scan already parsed — no extra file reads.
     pub fn cache_tasks(&self, project: &str, tasks: &[Task]) -> Result<(), IndexError> {
-        self.conn
-            .execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
-        self.conn
-            .execute("DELETE FROM task_tags WHERE project = ?1", params![project])?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM tasks WHERE project = ?1", params![project])?;
+        tx.execute("DELETE FROM task_tags WHERE project = ?1", params![project])?;
+        tx.execute(
             "DELETE FROM task_fields WHERE project = ?1",
             params![project],
         )?;
         for t in tasks {
-            self.insert_one(project, t)?;
+            Self::insert_one(&tx, project, t)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -463,15 +471,17 @@ impl SqliteIndex {
     /// cached task alone. `cache_tasks` deletes the whole project first,
     /// which a delta must not do — it describes a change, not the store.
     pub fn cache_upsert_tasks(&self, project: &str, tasks: &[Task]) -> Result<(), IndexError> {
+        let tx = self.conn.unchecked_transaction()?;
         for t in tasks {
             // A plain INSERT would collide on the primary key for a task that
             // is merely being updated, which is the common case for a delta.
-            self.conn.execute(
+            tx.execute(
                 "DELETE FROM tasks WHERE project = ?1 AND uid = ?2",
                 params![project, t.uid.as_str()],
             )?;
-            self.insert_one(project, t)?;
+            Self::insert_one(&tx, project, t)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1153,6 +1163,23 @@ mod tests {
         .unwrap();
         i.cache_tasks("p", &[task(1, "a", "todo", None)]).unwrap();
         assert_eq!(i.list_tasks("p", true, &[]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_cache_replacement_keeps_the_previous_cache() {
+        let i = idx();
+        i.cache_tasks("p", &[task(1, "original", "todo", None)])
+            .unwrap();
+        let replacements = [
+            task(2, "first replacement", "todo", None),
+            task(2, "duplicate key", "todo", None),
+        ];
+
+        assert!(i.cache_tasks("p", &replacements).is_err());
+
+        let tasks = i.list_tasks("p", true, &[]).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "original");
     }
 
     #[test]
