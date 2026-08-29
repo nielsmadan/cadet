@@ -83,6 +83,24 @@ fn put_then_get_round_trips() {
 }
 
 #[test]
+fn put_replaces_an_existing_body() {
+    let (d, b) = setup();
+    let mut t = task("Editable");
+    t.body = "\nOld body.\n".into();
+    let revision = b.put(t.clone(), None).unwrap();
+
+    t.body = "\nNew body.\n".into();
+    b.put(t.clone(), Some(revision)).unwrap();
+
+    let path = d
+        .path()
+        .join(b.location_of(t.uid.clone()).unwrap().unwrap());
+    let raw = std::fs::read_to_string(path).unwrap();
+    assert!(raw.ends_with("\nNew body.\n"), "{raw}");
+    assert_eq!(b.get(t.uid.clone()).unwrap().unwrap().body, t.body);
+}
+
+#[test]
 fn yaml_sensitive_strings_are_escaped_and_round_trip() {
     let (d, b) = setup();
     let mut t = task(r#"bug: press "global" at C:\hotkeys"#);

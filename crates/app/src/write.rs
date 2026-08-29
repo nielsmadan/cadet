@@ -30,6 +30,7 @@ pub struct TaskChanges {
     pub due: Option<Option<String>>,
     pub priority: Option<Priority>,
     pub tags: Option<Vec<String>>,
+    pub body: Option<String>,
     pub fields: BTreeMap<String, Option<FieldValue>>,
 }
 
@@ -222,6 +223,7 @@ impl App {
             && changes.due.is_none()
             && changes.priority.is_none()
             && changes.tags.is_none()
+            && changes.body.is_none()
             && changes.fields.is_empty()
         {
             return self.get_by_key(key);
@@ -271,6 +273,9 @@ impl App {
         }
         if let Some(tags) = changes.tags {
             task.tags = tags;
+        }
+        if let Some(body) = changes.body {
+            task.body = body;
         }
         for (name, value) in changes.fields {
             match value {

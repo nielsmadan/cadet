@@ -1475,6 +1475,32 @@ fn update_changes_only_what_is_named() {
 }
 
 #[test]
+fn update_can_replace_the_task_body() {
+    let f = fixture();
+    let t = f
+        .app
+        .add_with(cadet_app::TaskDraft {
+            title: "editable requirement".into(),
+            body: "\nOld body.\n".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let after = f
+        .app
+        .update(
+            &t.key,
+            cadet_app::TaskChanges {
+                body: Some("\nNew body.\n".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(after.body, "\nNew body.\n");
+}
+
+#[test]
 fn update_can_clear_a_due_date_and_remove_a_field() {
     let f = fixture();
     let mut fields = std::collections::BTreeMap::new();

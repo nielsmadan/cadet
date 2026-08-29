@@ -334,6 +334,14 @@ pub fn parse_frontmatter(src: &str) -> Option<Frontmatter> {
     Some(Frontmatter { values, body })
 }
 
+pub fn replace_body(src: &str, body: &str) -> Option<String> {
+    let all_lines = split_lines(src);
+    let (_, close_idx) = find_fences(&all_lines)?;
+    let mut out = join_lines(&all_lines[..=close_idx]);
+    out.push_str(body);
+    Some(out)
+}
+
 /// Replace, insert or remove frontmatter fields, touching no other byte.
 /// `None` removes the field. Spec §4.
 ///
@@ -489,6 +497,14 @@ Body text here.\n";
             1,
             "splicing must replace the field, not add a second one"
         );
+    }
+
+    #[test]
+    fn replacing_the_body_preserves_the_frontmatter_bytes() {
+        let out = replace_body(DOC, "\nNew body.\n").unwrap();
+        let frontmatter_end = DOC.find("\n---\n").unwrap() + "\n---\n".len();
+        assert_eq!(&out[..frontmatter_end], &DOC[..frontmatter_end]);
+        assert_eq!(&out[frontmatter_end..], "\nNew body.\n");
     }
 
     /// The same rule for a CRLF document: the splice must not normalise the

@@ -121,6 +121,11 @@ fn resolve_seed(
         &[
             ("title", "the positional title", positional_given),
             (
+                "body",
+                "the positional description",
+                !description.is_empty(),
+            ),
+            (
                 "due",
                 "`--due`/`--no-due`",
                 options.due.is_some() || options.no_due,
@@ -146,6 +151,7 @@ fn resolve_seed(
         )?;
     }
     let title = scratch.title.take().unwrap_or(title);
+    let description = scratch.body.take().unwrap_or(description);
     check_title(&title)?;
     let state = scratch.state.take().or(options.state);
     let priority = scratch.priority.take().or(options.priority);

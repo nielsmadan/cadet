@@ -831,6 +831,52 @@ fn message_shorthand_persists_description_and_tags() {
 }
 
 #[test]
+fn body_assignment_creates_and_revises_a_multiline_requirement() {
+    let h = project_harness();
+    h.cadet(&[
+        "add",
+        "Agent workflow",
+        "--set",
+        "body=## Outcome\n\nDispatch approved work.\n\n## Acceptance criteria\n\n- Agents can answer questions.",
+    ])
+    .assert()
+    .success();
+
+    let created: Value =
+        serde_json::from_slice(&h.cadet(&["show", "T-1", "--json"]).output().unwrap().stdout)
+            .unwrap();
+    assert_eq!(
+        created["task"]["body"],
+        "\n## Outcome\n\nDispatch approved work.\n\n## Acceptance criteria\n\n- Agents can answer questions.\n"
+    );
+
+    h.cadet(&["set", "T-1", "body=## Outcome\n\nUse the durable mailbox."])
+        .assert()
+        .success();
+    let revised: Value =
+        serde_json::from_slice(&h.cadet(&["show", "T-1", "--json"]).output().unwrap().stdout)
+            .unwrap();
+    assert_eq!(
+        revised["task"]["body"],
+        "\n## Outcome\n\nUse the durable mailbox.\n"
+    );
+}
+
+#[test]
+fn positional_description_and_body_assignment_conflict() {
+    let h = project_harness();
+    h.cadet(&[
+        "add",
+        "Agent workflow | positional body",
+        "--set",
+        "body=assigned body",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("body").and(predicates::str::contains("description")));
+}
+
+#[test]
 fn interactive_add_requires_a_terminal_before_creating_a_task() {
     let h = project_harness();
     h.cadet(&["add", "seed", "--interactive"])

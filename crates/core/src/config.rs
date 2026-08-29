@@ -10,6 +10,7 @@ pub const RESERVED_FIELDS: &[&str] = &[
     "due",
     "priority",
     "tags",
+    "body",
     "renumbered_from",
     "possible_duplicate_of",
 ];
@@ -353,6 +354,13 @@ values = ["shopping", "admin"]
         let src = SAMPLE.replace("name = \"category\"", "name = \"title\"");
         let err = ProjectConfig::parse(&src).unwrap_err();
         assert!(matches!(err, CoreError::ReservedFieldName(ref n) if n == "title"));
+    }
+
+    #[test]
+    fn rejects_custom_field_shadowing_body() {
+        let src = SAMPLE.replace("name = \"category\"", "name = \"body\"");
+        let err = ProjectConfig::parse(&src).unwrap_err();
+        assert!(matches!(err, CoreError::ReservedFieldName(ref n) if n == "body"));
     }
 
     #[test]

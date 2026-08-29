@@ -698,6 +698,7 @@ fn reserved_field_redirect(name: &str) -> Option<&'static str> {
         "state" => Some("`state` is not filterable via --field — use --state instead"),
         "priority" => Some("`priority` is not filterable via --field — use --priority instead"),
         "title" => Some("`title` has no ls filter"),
+        "body" => Some("`body` has no ls filter"),
         _ => None,
     }
 }
@@ -802,8 +803,18 @@ fn apply_assignment(
     let (name, raw) = pair
         .split_once('=')
         .ok_or_else(|| format!("expected name=value, got `{pair}`"))?;
+    let name = name.trim();
+    if name == "body" {
+        let body = raw.trim();
+        changes.body = Some(if body.is_empty() {
+            String::new()
+        } else {
+            format!("\n{body}\n")
+        });
+        return Ok(());
+    }
     let raw = raw.trim();
-    match name.trim() {
+    match name {
         "title" => {
             check_title(raw)?;
             changes.title = Some(raw.to_string());

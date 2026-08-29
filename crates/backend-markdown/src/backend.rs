@@ -1,4 +1,4 @@
-use crate::frontmatter::{parse_frontmatter, render_list, render_string, splice};
+use crate::frontmatter::{parse_frontmatter, render_list, render_string, replace_body, splice};
 use crate::probe::{Probe, probe};
 use crate::slug::slugify;
 use cadet_core::{
@@ -343,10 +343,11 @@ impl Backend for MarkdownBackend {
         }
         let edit_refs: Vec<(&str, Option<String>)> =
             edits.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let mut out = splice(&base, &edit_refs);
-        if base.is_empty() && !task.body.is_empty() {
-            out.push_str(&task.body);
-        }
+        let spliced = splice(&base, &edit_refs);
+        let out = replace_body(&spliced, &task.body).ok_or_else(|| BackendError::Malformed {
+            path: path.display().to_string(),
+            reason: "could not locate rendered frontmatter".into(),
+        })?;
         Self::write_atomic(&path, &out)?;
         Ok(revision(&task))
     }
