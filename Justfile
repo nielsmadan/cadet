@@ -2,6 +2,34 @@
 default:
     @just --list
 
+# Prepare this checkout for work: dependencies, hooks, then verify.
+setup:
+    @cargo fetch
+    @lefthook install
+    @just doctor
+
+# Verify the tools and checkout state this repo needs.
+doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    fail=0
+    need() {
+        if command -v "$1" >/dev/null 2>&1; then
+            printf '  ok       %s\n' "$1"
+        else
+            printf '  MISSING  %-12s install: %s\n' "$1" "$2"; fail=1
+        fi
+    }
+    need cargo "https://rustup.rs"
+    need lefthook "brew install lefthook"
+    if [ -f "$(git rev-parse --git-path hooks/pre-commit)" ]; then
+        printf '  ok       git hooks\n'
+    else
+        printf '  MISSING  %-12s run: just setup\n' 'git hooks'; fail=1
+    fi
+    [ "$fail" -eq 0 ] && printf 'Everything in place.\n'
+    exit $fail
+
 # Build and put `cadet` on PATH at ~/.cargo/bin. Re-run to update from dev.
 install:
     @# --force: cargo silently skips reinstalling when the version is unchanged.
@@ -27,7 +55,7 @@ test:
 lint:
     @cargo clippy --workspace --all-targets -- -D warnings
 
-fmt:
+format:
     @cargo fmt
 
 # Everything CI runs.

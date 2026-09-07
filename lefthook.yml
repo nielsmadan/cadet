@@ -40,3 +40,14 @@
 #
 #     - script: "hello.go"
 #       runner: go run
+
+pre-commit:
+  commands:
+    format:
+      glob: "*.rs"
+      run: cargo fmt --check
+
+pre-push:
+  commands:
+    check:
+      run: just check
