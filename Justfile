@@ -49,6 +49,9 @@ conf:
     @mkdir -p "${CADET_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cadet}"
     @${EDITOR:-vi} "${CADET_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cadet}/config.toml"
 
+build:
+    @cargo build --workspace
+
 test:
     @cargo test --workspace
 
